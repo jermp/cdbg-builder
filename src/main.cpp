@@ -216,8 +216,17 @@ int main(int argc, char** argv) {
               << ", num_threads = " << cfg.num_threads
               << (cfg.bucketed ? ", path = bucketed" : ", path = in-memory") << "\n";
 
+    auto t_start = std::chrono::steady_clock::now();
+    auto print_total = [&] {
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t_start).count();
+        std::cout << "[total construction time] " << (ms / 1000.0) << " s\n";
+    };
+
     if (cfg.bucketed) {
-        return run_bucketed(cfg, files);
+        int rc = run_bucketed(cfg, files);
+        print_total();
+        return rc;
     }
 
     const uint64_t num_shards = uint64_t(1) << cfg.shard_log2;
@@ -287,5 +296,6 @@ int main(int argc, char** argv) {
 
     std::cout << "done. wrote " << cfg.out_basename << ".fa and "
               << cfg.out_basename << ".colors\n";
+    print_total();
     return 0;
 }
