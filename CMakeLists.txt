@@ -25,15 +25,22 @@ endif()
 # bits library (header-only). It bundles essentials as a sub-submodule.
 set(BITS_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/external/bits/include)
 set(ESSENTIALS_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/external/bits/external/essentials/include)
+set(CMD_LINE_PARSER_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/external/cmd_line_parser/include)
 
 if(NOT EXISTS ${BITS_INCLUDE_DIR})
     message(FATAL_ERROR
         "external/bits is missing.\n"
         "Run: git submodule update --init --recursive")
 endif()
+if(NOT EXISTS ${CMD_LINE_PARSER_INCLUDE_DIR})
+    message(FATAL_ERROR
+        "external/cmd_line_parser is missing.\n"
+        "Run: git submodule update --init --recursive")
+endif()
 
 include_directories(${BITS_INCLUDE_DIR})
 include_directories(${ESSENTIALS_INCLUDE_DIR})
+include_directories(${CMD_LINE_PARSER_INCLUDE_DIR})
 include_directories(${CMAKE_SOURCE_DIR})
 include_directories(${CMAKE_SOURCE_DIR}/include)
 include_directories(${CMAKE_SOURCE_DIR}/external)
