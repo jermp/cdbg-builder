@@ -21,10 +21,10 @@ namespace cdgb {
 
 // Per-base ntHash seeds (the canonical ntHash table by Mohamadi et al.).
 inline constexpr uint64_t NT_SEED[4] = {
-    0x3c8bfbb395c60474ULL, // A
-    0x3193c18562a02b4cULL, // C
-    0x20323ed082572324ULL, // G
-    0x295549f54be24456ULL  // T
+    0x3c8bfbb395c60474ULL,  // A
+    0x3193c18562a02b4cULL,  // C
+    0x20323ed082572324ULL,  // G
+    0x295549f54be24456ULL   // T
 };
 
 inline uint64_t rol64(uint64_t x, unsigned r) {
@@ -57,26 +57,23 @@ inline bool nthash_init(const uint8_t* s, uint32_t m, uint64_t& fwd, uint64_t& r
 }
 
 // Roll one position right: drop `out_b` (leftmost of old window), append `in_b`.
-inline void nthash_roll(uint8_t out_b, uint8_t in_b, uint32_t m,
-                        uint64_t& fwd, uint64_t& rc) {
+inline void nthash_roll(uint8_t out_b, uint8_t in_b, uint32_t m, uint64_t& fwd, uint64_t& rc) {
     fwd = rol64(fwd, 1) ^ rol64(NT_SEED[out_b], m) ^ NT_SEED[in_b];
-    rc  = ror64(rc, 1) ^ ror64(NT_SEED[out_b ^ 3u], 1) ^ rol64(NT_SEED[in_b ^ 3u], m - 1);
+    rc = ror64(rc, 1) ^ ror64(NT_SEED[out_b ^ 3u], 1) ^ rol64(NT_SEED[in_b ^ 3u], m - 1);
 }
 
-inline uint64_t canonical_mhash(uint64_t fwd, uint64_t rc) {
-    return fwd <= rc ? fwd : rc;
-}
+inline uint64_t canonical_mhash(uint64_t fwd, uint64_t rc) { return fwd <= rc ? fwd : rc; }
 
 // GGCAT's compute_best_m for picking a minimizer length given k.
 // (crates/utils/src/lib.rs:29)
 inline uint32_t compute_best_m(uint32_t k) {
-    if (k <= 13)  return (k / 2 > k - 4) ? (k / 2) : (k > 4 ? (k - 4) : 1);
-    if (k <= 15)  return 9;
-    if (k <= 21)  return 10;
-    if (k <= 30)  return 11;
-    if (k <= 37)  return 12;
-    if (k <= 42)  return 13;
-    if (k <= 64)  return 14;
+    if (k <= 13) return (k / 2 > k - 4) ? (k / 2) : (k > 4 ? (k - 4) : 1);
+    if (k <= 15) return 9;
+    if (k <= 21) return 10;
+    if (k <= 30) return 11;
+    if (k <= 37) return 12;
+    if (k <= 42) return 13;
+    if (k <= 64) return 14;
     return (k + 2) / 4;
 }
 
@@ -84,11 +81,17 @@ inline uint32_t compute_best_m(uint32_t k) {
 // returning the current minimum's hash. Uses a monotonic deque so amortised
 // per-step cost is O(1).
 struct MinQueue {
-    struct E { uint64_t h; int32_t pos; };
+    struct E {
+        uint64_t h;
+        int32_t pos;
+    };
     std::deque<E> q;
     int32_t window_size = 0;
 
-    void reset(int32_t window) { q.clear(); window_size = window; }
+    void reset(int32_t window) {
+        q.clear();
+        window_size = window;
+    }
     void push(uint64_t h, int32_t pos) {
         while (!q.empty() && q.back().h >= h) q.pop_back();
         q.push_back({h, pos});

@@ -32,25 +32,27 @@
 namespace {
 
 void print_usage(const char* argv0) {
-    std::cerr <<
-        "cdgb-build: build a colored compacted de Bruijn graph and emit\n"
-        "  - <out>.fa      FASTA of monochromatic colored unitigs (header = color_set_id)\n"
-        "  - <out>.colors  binary in Fulgor's `hybrid` color-set format\n"
-        "\n"
-        "usage:\n"
-        "  " << argv0 << " -i <filenames_list> -k <k> -o <out_basename> [options]\n"
-        "\n"
-        "options:\n"
-        "  -t <N>            worker threads (default 1)\n"
-        "  --bucketed        use minimizer-bucketed disk-based ingest (recommended\n"
-        "                    for thousands of input files)\n"
-        "  -m <N>            minimizer length for --bucketed (default: auto)\n"
-        "  --buckets-log2 <N>  log2(num_buckets) for --bucketed (default 10 -> 1024)\n"
-        "  --tmp-dir <PATH>  scratch directory for bucket files (default mkdtemp)\n"
-        "\n"
-        "<filenames_list> is a text file containing one input path per line.\n"
-        "Each input file is one color, in line order (file at line i has color i).\n"
-        "Inputs may be FASTA, FASTQ, or gzipped variants of either.\n";
+    std::cerr
+        << "cdgb-build: build a colored compacted de Bruijn graph and emit\n"
+           "  - <out>.fa      FASTA of monochromatic colored unitigs (header = color_set_id)\n"
+           "  - <out>.colors  binary in Fulgor's `hybrid` color-set format\n"
+           "\n"
+           "usage:\n"
+           "  "
+        << argv0
+        << " -i <filenames_list> -k <k> -o <out_basename> [options]\n"
+           "\n"
+           "options:\n"
+           "  -t <N>            worker threads (default 1)\n"
+           "  --bucketed        use minimizer-bucketed disk-based ingest (recommended\n"
+           "                    for thousands of input files)\n"
+           "  -m <N>            minimizer length for --bucketed (default: auto)\n"
+           "  --buckets-log2 <N>  log2(num_buckets) for --bucketed (default 10 -> 1024)\n"
+           "  --tmp-dir <PATH>  scratch directory for bucket files (default mkdtemp)\n"
+           "\n"
+           "<filenames_list> is a text file containing one input path per line.\n"
+           "Each input file is one color, in line order (file at line i has color i).\n"
+           "Inputs may be FASTA, FASTQ, or gzipped variants of either.\n";
 }
 
 class Timer {
@@ -61,6 +63,7 @@ public:
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - m_t0).count();
         std::cout << "[" << m_label << "] " << (ms / 1000.0) << " s\n";
     }
+
 private:
     const char* m_label;
     std::chrono::steady_clock::time_point m_t0;
@@ -73,18 +76,32 @@ bool parse_args(int argc, char** argv, cdgb::BuildConfig& cfg) {
             if (i + 1 >= argc) throw std::runtime_error(std::string("missing value for ") + opt);
             return std::string(argv[++i]);
         };
-        if (a == "-i") cfg.filenames_list = need("-i");
-        else if (a == "-k") cfg.k = (uint32_t)std::stoul(need("-k"));
-        else if (a == "-o") cfg.out_basename = need("-o");
-        else if (a == "-t") cfg.num_threads = (uint32_t)std::stoul(need("-t"));
-        else if (a == "--shards") cfg.shard_log2 = (uint32_t)std::stoul(need("--shards"));
-        else if (a == "--bucketed") cfg.bucketed = true;
-        else if (a == "-m") cfg.m = (uint32_t)std::stoul(need("-m"));
-        else if (a == "--buckets-log2") cfg.bucket_log2 = (uint32_t)std::stoul(need("--buckets-log2"));
-        else if (a == "--tmp-dir") cfg.tmp_dir = need("--tmp-dir");
-        else if (a == "-v" || a == "--verbose") cfg.verbose = true;
-        else if (a == "-h" || a == "--help") return false;
-        else { std::cerr << "unknown arg: " << a << "\n"; return false; }
+        if (a == "-i")
+            cfg.filenames_list = need("-i");
+        else if (a == "-k")
+            cfg.k = (uint32_t)std::stoul(need("-k"));
+        else if (a == "-o")
+            cfg.out_basename = need("-o");
+        else if (a == "-t")
+            cfg.num_threads = (uint32_t)std::stoul(need("-t"));
+        else if (a == "--shards")
+            cfg.shard_log2 = (uint32_t)std::stoul(need("--shards"));
+        else if (a == "--bucketed")
+            cfg.bucketed = true;
+        else if (a == "-m")
+            cfg.m = (uint32_t)std::stoul(need("-m"));
+        else if (a == "--buckets-log2")
+            cfg.bucket_log2 = (uint32_t)std::stoul(need("--buckets-log2"));
+        else if (a == "--tmp-dir")
+            cfg.tmp_dir = need("--tmp-dir");
+        else if (a == "-v" || a == "--verbose")
+            cfg.verbose = true;
+        else if (a == "-h" || a == "--help")
+            return false;
+        else {
+            std::cerr << "unknown arg: " << a << "\n";
+            return false;
+        }
     }
     if (cfg.filenames_list.empty() || cfg.out_basename.empty() || cfg.k == 0) return false;
     if (cfg.k > cdgb::MAX_K) throw std::runtime_error("k must be <= 63");
@@ -115,7 +132,8 @@ int run_bucketed(cdgb::BuildConfig& cfg, const std::vector<std::string>& files) 
     std::string tmp_dir = cfg.tmp_dir;
     bool tmp_owned = false;
     if (tmp_dir.empty()) {
-        std::string tmpl = (std::filesystem::temp_directory_path() / "cdgb_buckets_XXXXXX").string();
+        std::string tmpl =
+            (std::filesystem::temp_directory_path() / "cdgb_buckets_XXXXXX").string();
         std::vector<char> buf(tmpl.begin(), tmpl.end());
         buf.push_back('\0');
         if (mkdtemp(buf.data()) == nullptr) {
@@ -132,8 +150,7 @@ int run_bucketed(cdgb::BuildConfig& cfg, const std::vector<std::string>& files) 
         Timer _("bucket-write");
         std::atomic<uint64_t> done{0};
         cdgb::Progress prog("bucket-write", done, files.size());
-        cdgb::ingest_bucketed(files, cfg.k, cfg.m, cfg.bucket_log2,
-                              writer, cfg.num_threads, &done);
+        cdgb::ingest_bucketed(files, cfg.k, cfg.m, cfg.bucket_log2, writer, cfg.num_threads, &done);
         prog.stop();
     }
     writer.close();
@@ -162,9 +179,7 @@ int run_bucketed(cdgb::BuildConfig& cfg, const std::vector<std::string>& files) 
 
         // Group by global cid so the FASTA is written in color-set order.
         std::vector<std::vector<size_t>> by_class(global_dict.size());
-        for (size_t i = 0; i < all_unitigs.size(); ++i) {
-            by_class[unitig_cid[i]].push_back(i);
-        }
+        for (size_t i = 0; i < all_unitigs.size(); ++i) { by_class[unitig_cid[i]].push_back(i); }
 
         std::ofstream fa(cfg.out_basename + ".fa");
         if (!fa) throw std::runtime_error("cannot open " + cfg.out_basename + ".fa");
@@ -199,8 +214,8 @@ int run_bucketed(cdgb::BuildConfig& cfg, const std::vector<std::string>& files) 
         }
     }
 
-    std::cout << "done. wrote " << cfg.out_basename << ".fa and "
-              << cfg.out_basename << ".colors\n";
+    std::cout << "done. wrote " << cfg.out_basename << ".fa and " << cfg.out_basename
+              << ".colors\n";
     return 0;
 }
 
@@ -209,7 +224,10 @@ int run_bucketed(cdgb::BuildConfig& cfg, const std::vector<std::string>& files) 
 int main(int argc, char** argv) {
     cdgb::BuildConfig cfg;
     try {
-        if (!parse_args(argc, argv, cfg)) { print_usage(argv[0]); return 1; }
+        if (!parse_args(argc, argv, cfg)) {
+            print_usage(argv[0]);
+            return 1;
+        }
     } catch (std::exception& e) {
         std::cerr << "argument error: " << e.what() << "\n";
         print_usage(argv[0]);
@@ -217,9 +235,13 @@ int main(int argc, char** argv) {
     }
 
     auto files = read_filenames(cfg.filenames_list);
-    if (files.empty()) { std::cerr << "no input files\n"; return 1; }
+    if (files.empty()) {
+        std::cerr << "no input files\n";
+        return 1;
+    }
     if (files.size() > (uint64_t)UINT32_MAX) {
-        std::cerr << "too many colors (max 2^32 - 1)\n"; return 1;
+        std::cerr << "too many colors (max 2^32 - 1)\n";
+        return 1;
     }
     std::cout << "k = " << cfg.k << ", num_colors = " << files.size()
               << ", num_threads = " << cfg.num_threads
@@ -228,7 +250,8 @@ int main(int argc, char** argv) {
     auto t_start = std::chrono::steady_clock::now();
     auto print_total = [&] {
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                      std::chrono::steady_clock::now() - t_start).count();
+                      std::chrono::steady_clock::now() - t_start)
+                      .count();
         std::cout << "[total construction time] " << (ms / 1000.0) << " s\n";
     };
 
@@ -303,8 +326,8 @@ int main(int argc, char** argv) {
         essentials::save(h, (cfg.out_basename + ".colors").c_str());
     }
 
-    std::cout << "done. wrote " << cfg.out_basename << ".fa and "
-              << cfg.out_basename << ".colors\n";
+    std::cout << "done. wrote " << cfg.out_basename << ".fa and " << cfg.out_basename
+              << ".colors\n";
     print_total();
     return 0;
 }

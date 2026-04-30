@@ -50,8 +50,13 @@ inline StepResult step(kmer_int_t can, bool rc, uint32_t k, uint8_t nt) {
     kmer_int_t next_fwd = shift_append(cur, nt, k);
     kmer_int_t next_rev = reverse_complement(next_fwd, k);
     StepResult r;
-    if (next_fwd <= next_rev) { r.next_can = next_fwd; r.next_rc = false; }
-    else                      { r.next_can = next_rev; r.next_rc = true;  }
+    if (next_fwd <= next_rev) {
+        r.next_can = next_fwd;
+        r.next_rc = false;
+    } else {
+        r.next_can = next_rev;
+        r.next_rc = true;
+    }
     return r;
 }
 
@@ -86,8 +91,8 @@ struct UnitigWalker {
                     m_pos[i].emplace(kv.first, idx);
                     ++idx;
                 }
-                m_visited[i] = std::unique_ptr<std::atomic<uint8_t>[]>(
-                    new std::atomic<uint8_t>[ks.size()]);
+                m_visited[i] =
+                    std::unique_ptr<std::atomic<uint8_t>[]>(new std::atomic<uint8_t>[ks.size()]);
                 for (size_t j = 0; j < ks.size(); ++j) m_visited[i][j].store(0);
             }
         };
@@ -124,8 +129,7 @@ private:
 
     bool claim(uint64_t s, size_t idx) {
         uint8_t expected = 0;
-        return m_visited[s][idx].compare_exchange_strong(expected, 1,
-                                                         std::memory_order_acq_rel);
+        return m_visited[s][idx].compare_exchange_strong(expected, 1, std::memory_order_acq_rel);
     }
 
     bool locate(kmer_int_t can, uint64_t& s_out, size_t& idx_out) const {
@@ -171,9 +175,12 @@ private:
             kmer_int_t can = ks[i];
             uint32_t cid = color_id(can);
             bool start_rc;
-            if (is_left_end(can, false, cid)) start_rc = false;
-            else if (is_left_end(can, true, cid)) start_rc = true;
-            else continue;
+            if (is_left_end(can, false, cid))
+                start_rc = false;
+            else if (is_left_end(can, true, cid))
+                start_rc = true;
+            else
+                continue;
             if (!claim(s, i)) continue;
             extend_and_emit(can, start_rc, cid, out);
         }

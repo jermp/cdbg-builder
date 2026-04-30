@@ -41,9 +41,7 @@ struct ColorSetDict {
 
     uint32_t size() const { return (uint32_t)m_classes.size(); }
     const std::vector<uint32_t>& at(uint32_t id) const { return m_classes[id]; }
-    const std::vector<std::vector<uint32_t>>& classes() const {
-        return m_classes;
-    }
+    const std::vector<std::vector<uint32_t>>& classes() const { return m_classes; }
 
 private:
     std::vector<std::vector<uint32_t>> m_classes;
@@ -57,8 +55,7 @@ struct FinalKmerMap {
         std::unordered_map<kmer_int_t, uint32_t, KmerHasher> map;
     };
 
-    explicit FinalKmerMap(uint32_t num_shards_log2)
-        : m_mask((uint64_t(1) << num_shards_log2) - 1) {
+    explicit FinalKmerMap(uint32_t num_shards_log2) : m_mask((uint64_t(1) << num_shards_log2) - 1) {
         m_shards.resize(uint64_t(1) << num_shards_log2);
         for (auto& s : m_shards) s = std::make_unique<Shard>();
     }

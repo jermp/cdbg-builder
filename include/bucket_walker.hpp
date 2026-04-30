@@ -58,12 +58,12 @@ inline void process_bucket(const std::string& path, uint32_t k,
         for (uint32_t i = 0; i < k - 1; ++i) {
             uint8_t v = bases[i];
             fwd = ((fwd << 2) | v) & mask;
-            rc  = (rc >> 2) | ((kmer_int_t)(v ^ 3) << k_minus_1_x2);
+            rc = (rc >> 2) | ((kmer_int_t)(v ^ 3) << k_minus_1_x2);
         }
         for (uint32_t i = k - 1; i < bases.size(); ++i) {
             uint8_t v = bases[i];
             fwd = ((fwd << 2) | v) & mask;
-            rc  = (rc >> 2) | ((kmer_int_t)(v ^ 3) << k_minus_1_x2);
+            rc = (rc >> 2) | ((kmer_int_t)(v ^ 3) << k_minus_1_x2);
             kmer_int_t can = fwd <= rc ? fwd : rc;
             kmer_colors[can].add_color(color);
         }
@@ -102,8 +102,7 @@ inline void process_bucket(const std::string& path, uint32_t k,
 
 // Parallel driver. Each worker processes one bucket at a time and appends its
 // unitigs to the shared output vector under `out_mu`.
-inline void process_buckets(const BucketWriter& writer, uint32_t k,
-                            uint32_t num_threads,
+inline void process_buckets(const BucketWriter& writer, uint32_t k, uint32_t num_threads,
                             std::vector<BucketUnitig>& out, std::mutex& out_mu,
                             std::atomic<uint64_t>* done = nullptr) {
     if (num_threads == 0) num_threads = 1;
