@@ -3,7 +3,7 @@
 Correctness check for cdgb-build output.
 
 Given the same filenames list and k used for the build, this script:
-  1. Recomputes the expected canonical-k-mer -> {color ids} map from inputs.
+  1. Recomputes the expected canonical-k-mer -> color-bitmask map from inputs.
   2. Parses <out>.fa, where each FASTA record's header is a color_set_id and
      the body is a colored unitig.
   3. Verifies that
@@ -14,71 +14,93 @@ Given the same filenames list and k used for the build, this script:
          color sets in the inputs,
        - <out>.colors exists and is non-empty.
 
+K-mers are 2-bit packed into Python ints (A=0, C=1, G=2, T=3) and reduced to
+their canonical form (min of forward / reverse complement) so the verifier
+scales to tens of millions of k-mers without holding 31-byte strings.
+
 Exits 0 on success, non-zero with a message on the first failure.
 """
 
+import argparse
+import gzip
 import os
 import sys
-import argparse
 
 
-COMPLEMENT = str.maketrans("ACGTacgt", "TGCAtgca")
+# A=0, C=1, G=2, T=3, everything else = 0xff (= "split the window")
+_ACGT_TABLE = bytes(
+    {0x41: 0, 0x43: 1, 0x47: 2, 0x54: 3,
+     0x61: 0, 0x63: 1, 0x67: 2, 0x74: 3}.get(b, 0xff)
+    for b in range(256)
+)
 
 
-def revcomp(s: str) -> str:
-    return s.translate(COMPLEMENT)[::-1]
+def _open(path: str):
+    return gzip.open(path, "rb") if path.endswith(".gz") else open(path, "rb")
 
 
-def canonical(kmer: str) -> str:
-    rc = revcomp(kmer)
-    return kmer if kmer <= rc else rc
-
-
-def read_fasta(path: str):
-    """Yield (header, seq) records. Lowercases nothing; concatenates body lines."""
-    header = None
+def stream_records(path: str):
+    """Yield raw sequence bytes per record; concatenates wrapped lines."""
     body = []
-    with open(path) as fh:
+    have_header = False
+    with _open(path) as fh:
         for line in fh:
-            line = line.rstrip("\n")
             if not line:
                 continue
-            if line.startswith(">"):
-                if header is not None:
-                    yield header, "".join(body)
-                header = line[1:]
+            if line.startswith(b">"):
+                if have_header:
+                    yield b"".join(body)
                 body = []
+                have_header = True
             else:
-                body.append(line)
-        if header is not None:
-            yield header, "".join(body)
+                body.append(line.rstrip(b"\r\n"))
+        if have_header:
+            yield b"".join(body)
 
 
-def kmers(seq: str, k: int):
-    seq = seq.upper()
-    for i in range(len(seq) - k + 1):
-        sub = seq[i:i + k]
-        if all(c in "ACGT" for c in sub):
-            yield sub
+def canonical_kmers(seq: bytes, k: int):
+    """Yield 2-bit packed canonical k-mer ints; restarts at any non-ACGT base."""
+    mask = (1 << (2 * k)) - 1
+    rc_high_shift = 2 * (k - 1)
+    fwd = 0
+    rc = 0
+    filled = 0
+    table = _ACGT_TABLE
+    for byte in seq:
+        v = table[byte]
+        if v == 0xff:
+            filled = 0
+            fwd = 0
+            rc = 0
+            continue
+        fwd = ((fwd << 2) | v) & mask
+        rc = (rc >> 2) | ((v ^ 3) << rc_high_shift)
+        if filled + 1 < k:
+            filled += 1
+            continue
+        yield fwd if fwd <= rc else rc
 
 
-def expected_kmer_to_colors(filenames: list, k: int) -> dict:
-    """canonical kmer -> frozenset of color ids (0-indexed by file order)."""
+def expected_colors_map(filenames: list, k: int) -> dict:
+    """Returns {canonical_kmer_int: color_bitmask_int}."""
     out = {}
     for color, path in enumerate(filenames):
-        for _, seq in read_fasta(path):
-            for km in kmers(seq, k):
-                c = canonical(km)
-                out.setdefault(c, set()).add(color)
-    return {km: frozenset(s) for km, s in out.items()}
+        bit = 1 << color
+        for seq in stream_records(path):
+            for km in canonical_kmers(seq, k):
+                out[km] = out.get(km, 0) | bit
+    return out
 
 
 def verify(filenames_list: str, out_basename: str, k: int) -> int:
     with open(filenames_list) as fh:
         files = [ln.strip() for ln in fh if ln.strip()]
 
-    expected = expected_kmer_to_colors(files, k)
+    print(f"computing expected k-mer set from {len(files)} input(s)...", flush=True)
+    expected = expected_colors_map(files, k)
     expected_classes = set(expected.values())
+    print(f"  {len(expected)} canonical k-mers, "
+          f"{len(expected_classes)} distinct color set(s)", flush=True)
 
     fa_path = out_basename + ".fa"
     colors_path = out_basename + ".colors"
@@ -90,53 +112,69 @@ def verify(filenames_list: str, out_basename: str, k: int) -> int:
         print(f"FAIL: {colors_path} missing or empty")
         return 1
 
-    seen_kmers = {}            # canonical kmer -> color_set_id from output
-    id_to_class = {}           # color_set_id -> frozenset of colors
+    print(f"checking {fa_path}...", flush=True)
+    seen = {}             # canonical kmer -> color_set_id from output
+    id_to_class = {}      # color_set_id -> color bitmask
     num_unitigs = 0
 
-    for header, seq in read_fasta(fa_path):
-        try:
-            cid = int(header)
-        except ValueError:
-            print(f"FAIL: non-integer FASTA header '{header}'")
-            return 1
+    cid = None
+    body = []
+
+    def flush(cid, body_bytes):
+        nonlocal num_unitigs
+        if cid is None:
+            return 0
         num_unitigs += 1
-
-        unitig_kmers = list(kmers(seq, k))
-        if not unitig_kmers:
-            print(f"FAIL: unitig with header {cid} has no valid k-mers")
-            return 1
-
         unitig_class = None
-        for km in unitig_kmers:
-            c = canonical(km)
-            if c not in expected:
-                print(f"FAIL: unitig k-mer {c} not in any input")
+        for km in canonical_kmers(body_bytes, k):
+            cls = expected.get(km)
+            if cls is None:
+                print(f"FAIL: unitig k-mer (cid={cid}) not in any input")
                 return 1
-            cls = expected[c]
             if unitig_class is None:
                 unitig_class = cls
             elif unitig_class != cls:
-                print(f"FAIL: unitig {cid} mixes color sets {unitig_class} and {cls}")
+                print(f"FAIL: unitig {cid} mixes color sets "
+                      f"{unitig_class:b} and {cls:b}")
                 return 1
-            if c in seen_kmers:
-                print(f"FAIL: k-mer {c} appears in multiple unitigs "
-                      f"(ids {seen_kmers[c]} and {cid})")
+            if km in seen:
+                print(f"FAIL: k-mer appears in multiple unitigs "
+                      f"(ids {seen[km]} and {cid})")
                 return 1
-            seen_kmers[c] = cid
-
-        if cid in id_to_class:
-            if id_to_class[cid] != unitig_class:
-                print(f"FAIL: color_set_id {cid} maps to "
-                      f"{id_to_class[cid]} and {unitig_class}")
-                return 1
-        else:
+            seen[km] = cid
+        if unitig_class is None:
+            print(f"FAIL: unitig with header {cid} has no valid k-mers")
+            return 1
+        prev = id_to_class.get(cid)
+        if prev is None:
             id_to_class[cid] = unitig_class
+        elif prev != unitig_class:
+            print(f"FAIL: color_set_id {cid} maps to "
+                  f"{prev:b} and {unitig_class:b}")
+            return 1
+        return 0
 
-    missing = set(expected) - set(seen_kmers)
-    if missing:
-        print(f"FAIL: {len(missing)} input k-mer(s) missing from output, "
-              f"e.g. {next(iter(missing))}")
+    with open(fa_path, "rb") as fh:
+        for line in fh:
+            if line.startswith(b">"):
+                rc = flush(cid, b"".join(body))
+                if rc:
+                    return rc
+                try:
+                    cid = int(line[1:].rstrip())
+                except ValueError:
+                    print(f"FAIL: non-integer FASTA header '{line[1:].rstrip()!r}'")
+                    return 1
+                body = []
+            else:
+                body.append(line.rstrip(b"\r\n"))
+        rc = flush(cid, b"".join(body))
+        if rc:
+            return rc
+
+    if len(seen) != len(expected):
+        missing = len(expected) - len(seen)
+        print(f"FAIL: {missing} input k-mer(s) missing from output")
         return 1
 
     distinct_ids = set(id_to_class.keys())
@@ -147,11 +185,9 @@ def verify(filenames_list: str, out_basename: str, k: int) -> int:
 
     if set(id_to_class.values()) != expected_classes:
         print("FAIL: set of color sets emitted differs from expected")
-        print(f"  emitted:  {set(id_to_class.values())}")
-        print(f"  expected: {expected_classes}")
         return 1
 
-    print(f"OK: {num_unitigs} unitig(s), {len(seen_kmers)} canonical k-mer(s), "
+    print(f"OK: {num_unitigs} unitig(s), {len(seen)} canonical k-mer(s), "
           f"{len(distinct_ids)} color set(s); {colors_path} present "
           f"({os.path.getsize(colors_path)} bytes)")
     return 0

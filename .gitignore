@@ -20,6 +20,3 @@ Makefile
 *.cdbg
 *.cdbg.colors
 test_output/
-
-# but keep tracked test inputs
-!test_data/inputs/*.fa
