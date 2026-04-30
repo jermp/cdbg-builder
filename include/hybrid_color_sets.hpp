@@ -26,10 +26,11 @@
 // Offsets array stores the bit offset into m_color_sets at which each color
 // set begins, plus a sentinel = total bit count.
 
-#include <bits/bit_vector.hpp>
-#include <bits/elias_fano.hpp>
-#include <bits/util.hpp>
-#include <essentials/essentials.hpp>
+#include <bit_vector.hpp>
+#include <elias_fano.hpp>
+#include <integer_codes.hpp>
+#include <util.hpp>
+#include <essentials.hpp>
 
 #include <cassert>
 #include <cstdint>
