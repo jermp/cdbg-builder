@@ -31,11 +31,18 @@ struct KmerEntry {
 
     // Insert a color; idempotent.
     void add_color(uint32_t c) {
-        if (inline_a == INVALID) { inline_a = c; return; }
+        if (inline_a == INVALID) {
+            inline_a = c;
+            return;
+        }
         if (inline_a == c) return;
-        if (inline_b == INVALID) { inline_b = c; return; }
+        if (inline_b == INVALID) {
+            inline_b = c;
+            return;
+        }
         if (inline_b == c) return;
-        for (uint32_t x : extra) if (x == c) return;
+        for (uint32_t x : extra)
+            if (x == c) return;
         extra.push_back(c);
     }
 
@@ -61,8 +68,7 @@ struct ConcurrentKmerMap {
     };
 
     explicit ConcurrentKmerMap(uint32_t num_shards_log2 = 8)
-        : m_log2(num_shards_log2)
-        , m_mask((uint64_t(1) << num_shards_log2) - 1) {
+        : m_mask((uint64_t(1) << num_shards_log2) - 1) {
         m_shards.resize(uint64_t(1) << num_shards_log2);
         for (auto& s : m_shards) s = std::make_unique<Shard>();
     }
@@ -82,7 +88,7 @@ struct ConcurrentKmerMap {
     Shard& shard(uint64_t i) { return *m_shards[i]; }
     const Shard& shard(uint64_t i) const { return *m_shards[i]; }
 
-    uint64_t shard_of(kmer_int_t key) const { return KmerHasher{}(key) & m_mask; }
+    uint64_t shard_of(kmer_int_t key) const { return KmerHasher{}(key)&m_mask; }
 
     uint64_t num_kmers() const {
         uint64_t n = 0;
@@ -91,7 +97,6 @@ struct ConcurrentKmerMap {
     }
 
 private:
-    uint32_t m_log2;
     uint64_t m_mask;
     std::vector<std::unique_ptr<Shard>> m_shards;
 };

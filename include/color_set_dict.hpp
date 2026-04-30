@@ -41,7 +41,9 @@ struct ColorSetDict {
 
     uint32_t size() const { return (uint32_t)m_classes.size(); }
     const std::vector<uint32_t>& at(uint32_t id) const { return m_classes[id]; }
-    const std::vector<std::vector<uint32_t>>& classes() const { return m_classes; }
+    const std::vector<std::vector<uint32_t>>& classes() const {
+        return m_classes;
+    }
 
 private:
     std::vector<std::vector<uint32_t>> m_classes;
@@ -56,8 +58,7 @@ struct FinalKmerMap {
     };
 
     explicit FinalKmerMap(uint32_t num_shards_log2)
-        : m_log2(num_shards_log2)
-        , m_mask((uint64_t(1) << num_shards_log2) - 1) {
+        : m_mask((uint64_t(1) << num_shards_log2) - 1) {
         m_shards.resize(uint64_t(1) << num_shards_log2);
         for (auto& s : m_shards) s = std::make_unique<Shard>();
     }
@@ -65,17 +66,17 @@ struct FinalKmerMap {
     uint64_t num_shards() const { return m_shards.size(); }
     Shard& shard(uint64_t i) { return *m_shards[i]; }
     const Shard& shard(uint64_t i) const { return *m_shards[i]; }
-    uint64_t shard_of(kmer_int_t k) const { return KmerHasher{}(k) & m_mask; }
+    uint64_t shard_of(kmer_int_t k) const { return KmerHasher{}(k)&m_mask; }
 
     // Lookup; returns UINT32_MAX if not present.
     uint32_t lookup(kmer_int_t k) const {
-        const auto& s = *m_shards[KmerHasher{}(k) & m_mask];
+        const auto& s = *m_shards[KmerHasher{}(k)&m_mask];
         auto it = s.map.find(k);
         return it == s.map.end() ? 0xffffffffu : it->second;
     }
 
     bool contains(kmer_int_t k) const {
-        const auto& s = *m_shards[KmerHasher{}(k) & m_mask];
+        const auto& s = *m_shards[KmerHasher{}(k)&m_mask];
         return s.map.find(k) != s.map.end();
     }
 
@@ -86,7 +87,6 @@ struct FinalKmerMap {
     }
 
 private:
-    uint32_t m_log2;
     uint64_t m_mask;
     std::vector<std::unique_ptr<Shard>> m_shards;
 };
