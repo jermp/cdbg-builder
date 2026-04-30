@@ -1,3 +1,4 @@
+#include <atomic>
 #include <chrono>
 #include <fstream>
 #include <iostream>
@@ -14,6 +15,7 @@
 #include "finalize.hpp"
 #include "hybrid_color_sets.hpp"
 #include "ingester.hpp"
+#include "progress.hpp"
 #include "unitig_walker.hpp"
 
 namespace {
@@ -97,10 +99,15 @@ int main(int argc, char** argv) {
     std::cout << "k = " << cfg.k << ", num_colors = " << files.size()
               << ", num_threads = " << cfg.num_threads << "\n";
 
+    const uint64_t num_shards = uint64_t(1) << cfg.shard_log2;
+
     cdgb::ConcurrentKmerMap raw_map(cfg.shard_log2);
     {
         Timer _("ingest");
-        cdgb::ingest_parallel(files, cfg.k, raw_map, cfg.num_threads);
+        std::atomic<uint64_t> done{0};
+        cdgb::Progress prog("ingest", done, files.size());
+        cdgb::ingest_parallel(files, cfg.k, raw_map, cfg.num_threads, &done);
+        prog.stop();
         std::cout << "  k-mers ingested: " << raw_map.num_kmers() << "\n";
     }
 
@@ -108,7 +115,10 @@ int main(int argc, char** argv) {
     cdgb::ColorSetDict global_dict;
     {
         Timer _("finalize");
-        cdgb::finalize(raw_map, fkm, global_dict, cfg.num_threads);
+        std::atomic<uint64_t> done{0};
+        cdgb::Progress prog("finalize", done, num_shards);
+        cdgb::finalize(raw_map, fkm, global_dict, cfg.num_threads, &done);
+        prog.stop();
         std::cout << "  distinct color classes: " << global_dict.size() << "\n";
         std::cout << "  k-mers retained: " << fkm.size() << "\n";
     }
@@ -118,7 +128,10 @@ int main(int argc, char** argv) {
         Timer _("unitig walk");
         std::mutex mu;
         cdgb::UnitigWalker w(fkm, cfg.k);
-        w.walk_all(cfg.num_threads, unitigs, mu);
+        std::atomic<uint64_t> done{0};
+        cdgb::Progress prog("unitig walk", done, num_shards);
+        w.walk_all(cfg.num_threads, unitigs, mu, &done);
+        prog.stop();
         std::cout << "  unitigs: " << unitigs.size() << "\n";
     }
 

@@ -88,8 +88,12 @@ inline void ingest_file(const std::string& path, uint32_t color, uint32_t k,
 
 // Parallel driver: distribute files across threads. Each thread fully processes
 // one file at a time. Files are independent inputs (one color each).
+//
+// If `done` is non-null, it is incremented by 1 after each file completes; a
+// caller-side Progress can then report file-level ingest progress.
 inline void ingest_parallel(const std::vector<std::string>& files, uint32_t k,
-                            ConcurrentKmerMap& dst, uint32_t num_threads) {
+                            ConcurrentKmerMap& dst, uint32_t num_threads,
+                            std::atomic<uint64_t>* done = nullptr) {
     if (num_threads == 0) num_threads = 1;
     std::atomic<size_t> next{0};
     std::vector<std::thread> workers;
@@ -104,6 +108,7 @@ inline void ingest_parallel(const std::vector<std::string>& files, uint32_t k,
             } catch (std::exception& e) {
                 std::cerr << "error ingesting " << files[i] << ": " << e.what() << '\n';
             }
+            if (done) done->fetch_add(1, std::memory_order_relaxed);
         }
     };
 

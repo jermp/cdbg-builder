@@ -60,7 +60,8 @@ inline StepResult step(kmer_int_t can, bool rc, uint32_t k, uint8_t nt) {
 struct UnitigWalker {
     UnitigWalker(const FinalKmerMap& fkm, uint32_t k) : m_fkm(fkm), m_k(k) {}
 
-    void walk_all(uint32_t num_threads, std::vector<Unitig>& out, std::mutex& out_mu) {
+    void walk_all(uint32_t num_threads, std::vector<Unitig>& out, std::mutex& out_mu,
+                  std::atomic<uint64_t>* done = nullptr) {
         if (num_threads == 0) num_threads = 1;
         const uint64_t S = m_fkm.num_shards();
 
@@ -104,6 +105,7 @@ struct UnitigWalker {
                 uint64_t s = next_shard.fetch_add(1);
                 if (s >= S) break;
                 walk_shard(s, local);
+                if (done) done->fetch_add(1, std::memory_order_relaxed);
             }
             std::lock_guard<std::mutex> lk(out_mu);
             for (auto& u : local) out.emplace_back(std::move(u));

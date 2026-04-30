@@ -22,7 +22,7 @@ namespace cdgb {
 //   3. Each worker rewrites its assigned FinalKmerMap shards to use global
 //      ids.
 inline void finalize(ConcurrentKmerMap& src, FinalKmerMap& dst, ColorSetDict& global_dict,
-                     uint32_t num_threads) {
+                     uint32_t num_threads, std::atomic<uint64_t>* done = nullptr) {
     if (num_threads == 0) num_threads = 1;
     const uint64_t S = src.num_shards();
 
@@ -54,6 +54,7 @@ inline void finalize(ConcurrentKmerMap& src, FinalKmerMap& dst, ColorSetDict& gl
             // Free the source shard's memory now that we've extracted what we need.
             std::unordered_map<kmer_int_t, KmerEntry, KmerHasher> tmp;
             shard.map.swap(tmp);
+            if (done) done->fetch_add(1, std::memory_order_relaxed);
         }
     };
     {
