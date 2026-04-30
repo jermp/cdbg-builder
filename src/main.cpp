@@ -40,6 +40,7 @@ public:
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - m_t0).count();
         std::cout << "[" << m_label << "] " << (ms / 1000.0) << " s\n";
     }
+
 private:
     const char* m_label;
     std::chrono::steady_clock::time_point m_t0;
@@ -119,7 +120,8 @@ int run_bucketed(cdgb::BuildConfig& cfg, const std::vector<std::string>& files) 
     std::string tmp_dir = cfg.tmp_dir;
     bool tmp_owned = false;
     if (tmp_dir.empty()) {
-        std::string tmpl = (std::filesystem::temp_directory_path() / "cdgb_buckets_XXXXXX").string();
+        std::string tmpl =
+            (std::filesystem::temp_directory_path() / "cdgb_buckets_XXXXXX").string();
         std::vector<char> buf(tmpl.begin(), tmpl.end());
         buf.push_back('\0');
         if (mkdtemp(buf.data()) == nullptr) {
@@ -136,8 +138,7 @@ int run_bucketed(cdgb::BuildConfig& cfg, const std::vector<std::string>& files) 
         Timer _("bucket-write");
         std::atomic<uint64_t> done{0};
         cdgb::Progress prog("bucket-write", done, files.size());
-        cdgb::ingest_bucketed(files, cfg.k, cfg.m, cfg.bucket_log2,
-                              writer, cfg.num_threads, &done);
+        cdgb::ingest_bucketed(files, cfg.k, cfg.m, cfg.bucket_log2, writer, cfg.num_threads, &done);
         prog.stop();
     }
     writer.close();
@@ -166,9 +167,7 @@ int run_bucketed(cdgb::BuildConfig& cfg, const std::vector<std::string>& files) 
 
         // Group by global cid so the FASTA is written in color-set order.
         std::vector<std::vector<size_t>> by_class(global_dict.size());
-        for (size_t i = 0; i < all_unitigs.size(); ++i) {
-            by_class[unitig_cid[i]].push_back(i);
-        }
+        for (size_t i = 0; i < all_unitigs.size(); ++i) { by_class[unitig_cid[i]].push_back(i); }
 
         std::ofstream fa(cfg.out_basename + ".fa");
         if (!fa) throw std::runtime_error("cannot open " + cfg.out_basename + ".fa");
@@ -203,8 +202,8 @@ int run_bucketed(cdgb::BuildConfig& cfg, const std::vector<std::string>& files) 
         }
     }
 
-    std::cout << "done. wrote " << cfg.out_basename << ".fa and "
-              << cfg.out_basename << ".colors\n";
+    std::cout << "done. wrote " << cfg.out_basename << ".fa and " << cfg.out_basename
+              << ".colors\n";
     return 0;
 }
 
@@ -215,9 +214,13 @@ int main(int argc, char** argv) {
     if (!parse_args(argc, argv, cfg)) return 1;
 
     auto files = read_filenames(cfg.filenames_list);
-    if (files.empty()) { std::cerr << "no input files\n"; return 1; }
+    if (files.empty()) {
+        std::cerr << "no input files\n";
+        return 1;
+    }
     if (files.size() > (uint64_t)UINT32_MAX) {
-        std::cerr << "too many colors (max 2^32 - 1)\n"; return 1;
+        std::cerr << "too many colors (max 2^32 - 1)\n";
+        return 1;
     }
     std::cout << "k = " << cfg.k << ", num_colors = " << files.size()
               << ", num_threads = " << cfg.num_threads
@@ -226,7 +229,8 @@ int main(int argc, char** argv) {
     auto t_start = std::chrono::steady_clock::now();
     auto print_total = [&] {
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                      std::chrono::steady_clock::now() - t_start).count();
+                      std::chrono::steady_clock::now() - t_start)
+                      .count();
         std::cout << "[total construction time] " << (ms / 1000.0) << " s\n";
     };
 
@@ -301,8 +305,8 @@ int main(int argc, char** argv) {
         essentials::save(h, (cfg.out_basename + ".colors").c_str());
     }
 
-    std::cout << "done. wrote " << cfg.out_basename << ".fa and "
-              << cfg.out_basename << ".colors\n";
+    std::cout << "done. wrote " << cfg.out_basename << ".fa and " << cfg.out_basename
+              << ".colors\n";
     print_total();
     return 0;
 }

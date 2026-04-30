@@ -50,22 +50,22 @@ inline void emit_kmers_to_buffers(const char* seq, size_t len, uint32_t k, uint3
             continue;
         }
         fwd = ((fwd << 2) | v) & mask;
-        rc  = (rc >> 2) | ((kmer_int_t)(v ^ 3) << k_minus_1_x2);
+        rc = (rc >> 2) | ((kmer_int_t)(v ^ 3) << k_minus_1_x2);
         if (valid + 1 < k) {
             ++valid;
             continue;
         }
         valid = k;
         kmer_int_t can = fwd <= rc ? fwd : rc;
-        uint64_t s = KmerHasher{}(can) & shard_mask;
+        uint64_t s = KmerHasher{}(can)&shard_mask;
         bufs[s].pairs.emplace_back(can, color);
         if (bufs[s].pairs.size() >= flush_threshold) flush_one(s);
     }
 }
 
 // Process one file (one color) into the shared map.
-inline void ingest_file(const std::string& path, uint32_t color, uint32_t k,
-                        ConcurrentKmerMap& dst, size_t flush_threshold = 4096) {
+inline void ingest_file(const std::string& path, uint32_t color, uint32_t k, ConcurrentKmerMap& dst,
+                        size_t flush_threshold = 4096) {
     const uint64_t shard_mask = dst.num_shards() - 1;
     std::vector<ShardBuffer> bufs(dst.num_shards());
 

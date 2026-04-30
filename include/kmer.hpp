@@ -22,11 +22,20 @@ constexpr uint32_t MAX_K = 63;
 
 inline uint8_t nuc_to_2bit(char c) {
     switch (c) {
-        case 'A': case 'a': return 0;
-        case 'C': case 'c': return 1;
-        case 'G': case 'g': return 2;
-        case 'T': case 't': return 3;
-        default: return 0xff;
+        case 'A':
+        case 'a':
+            return 0;
+        case 'C':
+        case 'c':
+            return 1;
+        case 'G':
+        case 'g':
+            return 2;
+        case 'T':
+        case 't':
+            return 3;
+        default:
+            return 0xff;
     }
 }
 
@@ -57,9 +66,7 @@ inline kmer_int_t canonical(kmer_int_t fwd, uint32_t k) {
     return fwd <= rc ? fwd : rc;
 }
 
-inline bool is_canonical(kmer_int_t fwd, uint32_t k) {
-    return fwd <= reverse_complement(fwd, k);
-}
+inline bool is_canonical(kmer_int_t fwd, uint32_t k) { return fwd <= reverse_complement(fwd, k); }
 
 // shift and append: take a k-mer, drop first symbol, append `nt` (2-bit) at the right.
 inline kmer_int_t shift_append(kmer_int_t x, uint8_t nt, uint32_t k) {
@@ -99,7 +106,7 @@ struct KmerHasher {
         auto mix = [](uint64_t z) {
             z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
             z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
-            z =  z ^ (z >> 31);
+            z = z ^ (z >> 31);
             return z;
         };
         return (size_t)(mix(lo) ^ (mix(hi + 0x9e3779b97f4a7c15ULL) << 1));

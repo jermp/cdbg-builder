@@ -34,21 +34,19 @@ public:
         , m_num_buckets(num_buckets)
         , m_flush_bytes(flush_bytes)
         , m_mus(num_buckets)
-        , m_files(num_buckets, nullptr)
-    {
+        , m_files(num_buckets, nullptr) {
         std::filesystem::create_directories(m_dir);
         for (uint32_t b = 0; b < num_buckets; ++b) {
             std::string p = bucket_path(b);
             FILE* f = std::fopen(p.c_str(), "wb");
-            if (!f) throw std::runtime_error("cannot open bucket file: " + p +
-                                             ": " + std::strerror(errno));
+            if (!f)
+                throw std::runtime_error("cannot open bucket file: " + p + ": " +
+                                         std::strerror(errno));
             m_files[b] = f;
         }
     }
 
-    ~BucketWriter() {
-        close();
-    }
+    ~BucketWriter() { close(); }
 
     BucketWriter(const BucketWriter&) = delete;
     BucketWriter& operator=(const BucketWriter&) = delete;
@@ -66,9 +64,7 @@ public:
         if (buf.empty()) return;
         std::lock_guard<std::mutex> lk(m_mus[b]);
         size_t n = std::fwrite(buf.data(), 1, buf.size(), m_files[b]);
-        if (n != buf.size()) {
-            throw std::runtime_error("short write to " + bucket_path(b));
-        }
+        if (n != buf.size()) { throw std::runtime_error("short write to " + bucket_path(b)); }
         m_total_bytes.fetch_add(buf.size(), std::memory_order_relaxed);
         buf.clear();
     }
@@ -142,8 +138,7 @@ public:
     // Iterate records in order. Returns false when no more records are available.
     bool next(uint32_t& color, std::vector<uint8_t>& bases) {
         if (m_pos >= m_buf.size()) return false;
-        size_t consumed = read_super_kmer(m_buf.data() + m_pos, m_buf.size() - m_pos,
-                                          color, bases);
+        size_t consumed = read_super_kmer(m_buf.data() + m_pos, m_buf.size() - m_pos, color, bases);
         if (consumed == 0) return false;
         m_pos += consumed;
         return true;

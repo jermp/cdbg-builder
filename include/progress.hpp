@@ -30,9 +30,8 @@ public:
         , m_os(os)
         , m_interval(interval)
         , m_is_tty(::isatty(2) != 0)
-        , m_start(std::chrono::steady_clock::now())
-    {
-        m_thread = std::thread([this]{ run(); });
+        , m_start(std::chrono::steady_clock::now()) {
+        m_thread = std::thread([this] { run(); });
     }
 
     ~Progress() { stop(); }
@@ -63,20 +62,17 @@ private:
         if (final) done = m_total ? m_total : done;
 
         auto now = std::chrono::steady_clock::now();
-        double sec = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_start).count() / 1000.0;
+        double sec =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - m_start).count() / 1000.0;
 
         char buf[256];
         if (m_total) {
             double pct = 100.0 * (double)done / (double)m_total;
-            std::snprintf(buf, sizeof(buf),
-                          "[%s] %llu/%llu (%.1f%%) %.1fs",
-                          m_label.c_str(),
-                          (unsigned long long)done, (unsigned long long)m_total,
-                          pct, sec);
+            std::snprintf(buf, sizeof(buf), "[%s] %llu/%llu (%.1f%%) %.1fs", m_label.c_str(),
+                          (unsigned long long)done, (unsigned long long)m_total, pct, sec);
         } else {
-            std::snprintf(buf, sizeof(buf),
-                          "[%s] %llu %.1fs",
-                          m_label.c_str(), (unsigned long long)done, sec);
+            std::snprintf(buf, sizeof(buf), "[%s] %llu %.1fs", m_label.c_str(),
+                          (unsigned long long)done, sec);
         }
 
         if (m_is_tty) {

@@ -38,9 +38,7 @@ inline void pack_2bit(const uint8_t* src, size_t n, std::vector<uint8_t>& dst) {
 // into `dst` (cleared and resized to n).
 inline void unpack_2bit(const uint8_t* src, size_t n, std::vector<uint8_t>& dst) {
     dst.assign(n, 0);
-    for (size_t i = 0; i < n; ++i) {
-        dst[i] = (src[i >> 2] >> (2 * (i & 3))) & 3u;
-    }
+    for (size_t i = 0; i < n; ++i) { dst[i] = (src[i >> 2] >> (2 * (i & 3))) & 3u; }
 }
 
 // ---- LEB128 varint -----------------------------------------------------------
@@ -78,8 +76,8 @@ inline void write_super_kmer(uint32_t color, const uint8_t* bases, uint32_t len,
 
 // Returns the byte length consumed; sets out_color, out_len, and copies bases
 // into out_bases. Returns 0 on malformed/EOF.
-inline size_t read_super_kmer(const uint8_t* buf, size_t buf_len,
-                              uint32_t& out_color, std::vector<uint8_t>& out_bases) {
+inline size_t read_super_kmer(const uint8_t* buf, size_t buf_len, uint32_t& out_color,
+                              std::vector<uint8_t>& out_bases) {
     size_t p = 0;
     uint64_t color = varint_read(buf, buf_len, p);
     uint64_t len = varint_read(buf, buf_len, p);
