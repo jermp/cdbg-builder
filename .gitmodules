@@ -1,0 +1,3 @@
+[submodule "external/bits"]
+	path = external/bits
+	url = https://github.com/jermp/bits
