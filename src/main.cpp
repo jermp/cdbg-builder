@@ -185,9 +185,18 @@ int run_bucketed(cdgb::BuildConfig& cfg, const std::vector<std::string>& files) 
         essentials::save(h, (cfg.out_basename + ".colors").c_str());
     }
 
-    if (tmp_owned) {
+    // Clean up bucket files. If we created the directory ourselves, remove it
+    // entirely; if the user supplied --tmp-dir, only remove the bucket files
+    // we wrote (leave the directory and any other contents alone).
+    {
         std::error_code ec;
-        std::filesystem::remove_all(tmp_dir, ec);
+        if (tmp_owned) {
+            std::filesystem::remove_all(tmp_dir, ec);
+        } else {
+            for (uint32_t b = 0; b < num_buckets; ++b) {
+                std::filesystem::remove(writer.bucket_path(b), ec);
+            }
+        }
     }
 
     std::cout << "done. wrote " << cfg.out_basename << ".fa and "
