@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-#include <essentials/essentials.hpp>
+#include <essentials.hpp>
 
 #include "build_config.hpp"
 #include "color_set_dict.hpp"
