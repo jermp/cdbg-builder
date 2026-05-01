@@ -92,12 +92,12 @@ public:
             } else {
                 Entry& e = it->second;
                 e.flags &= r.flags;  // AND across contributors
-                auto& cs = e.colors;
-                auto pos = std::lower_bound(cs.begin(), cs.end(), r.color);
-                if (pos == cs.end() || *pos != r.color) {
-                    cs.insert(pos, r.color);
-                    m_bytes += sizeof(uint32_t);
-                }
+                // Append unsorted; sort+unique runs once at spill time.
+                // For high-redundancy inputs (a popular super-k-mer hit by
+                // every input file) this turns the per-color cost from
+                // O(prev_color_count) into O(1).
+                e.colors.push_back(r.color);
+                m_bytes += sizeof(uint32_t);
             }
         }
         if (m_bytes >= m_spill_bytes) spill_locked();
@@ -125,7 +125,12 @@ private:
         uint64_t spilled = 0;
         for (auto& kv : m_dedup) {
             const std::string& key = kv.first;
-            const Entry& e = kv.second;
+            Entry& e = kv.second;
+            // Sort+unique once per spill; the insert-time path is just
+            // push_back, so duplicates are common when the same color
+            // recurs across batches.
+            std::sort(e.colors.begin(), e.colors.end());
+            e.colors.erase(std::unique(e.colors.begin(), e.colors.end()), e.colors.end());
             rec_buf.clear();
             write_super_kmer(e.flags, e.colors.data(), (uint32_t)e.colors.size(),
                              (const uint8_t*)key.data(), (uint32_t)key.size(), rec_buf);
