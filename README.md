@@ -47,7 +47,7 @@ Options:
 | `-t INT`             | Number of worker threads                                          | 1       |
 | `-m INT`             | Minimizer length used for bucketing                               | auto    |
 | `--buckets-log2 INT` | `2^N` minimizer-derived bucket files on disk                      | 10      |
-| `--tmp-dir PATH`     | Scratch directory for the bucket files (must be empty; removed on success) | mkdtemp |
+| `--tmp-dir PATH`     | Scratch directory for the bucket files (created if missing; if it already exists it must be empty; removed on success) | mkdtemp |
 | `-v`                 | Verbose output                                                    | off     |
 
 The build pipeline is GGCAT-style: stream input → write super-k-mers

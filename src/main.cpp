@@ -120,10 +120,11 @@ int main(int argc, char** argv) {
         std::cout << "[total construction time] " << (ms / 1000.0) << " s\n";
     };
 
-    // Resolve a scratch directory. If the user supplied --tmp-dir, it
-    // must exist and be empty: the tool wipes the entire directory at
-    // the end of construction, and we don't want to clobber unrelated
-    // user files that happen to be in there.
+    // Resolve a scratch directory. If the user supplied --tmp-dir, we
+    // create it if missing. Once construction starts, the tool wipes
+    // the entire directory at the end -- so if the path already exists,
+    // it must be a directory and it must be empty (we won't clobber
+    // unrelated user files).
     std::string tmp_dir = cfg.tmp_dir;
     if (tmp_dir.empty()) {
         std::string tmpl =
@@ -137,16 +138,24 @@ int main(int argc, char** argv) {
         tmp_dir = buf.data();
     } else {
         std::error_code ec;
-        if (!std::filesystem::exists(tmp_dir, ec) || !std::filesystem::is_directory(tmp_dir, ec)) {
-            std::cerr << "error: --tmp-dir " << tmp_dir
-                      << " does not exist or is not a directory\n";
-            return 1;
-        }
-        if (!std::filesystem::is_empty(tmp_dir, ec)) {
-            std::cerr << "error: --tmp-dir " << tmp_dir
-                      << " is not empty (the tool will remove the directory on exit, so it must"
-                         " start empty)\n";
-            return 1;
+        if (std::filesystem::exists(tmp_dir, ec)) {
+            if (!std::filesystem::is_directory(tmp_dir, ec)) {
+                std::cerr << "error: --tmp-dir " << tmp_dir << " exists but is not a directory\n";
+                return 1;
+            }
+            if (!std::filesystem::is_empty(tmp_dir, ec)) {
+                std::cerr << "error: --tmp-dir " << tmp_dir
+                          << " is not empty (the tool will remove the directory on exit, so it"
+                             " must start empty)\n";
+                return 1;
+            }
+        } else {
+            std::filesystem::create_directories(tmp_dir, ec);
+            if (ec) {
+                std::cerr << "error: cannot create --tmp-dir " << tmp_dir << ": " << ec.message()
+                          << "\n";
+                return 1;
+            }
         }
     }
     std::cout << "  tmp_dir = " << tmp_dir << "\n";
@@ -164,29 +173,22 @@ int main(int argc, char** argv) {
               << writer.total_uncompressed_bytes() << " uncompressed)\n";
     cdgb::bucket_prof().print(cfg.num_threads);
 
+    // Bucket processing emits stitchable fragments AND merges per-bucket
+    // color sets into the shared global dict on the fly. By the time we
+    // exit this block, every fragment already carries a global cid; no
+    // separate single-threaded intern pass is needed.
     std::vector<cdgb::stitchable_unitig> frag_unitigs;
     std::mutex out_mu;
+    cdgb::color_set_dict global_dict;
+    std::mutex global_mu;
     {
         timer _("bucket-process");
         std::atomic<uint64_t> done{0};
         cdgb::progress prog("bucket-process", done, num_buckets);
-        cdgb::process_buckets(writer, cfg.k, cfg.num_threads, frag_unitigs, out_mu, &done);
+        cdgb::process_buckets(writer, cfg.k, cfg.num_threads, frag_unitigs, out_mu, global_dict,
+                              global_mu, &done);
         prog.stop();
         std::cout << "  bucket fragments: " << frag_unitigs.size() << "\n";
-    }
-
-    // Globally intern each fragment's color set into a uint32_t cid.
-    // Doing this BEFORE stitch turns stitch_unitigs's color-set equality
-    // check from O(color_count) (vector compare) into O(1) (uint32_t
-    // compare), and likewise turns walk_chain's color-set copy into a
-    // single integer assignment. On the 4546-genome run that drops the
-    // stitch phase from minutes to seconds.
-    cdgb::color_set_dict global_dict;
-    {
-        timer _("intern color sets");
-        for (auto& u : frag_unitigs) {
-            u.cid = global_dict.intern(std::move(u.colors));
-        }
         std::cout << "  distinct color classes: " << global_dict.size() << "\n";
     }
 
@@ -202,7 +204,8 @@ int main(int argc, char** argv) {
     }
 
     // Emit FASTA + .colors. Both files use the cid that's already on
-    // each unitig (set by the interning pass above).
+    // each unitig (assigned during process_buckets when each bucket's
+    // local color_set_dict was merged into the global one).
     {
         timer _("emit fasta + colors");
         std::vector<std::vector<size_t>> by_class(global_dict.size());

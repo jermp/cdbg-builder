@@ -45,6 +45,11 @@ struct color_set_dict {
     const std::vector<uint32_t>& at(uint32_t id) const { return m_classes[id]; }
     const std::vector<std::vector<uint32_t>>& classes() const { return m_classes; }
 
+    // Move-out of the i-th color list; the dict entry is left empty.
+    // Used by the per-bucket merge in process_buckets to avoid copying
+    // each bucket's classes into the global dict.
+    std::vector<uint32_t>& mutable_at(uint32_t id) { return m_classes[id]; }
+
 private:
     std::vector<std::vector<uint32_t>> m_classes;
     ankerl::unordered_dense::map<std::vector<uint32_t>, uint32_t, hash> m_index;
