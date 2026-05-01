@@ -33,8 +33,7 @@ namespace detail {
 // `bases` holds 2-bit-encoded bases. Records are appended via `sink` to the
 // appropriate bucket files.
 inline void emit_super_kmers(const uint8_t* bases, uint32_t L, uint32_t k, uint32_t m,
-                             uint32_t color, uint32_t bucket_log2,
-                             PerThreadBucketBuffers& sink) {
+                             uint32_t color, uint32_t bucket_log2, PerThreadBucketBuffers& sink) {
     if (L < k) return;
     const uint32_t K = L - k + 1;  // number of k-mers
     const uint32_t W = k - m + 1;  // window size, in m-mer indices
