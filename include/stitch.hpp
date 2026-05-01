@@ -28,14 +28,20 @@
 // Junctions are guaranteed to align by the link rules above.
 //
 // We additionally require the two unitigs' color sets to be equal before
-// gluing. GGCAT also builds a colored compacted dBG, but it doesn't gate
-// its unitig-extension step on color-set equality at junctions; colors
-// are tracked separately and emitted later. We do gate at stitch time,
-// which would be O(color_count) per junction if we compared color
-// vectors directly. Instead, each fragment carries a `cid` (a global
-// color-class id assigned by main after process_buckets via
-// color_set_dict::intern), so the equality check here is a cheap
-// uint32_t comparison and walk_chain copies a single integer.
+// gluing — emitted unitigs are monochromatic. GGCAT does the same; the
+// difference is *when* each k-mer's color-class id is assigned. GGCAT
+// interns color sets to a small integer id inside its `kmers_merge`
+// phase, so its per-bucket walk and its cross-bucket `links_compaction`
+// (the analog of our stitch) can both gate on cheap integer
+// comparisons. We do the same thing slightly later: after process_buckets
+// emits fragments still holding `std::vector<uint32_t>` color lists,
+// main runs an `intern color sets` pass that calls
+// color_set_dict::intern on each fragment and stores the returned id in
+// stitchable_unitig::cid. From that point on, the stitch equality check
+// is a uint32_t compare and walk_chain inherits the cid by integer
+// assignment instead of copying a thousand-entry vector.
+// Functionally equivalent to GGCAT's gating; structurally one extra
+// pass instead of folding the interning into per-bucket processing.
 
 #include <array>
 #include <atomic>
