@@ -164,7 +164,10 @@ int main(int argc, char** argv) {
     std::vector<cdgb::stitchable_unitig> all_unitigs;
     {
         timer _("stitch");
-        cdgb::stitch_unitigs(frag_unitigs, cfg.k, all_unitigs);
+        std::atomic<uint64_t> done{0};
+        cdgb::progress prog("stitch", done, frag_unitigs.size());
+        cdgb::stitch_unitigs(frag_unitigs, cfg.k, all_unitigs, &done);
+        prog.stop();
         frag_unitigs = {};
         std::cout << "  unitigs after stitching: " << all_unitigs.size() << "\n";
     }
@@ -191,7 +194,7 @@ int main(int argc, char** argv) {
         }
         fa.close();
 
-        cdgb::hybrid_builder hb((uint32_t)files.size());
+        cdgb::hybrid_builder hb(files.size());
         for (uint32_t cid = 0; cid < global_dict.size(); ++cid) {
             const auto& cs = global_dict.at(cid);
             hb.encode_color_set(cs.data(), cs.size());

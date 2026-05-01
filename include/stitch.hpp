@@ -31,11 +31,13 @@
 // only departure from GGCAT's behaviour (which is uncolored).
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <iostream>
 #include <string>
-#include <unordered_map>
 #include <vector>
+
+#include <unordered_dense/unordered_dense.h>
 
 #include "bucket_walker.hpp"
 #include "kmer.hpp"
@@ -86,6 +88,17 @@ struct end_ref {
     bool is_canonical_fwd;
 };
 
+// Fixed-size value for `by_junction`. The walker only acts on junctions
+// with exactly two ends, so we keep up to 2 inline and reject the rest
+// via `count` going to 3+ (overflow). This avoids one std::vector
+// allocation per junction, which dominated the upfront indexing time on
+// large inputs (millions of junctions -> millions of heap allocs).
+struct junction_ends {
+    end_ref a;
+    end_ref b;
+    uint8_t count = 0;  // 0, 1, 2, or 3 (overflow: more than 2 ends)
+};
+
 inline kmer_int_t side_junction_canonical(const stitchable_unitig& u, uint32_t k, uint8_t side,
                                           bool& is_canonical_fwd) {
     const char* p = (side == SIDE_LEFT) ? u.seq.data() : u.seq.data() + (u.seq.size() - (k - 1));
@@ -107,7 +120,8 @@ struct link {
 }  // namespace detail
 
 inline void stitch_unitigs(std::vector<stitchable_unitig>& frag, uint32_t k,
-                           std::vector<stitchable_unitig>& out) {
+                           std::vector<stitchable_unitig>& out,
+                           std::atomic<uint64_t>* done = nullptr) {
     using detail::SIDE_LEFT;
     using detail::SIDE_RIGHT;
     using detail::end_ref;
@@ -115,29 +129,41 @@ inline void stitch_unitigs(std::vector<stitchable_unitig>& frag, uint32_t k,
 
     if (k < 2) {
         out = std::move(frag);
+        if (done) done->fetch_add(out.size(), std::memory_order_relaxed);
         return;
     }
 
     // 1) Index every open end by its canonical (k-1)-mer junction.
-    std::unordered_map<kmer_int_t, std::vector<end_ref>, kmer_hasher> by_junction;
+    std::cerr << "[stitch] indexing " << frag.size() << " fragments...\n";
+    ankerl::unordered_dense::map<kmer_int_t, detail::junction_ends, kmer_hasher> by_junction;
     by_junction.reserve(frag.size() * 2);
+    auto add_end = [&](kmer_int_t key, end_ref ref) {
+        auto& je = by_junction[key];
+        if (je.count == 0) je.a = ref;
+        else if (je.count == 1)
+            je.b = ref;
+        // count >= 2 stays as-is; we just bump the counter so the build
+        // step below sees the overflow.
+        if (je.count < 3) ++je.count;
+    };
     for (uint32_t i = 0; i < frag.size(); ++i) {
         const auto& u = frag[i];
         if (u.seq.size() < k) continue;
         if (u.open_flags & UNITIG_OPEN_LEFT) {
             bool is_fwd;
             kmer_int_t key = detail::side_junction_canonical(u, k, SIDE_LEFT, is_fwd);
-            by_junction[key].push_back({i, SIDE_LEFT, is_fwd});
+            add_end(key, {i, SIDE_LEFT, is_fwd});
         }
         if (u.open_flags & UNITIG_OPEN_RIGHT) {
             bool is_fwd;
             kmer_int_t key = detail::side_junction_canonical(u, k, SIDE_RIGHT, is_fwd);
-            by_junction[key].push_back({i, SIDE_RIGHT, is_fwd});
+            add_end(key, {i, SIDE_RIGHT, is_fwd});
         }
     }
 
     // 2) Build adjacency. adj[u][side] = (other_unitig, other_side) on the
     //    own-frame `side` of u that the link enters.
+    std::cerr << "[stitch] building adjacency over " << by_junction.size() << " junctions...\n";
     std::vector<std::array<link, 2>> adj(frag.size());
 
     auto pair_compatible = [](const end_ref& a, const end_ref& b) {
@@ -148,10 +174,10 @@ inline void stitch_unitigs(std::vector<stitchable_unitig>& frag, uint32_t k,
     };
 
     for (auto& kv : by_junction) {
-        auto& v = kv.second;
-        if (v.size() != 2) continue;
-        const end_ref& e1 = v[0];
-        const end_ref& e2 = v[1];
+        const auto& je = kv.second;
+        if (je.count != 2) continue;  // skip empty / singleton / overflow
+        const end_ref& e1 = je.a;
+        const end_ref& e2 = je.b;
         if (frag[e1.unitig_idx].colors != frag[e2.unitig_idx].colors) continue;
         if (!pair_compatible(e1, e2)) continue;
         // Both directions of the link.
@@ -160,6 +186,8 @@ inline void stitch_unitigs(std::vector<stitchable_unitig>& frag, uint32_t k,
     }
 
     // 3) Walk chains.
+    by_junction = {};  // free now; we only need adj from here on
+    std::cerr << "[stitch] walking chains...\n";
     std::vector<uint8_t> visited(frag.size(), 0);
     out.reserve(frag.size());
 
@@ -177,6 +205,7 @@ inline void stitch_unitigs(std::vector<stitchable_unitig>& frag, uint32_t k,
         merged.colors = frag[start_idx].colors;
         merged.seq = take_seq(start_idx, start_flipped);
         visited[start_idx] = 1;
+        if (done) done->fetch_add(1, std::memory_order_relaxed);
 
         // The merged-LEFT side of the chain corresponds to start's own
         // SIDE_LEFT (if !start_flipped) or own SIDE_RIGHT (if start_flipped).
@@ -209,6 +238,7 @@ inline void stitch_unitigs(std::vector<stitchable_unitig>& frag, uint32_t k,
             std::string add = take_seq(nxt, f_nxt);
             merged.seq.append(add.begin() + (k - 1), add.end());
             visited[nxt] = 1;
+            if (done) done->fetch_add(1, std::memory_order_relaxed);
             cur = nxt;
             f_cur = f_nxt;
         }

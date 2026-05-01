@@ -69,12 +69,12 @@ private:
 
 struct hybrid_builder {
     hybrid_builder() = default;
-    explicit hybrid_builder(uint32_t num_colors) { init(num_colors); }
+    explicit hybrid_builder(uint64_t num_colors) { init(num_colors); }
 
-    void init(uint32_t num_colors) {
+    void init(uint64_t num_colors) {
         m_num_colors = num_colors;
-        m_sparse_set_threshold_size = (uint32_t)(0.25 * num_colors);
-        m_very_dense_set_threshold_size = (uint32_t)(0.75 * num_colors);
+        m_sparse_set_threshold_size = 0.25 * num_colors;
+        m_very_dense_set_threshold_size = 0.75 * num_colors;
         m_offsets.clear();
         m_offsets.push_back(0);
         m_bvb.clear();
@@ -82,7 +82,7 @@ struct hybrid_builder {
         m_num_total_integers = 0;
     }
 
-    void encode_color_set(const uint32_t* color_set, const uint64_t size) {
+    void encode_color_set(uint32_t const* color_set, const uint64_t size) {
         bits::util::write_delta(m_bvb, size);  // size first
         if (size < m_sparse_set_threshold_size) {
             uint32_t prev = color_set[0];
@@ -101,7 +101,7 @@ struct hybrid_builder {
         } else {
             bool first = true;
             uint32_t val = 0;
-            uint32_t prev = (uint32_t)-1;
+            uint32_t prev = uint32_t(-1);
             uint32_t written = 0;
             for (uint64_t i = 0; i < size; ++i) {
                 uint32_t x = color_set[i];
@@ -148,9 +148,9 @@ struct hybrid_builder {
     uint64_t num_color_sets() const { return m_num_color_sets; }
 
 private:
-    uint32_t m_num_colors = 0;
-    uint32_t m_sparse_set_threshold_size = 0;
-    uint32_t m_very_dense_set_threshold_size = 0;
+    uint64_t m_num_colors = 0;
+    uint64_t m_sparse_set_threshold_size = 0;
+    uint64_t m_very_dense_set_threshold_size = 0;
     uint64_t m_num_color_sets = 0;
     uint64_t m_num_total_integers = 0;
     bits::bit_vector::builder m_bvb;
