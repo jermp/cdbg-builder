@@ -16,6 +16,7 @@
 // and last canonical k-mers and side-flags so the cross-bucket stitch phase
 // can match them up.
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <iostream>
@@ -27,11 +28,40 @@
 
 #include "bucket_io.hpp"
 #include "color_set_dict.hpp"
-#include "concurrent_kmer_map.hpp"
 #include "kmer.hpp"
 #include "super_kmer.hpp"
 
 namespace cdgb {
+
+// Per-k-mer color accumulator. Stores the first two colors inline to avoid
+// allocation for the common singleton/doubleton case; a 0xffffffff sentinel
+// marks "unused" inline slots.
+struct KmerEntry {
+    static constexpr uint32_t INVALID = 0xffffffffu;
+    uint32_t inline_a = INVALID;
+    uint32_t inline_b = INVALID;
+    std::vector<uint32_t> extra;
+
+    void add_color(uint32_t c) {
+        if (inline_a == INVALID) { inline_a = c; return; }
+        if (inline_a == c) return;
+        if (inline_b == INVALID) { inline_b = c; return; }
+        if (inline_b == c) return;
+        for (uint32_t x : extra) if (x == c) return;
+        extra.push_back(c);
+    }
+
+    std::vector<uint32_t> to_sorted() const {
+        std::vector<uint32_t> v;
+        v.reserve(2 + extra.size());
+        if (inline_a != INVALID) v.push_back(inline_a);
+        if (inline_b != INVALID) v.push_back(inline_b);
+        for (uint32_t x : extra) v.push_back(x);
+        std::sort(v.begin(), v.end());
+        v.erase(std::unique(v.begin(), v.end()), v.end());
+        return v;
+    }
+};
 
 // Open-end marker, in unitig-sequence orientation.
 inline constexpr uint8_t UNITIG_OPEN_LEFT  = 1u << 0;
