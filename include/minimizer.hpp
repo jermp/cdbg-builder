@@ -12,7 +12,6 @@
 #include <cassert>
 #include <cstdint>
 #include <cstring>
-#include <deque>
 #include <vector>
 
 #include "kmer.hpp"
@@ -78,28 +77,63 @@ inline uint32_t compute_best_m(uint32_t k) {
 }
 
 // Sliding-window minimum over a stream of (uint64_t hash, int32_t pos) pairs,
-// returning the current minimum's hash. Uses a monotonic deque so amortised
-// per-step cost is O(1).
+// returning the current minimum's hash. Implemented as a fixed-size ring
+// buffer of the last W m-mer hashes plus a cached (cur_min, cur_min_pos):
+//
+//   - Common path (~all pushes): O(1) — store h at pos % W in the ring,
+//     and if h <= cur_min update the cached min.
+//   - When the cached min's position falls out of the window, rescan the
+//     W ring slots for the new min: O(W).
+//
+// For random DNA the expected expiration rate is ~1/W per push, so the
+// amortised cost stays O(1) but the constant is much smaller than a
+// std::deque-based monotonic queue: no allocations, dense linear scan,
+// branch-predictable common path.
+//
+// W = k - m + 1, bounded by MAX_K + 1 = 64 for the supported k range.
+// The 64-slot static array fits in a single cache line.
 struct min_queue {
-    struct entry {
-        uint64_t h;
-        int32_t pos;
-    };
-    std::deque<entry> q;
+    static constexpr int32_t MAX_W = 64;
+    uint64_t hashes[MAX_W];
     int32_t window_size = 0;
+    uint64_t cur_min = ~uint64_t(0);
+    int32_t cur_min_pos = -1;
 
     void reset(int32_t window) {
-        q.clear();
+        assert(window > 0 && window <= MAX_W);
         window_size = window;
+        cur_min = ~uint64_t(0);
+        cur_min_pos = -1;
     }
+
     void push(uint64_t h, int32_t pos) {
-        while (!q.empty() && q.back().h >= h) q.pop_back();
-        q.push_back({h, pos});
-        while (!q.empty() && q.front().pos + window_size <= pos) q.pop_front();
+        hashes[(uint32_t)pos % (uint32_t)window_size] = h;
+        // Did the previously-tracked minimum just slide out of the window?
+        if (cur_min_pos + window_size <= pos) {
+            int32_t start = pos - window_size + 1;
+            if (start < 0) start = 0;
+            uint64_t best = hashes[(uint32_t)start % (uint32_t)window_size];
+            int32_t best_pos = start;
+            for (int32_t p = start + 1; p <= pos; ++p) {
+                uint64_t hp = hashes[(uint32_t)p % (uint32_t)window_size];
+                // <= keeps the rightmost (newest) position on ties, matching
+                // the previous monotonic-queue tie-breaking.
+                if (hp <= best) {
+                    best = hp;
+                    best_pos = p;
+                }
+            }
+            cur_min = best;
+            cur_min_pos = best_pos;
+        } else if (h <= cur_min) {
+            cur_min = h;
+            cur_min_pos = pos;
+        }
     }
-    bool empty() const { return q.empty(); }
-    uint64_t min_hash() const { return q.front().h; }
-    int32_t min_pos() const { return q.front().pos; }
+
+    bool empty() const { return cur_min_pos < 0; }
+    uint64_t min_hash() const { return cur_min; }
+    int32_t min_pos() const { return cur_min_pos; }
 };
 
 }  // namespace cdgb
