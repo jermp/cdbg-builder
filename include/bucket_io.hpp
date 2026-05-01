@@ -83,8 +83,7 @@ public:
         auto& prof = bucket_prof();
         auto t_lock = bucket_write_prof::clock::now();
         std::lock_guard<std::mutex> lk(m_mu);
-        prof.ns_lock_wait.fetch_add(bucket_write_prof::since(t_lock),
-                                    std::memory_order_relaxed);
+        prof.ns_lock_wait.fetch_add(bucket_write_prof::since(t_lock), std::memory_order_relaxed);
         auto t_map = bucket_write_prof::clock::now();
         for (const auto& r : recs) {
             std::string_view key((const char*)bases_storage.data() + r.bases_off, r.bases_len);
@@ -113,14 +112,12 @@ public:
                 m_bytes += sizeof(uint32_t);
             }
         }
-        prof.ns_hashmap.fetch_add(bucket_write_prof::since(t_map),
-                                  std::memory_order_relaxed);
+        prof.ns_hashmap.fetch_add(bucket_write_prof::since(t_map), std::memory_order_relaxed);
         prof.n_records.fetch_add(recs.size(), std::memory_order_relaxed);
         if (m_bytes >= m_spill_bytes) {
             auto t_sp = bucket_write_prof::clock::now();
             spill_locked();
-            prof.ns_spill.fetch_add(bucket_write_prof::since(t_sp),
-                                    std::memory_order_relaxed);
+            prof.ns_spill.fetch_add(bucket_write_prof::since(t_sp), std::memory_order_relaxed);
             prof.n_spills.fetch_add(1, std::memory_order_relaxed);
         }
     }
@@ -196,7 +193,7 @@ private:
 class bucket_writer {
 public:
     bucket_writer(const std::string& dir, uint32_t num_buckets, size_t flush_bases = 64 * 1024,
-                 size_t spill_bytes = DEFAULT_COMPACTOR_SPILL_BYTES)
+                  size_t spill_bytes = DEFAULT_COMPACTOR_SPILL_BYTES)
         : m_dir(dir), m_num_buckets(num_buckets), m_flush_bases(flush_bases) {
         std::filesystem::create_directories(m_dir);
         m_compactors.reserve(num_buckets);
@@ -225,8 +222,7 @@ public:
         auto& prof = bucket_prof();
         auto t = bucket_write_prof::clock::now();
         m_compactors[b]->insert_batch(recs, bases_buf);
-        prof.ns_flush.fetch_add(bucket_write_prof::since(t),
-                                std::memory_order_relaxed);
+        prof.ns_flush.fetch_add(bucket_write_prof::since(t), std::memory_order_relaxed);
         prof.n_flushes.fetch_add(1, std::memory_order_relaxed);
         recs.clear();
         bases_buf.clear();

@@ -42,35 +42,34 @@ struct bucket_write_prof {
 
     // Helper: nanoseconds since `t0`.
     static inline uint64_t since(clock::time_point t0) {
-        return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-                   clock::now() - t0)
+        return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - t0)
             .count();
     }
 
     void print(uint32_t num_threads) const {
-        auto load = [](const std::atomic<uint64_t>& a) { return a.load(std::memory_order_relaxed); };
-        double per_thread = num_threads > 0 ? (double)num_threads : 1.0;
-        auto s = [&](const std::atomic<uint64_t>& a) {
-            return (double)load(a) / 1e9 / per_thread;
+        auto load = [](const std::atomic<uint64_t>& a) {
+            return a.load(std::memory_order_relaxed);
         };
+        double per_thread = num_threads > 0 ? (double)num_threads : 1.0;
+        auto s = [&](const std::atomic<uint64_t>& a) { return (double)load(a) / 1e9 / per_thread; };
         uint64_t loop_body = load(ns_loop_body);
         uint64_t flush = load(ns_flush);
-        double s_compute = (loop_body > flush ? (double)(loop_body - flush) : 0.0) / 1e9 / per_thread;
-        std::fprintf(stderr,
-                     "[bucket-write profile] (per-thread time, ns/threads -> wall-equiv):\n"
-                     "  seq_read     %6.2fs   (gzip + kseq parsing)\n"
-                     "  compute      %6.2fs   (ACGT scan + 2-bit + ntHash + minimizer + per-thread append)\n"
-                     "  flush        %6.2fs   (writer.flush total = lock + hashmap + spill)\n"
-                     "    lock_wait  %6.2fs\n"
-                     "    hashmap    %6.2fs\n"
-                     "    spill      %6.2fs   (sort+unique + write_super_kmer + gzwrite)\n"
-                     "  counts: files=%llu records=%llu flushes=%llu spills=%llu inserts=%llu\n",
-                     s(ns_seq_read), s_compute, s(ns_flush), s(ns_lock_wait), s(ns_hashmap),
-                     s(ns_spill), (unsigned long long)load(n_files),
-                     (unsigned long long)load(n_records),
-                     (unsigned long long)load(n_flushes),
-                     (unsigned long long)load(n_spills),
-                     (unsigned long long)load(n_inserts));
+        double s_compute =
+            (loop_body > flush ? (double)(loop_body - flush) : 0.0) / 1e9 / per_thread;
+        std::fprintf(
+            stderr,
+            "[bucket-write profile] (per-thread time, ns/threads -> wall-equiv):\n"
+            "  seq_read     %6.2fs   (gzip + kseq parsing)\n"
+            "  compute      %6.2fs   (ACGT scan + 2-bit + ntHash + minimizer + per-thread append)\n"
+            "  flush        %6.2fs   (writer.flush total = lock + hashmap + spill)\n"
+            "    lock_wait  %6.2fs\n"
+            "    hashmap    %6.2fs\n"
+            "    spill      %6.2fs   (sort+unique + write_super_kmer + gzwrite)\n"
+            "  counts: files=%llu records=%llu flushes=%llu spills=%llu inserts=%llu\n",
+            s(ns_seq_read), s_compute, s(ns_flush), s(ns_lock_wait), s(ns_hashmap), s(ns_spill),
+            (unsigned long long)load(n_files), (unsigned long long)load(n_records),
+            (unsigned long long)load(n_flushes), (unsigned long long)load(n_spills),
+            (unsigned long long)load(n_inserts));
     }
 };
 
