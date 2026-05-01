@@ -33,13 +33,7 @@ trap 'rm -rf "$WORK"' EXIT
 FILELIST="$WORK/filenames.txt"
 printf '%s\n' "${inputs[@]}" > "$FILELIST"
 
-echo "=== in-memory path ==="
-OUT_MEM="$WORK/sal_mem"
-"$BIN" -i "$FILELIST" -k "$K" -o "$OUT_MEM" -t "$THREADS"
-python3 "$HERE/verify.py" --filenames "$FILELIST" --out "$OUT_MEM" -k "$K"
-
-echo
-echo "=== bucketed path ==="
-OUT_BKT="$WORK/sal_bkt"
-"$BIN" -i "$FILELIST" -k "$K" -o "$OUT_BKT" -t "$THREADS" --bucketed --tmp-dir "$WORK/buckets"
-python3 "$HERE/verify.py" --filenames "$FILELIST" --out "$OUT_BKT" -k "$K"
+OUT="$WORK/sal"
+"$BIN" -i "$FILELIST" -k "$K" -o "$OUT" -t "$THREADS" --tmp-dir "$WORK/buckets"
+python3 "$HERE/verify.py" --filenames "$FILELIST" --out "$OUT" -k "$K"
+python3 "$HERE/strict_topology_check.py" --filenames "$FILELIST" --out "$OUT" -k "$K"

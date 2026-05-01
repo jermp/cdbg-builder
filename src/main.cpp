@@ -22,16 +22,12 @@
 #include "bucket_walker.hpp"
 #include "build_config.hpp"
 #include "color_set_dict.hpp"
-#include "concurrent_kmer_map.hpp"
-#include "finalize.hpp"
 #include "hybrid_color_sets.hpp"
-#include "ingester.hpp"
 #include "minimizer.hpp"
 #include "progress.hpp"
-#include "unitig_walker.hpp"
+#include "stitch.hpp"
 
 namespace {
-
 class Timer {
 public:
     Timer(const char* label) : m_label(label), m_t0(std::chrono::steady_clock::now()) {}
@@ -58,18 +54,11 @@ bool parse_args(int argc, char** argv, cdgb::BuildConfig& cfg) {
                "K-mer length (must be <= " + std::to_string(cdgb::MAX_K) + ").",
                "-k", true);
     parser.add("num_threads", "Number of worker threads (default 1).", "-t", false);
-    parser.add("shard_log2",
-               "log2 of the in-memory hash-shard count (default 8 -> 256).",
-               "--shards", false);
-    parser.add("bucketed",
-               "Use the minimizer-bucketed disk-based ingest path "
-               "(recommended for thousands of input files).",
-               "--bucketed", false, true);
     parser.add("m",
-               "Minimizer length for --bucketed (default: auto, derived from k).",
+               "Minimizer length (default: auto, derived from k).",
                "-m", false);
     parser.add("buckets_log2",
-               "log2 of the bucket count for --bucketed (default 10 -> 1024).",
+               "log2 of the bucket count (default 10 -> 1024).",
                "--buckets-log2", false);
     parser.add("tmp_dir",
                "Scratch directory for bucket files (default: mkdtemp under $TMPDIR).",
@@ -81,13 +70,11 @@ bool parse_args(int argc, char** argv, cdgb::BuildConfig& cfg) {
     cfg.filenames_list = parser.get<std::string>("filenames_list");
     cfg.out_basename   = parser.get<std::string>("out_basename");
     cfg.k              = parser.get<uint32_t>("k");
-    if (parser.parsed("num_threads"))   cfg.num_threads = parser.get<uint32_t>("num_threads");
-    if (parser.parsed("shard_log2"))    cfg.shard_log2 = parser.get<uint32_t>("shard_log2");
-    if (parser.parsed("bucketed"))      cfg.bucketed = parser.get<bool>("bucketed");
-    if (parser.parsed("m"))             cfg.m = parser.get<uint32_t>("m");
-    if (parser.parsed("buckets_log2"))  cfg.bucket_log2 = parser.get<uint32_t>("buckets_log2");
-    if (parser.parsed("tmp_dir"))       cfg.tmp_dir = parser.get<std::string>("tmp_dir");
-    if (parser.parsed("verbose"))       cfg.verbose = parser.get<bool>("verbose");
+    if (parser.parsed("num_threads"))  cfg.num_threads = parser.get<uint32_t>("num_threads");
+    if (parser.parsed("m"))            cfg.m = parser.get<uint32_t>("m");
+    if (parser.parsed("buckets_log2")) cfg.bucket_log2 = parser.get<uint32_t>("buckets_log2");
+    if (parser.parsed("tmp_dir"))      cfg.tmp_dir = parser.get<std::string>("tmp_dir");
+    if (parser.parsed("verbose"))      cfg.verbose = parser.get<bool>("verbose");
 
     if (cfg.k == 0 || cfg.k > cdgb::MAX_K) {
         std::cerr << "error: k must satisfy 1 <= k <= " << cdgb::MAX_K << "\n";
@@ -107,14 +94,41 @@ std::vector<std::string> read_filenames(const std::string& path) {
     return v;
 }
 
-int run_bucketed(cdgb::BuildConfig& cfg, const std::vector<std::string>& files) {
+}  // namespace
+
+int main(int argc, char** argv) {
+    cdgb::BuildConfig cfg;
+    if (!parse_args(argc, argv, cfg)) return 1;
+
+    auto files = read_filenames(cfg.filenames_list);
+    if (files.empty()) {
+        std::cerr << "no input files\n";
+        return 1;
+    }
+    if (files.size() > (uint64_t)UINT32_MAX) {
+        std::cerr << "too many colors (max 2^32 - 1)\n";
+        return 1;
+    }
+
     if (cfg.m == 0) cfg.m = cdgb::compute_best_m(cfg.k);
     if (cfg.m < 2 || cfg.m > cfg.k) {
         std::cerr << "invalid m=" << cfg.m << " (need 2 <= m <= k)\n";
         return 1;
     }
     const uint32_t num_buckets = 1u << cfg.bucket_log2;
-    std::cout << "  m = " << cfg.m << ", num_buckets = " << num_buckets << "\n";
+
+    std::cout << "k = " << cfg.k << ", m = " << cfg.m
+              << ", num_colors = " << files.size()
+              << ", num_threads = " << cfg.num_threads
+              << ", num_buckets = " << num_buckets << "\n";
+
+    auto t_start = std::chrono::steady_clock::now();
+    auto print_total = [&] {
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t_start)
+                      .count();
+        std::cout << "[total construction time] " << (ms / 1000.0) << " s\n";
+    };
 
     // Resolve a scratch directory.
     std::string tmp_dir = cfg.tmp_dir;
@@ -138,21 +152,30 @@ int run_bucketed(cdgb::BuildConfig& cfg, const std::vector<std::string>& files) 
         Timer _("bucket-write");
         std::atomic<uint64_t> done{0};
         cdgb::Progress prog("bucket-write", done, files.size());
-        cdgb::ingest_bucketed(files, cfg.k, cfg.m, cfg.bucket_log2, writer, cfg.num_threads, &done);
+        cdgb::ingest_bucketed(files, cfg.k, cfg.m, cfg.bucket_log2, writer,
+                              cfg.num_threads, &done);
         prog.stop();
     }
     writer.close();
     std::cout << "  bucket bytes written: " << writer.total_bytes() << "\n";
 
-    std::vector<cdgb::BucketUnitig> all_unitigs;
+    std::vector<cdgb::StitchableUnitig> frag_unitigs;
     std::mutex out_mu;
     {
         Timer _("bucket-process");
         std::atomic<uint64_t> done{0};
         cdgb::Progress prog("bucket-process", done, num_buckets);
-        cdgb::process_buckets(writer, cfg.k, cfg.num_threads, all_unitigs, out_mu, &done);
+        cdgb::process_buckets(writer, cfg.k, cfg.num_threads, frag_unitigs, out_mu, &done);
         prog.stop();
-        std::cout << "  unitigs: " << all_unitigs.size() << "\n";
+        std::cout << "  bucket fragments: " << frag_unitigs.size() << "\n";
+    }
+
+    std::vector<cdgb::StitchableUnitig> all_unitigs;
+    {
+        Timer _("stitch");
+        cdgb::stitch_unitigs(frag_unitigs, cfg.k, all_unitigs);
+        frag_unitigs = {};
+        std::cout << "  unitigs after stitching: " << all_unitigs.size() << "\n";
     }
 
     // Globally intern color sets and write FASTA + .colors.
@@ -165,9 +188,10 @@ int run_bucketed(cdgb::BuildConfig& cfg, const std::vector<std::string>& files) 
         }
         std::cout << "  distinct color classes: " << global_dict.size() << "\n";
 
-        // Group by global cid so the FASTA is written in color-set order.
         std::vector<std::vector<size_t>> by_class(global_dict.size());
-        for (size_t i = 0; i < all_unitigs.size(); ++i) { by_class[unitig_cid[i]].push_back(i); }
+        for (size_t i = 0; i < all_unitigs.size(); ++i) {
+            by_class[unitig_cid[i]].push_back(i);
+        }
 
         std::ofstream fa(cfg.out_basename + ".fa");
         if (!fa) throw std::runtime_error("cannot open " + cfg.out_basename + ".fa");
@@ -200,109 +224,6 @@ int run_bucketed(cdgb::BuildConfig& cfg, const std::vector<std::string>& files) 
                 std::filesystem::remove(writer.bucket_path(b), ec);
             }
         }
-    }
-
-    std::cout << "done. wrote " << cfg.out_basename << ".fa and " << cfg.out_basename
-              << ".colors\n";
-    return 0;
-}
-
-}  // namespace
-
-int main(int argc, char** argv) {
-    cdgb::BuildConfig cfg;
-    if (!parse_args(argc, argv, cfg)) return 1;
-
-    auto files = read_filenames(cfg.filenames_list);
-    if (files.empty()) {
-        std::cerr << "no input files\n";
-        return 1;
-    }
-    if (files.size() > (uint64_t)UINT32_MAX) {
-        std::cerr << "too many colors (max 2^32 - 1)\n";
-        return 1;
-    }
-    std::cout << "k = " << cfg.k << ", num_colors = " << files.size()
-              << ", num_threads = " << cfg.num_threads
-              << (cfg.bucketed ? ", path = bucketed" : ", path = in-memory") << "\n";
-
-    auto t_start = std::chrono::steady_clock::now();
-    auto print_total = [&] {
-        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                      std::chrono::steady_clock::now() - t_start)
-                      .count();
-        std::cout << "[total construction time] " << (ms / 1000.0) << " s\n";
-    };
-
-    if (cfg.bucketed) {
-        int rc = run_bucketed(cfg, files);
-        print_total();
-        return rc;
-    }
-
-    const uint64_t num_shards = uint64_t(1) << cfg.shard_log2;
-
-    cdgb::ConcurrentKmerMap raw_map(cfg.shard_log2);
-    {
-        Timer _("ingest");
-        std::atomic<uint64_t> done{0};
-        cdgb::Progress prog("ingest", done, files.size());
-        cdgb::ingest_parallel(files, cfg.k, raw_map, cfg.num_threads, &done);
-        prog.stop();
-        std::cout << "  k-mers ingested: " << raw_map.num_kmers() << "\n";
-    }
-
-    cdgb::FinalKmerMap fkm(cfg.shard_log2);
-    cdgb::ColorSetDict global_dict;
-    {
-        Timer _("finalize");
-        std::atomic<uint64_t> done{0};
-        cdgb::Progress prog("finalize", done, num_shards);
-        cdgb::finalize(raw_map, fkm, global_dict, cfg.num_threads, &done);
-        prog.stop();
-        std::cout << "  distinct color classes: " << global_dict.size() << "\n";
-        std::cout << "  k-mers retained: " << fkm.size() << "\n";
-    }
-
-    std::vector<cdgb::Unitig> unitigs;
-    {
-        Timer _("unitig walk");
-        std::mutex mu;
-        cdgb::UnitigWalker w(fkm, cfg.k);
-        std::atomic<uint64_t> done{0};
-        cdgb::Progress prog("unitig walk", done, num_shards);
-        w.walk_all(cfg.num_threads, unitigs, mu, &done);
-        prog.stop();
-        std::cout << "  unitigs: " << unitigs.size() << "\n";
-    }
-
-    // Group unitigs by color_set_id so the FASTA is written in color-set order.
-    {
-        Timer _("emit fasta + colors");
-        std::vector<std::vector<size_t>> by_class(global_dict.size());
-        for (size_t i = 0; i < unitigs.size(); ++i) {
-            by_class[unitigs[i].color_set_id].push_back(i);
-        }
-
-        // FASTA: header = color_set_id, body = unitig sequence.
-        std::ofstream fa(cfg.out_basename + ".fa");
-        if (!fa) throw std::runtime_error("cannot open " + cfg.out_basename + ".fa");
-        for (uint32_t cid = 0; cid < global_dict.size(); ++cid) {
-            for (size_t idx : by_class[cid]) {
-                fa << '>' << cid << '\n' << unitigs[idx].seq << '\n';
-            }
-        }
-        fa.close();
-
-        // Hybrid color sets in canonical order (id 0, 1, ...).
-        cdgb::HybridBuilder hb((uint32_t)files.size());
-        for (uint32_t cid = 0; cid < global_dict.size(); ++cid) {
-            const auto& cs = global_dict.at(cid);
-            hb.encode_color_set(cs.data(), cs.size());
-        }
-        cdgb::Hybrid h;
-        hb.build(h);
-        essentials::save(h, (cfg.out_basename + ".colors").c_str());
     }
 
     std::cout << "done. wrote " << cfg.out_basename << ".fa and " << cfg.out_basename

@@ -2,7 +2,6 @@
 
 #include <cstdint>
 #include <cstring>
-#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -46,46 +45,6 @@ struct ColorSetDict {
 private:
     std::vector<std::vector<uint32_t>> m_classes;
     std::unordered_map<std::vector<uint32_t>, uint32_t, Hash> m_index;
-};
-
-// Final per-k-mer map: canonical k-mer -> color_set_id. Sharded for cache
-// friendliness during the parallel unitig walk.
-struct FinalKmerMap {
-    struct Shard {
-        std::unordered_map<kmer_int_t, uint32_t, KmerHasher> map;
-    };
-
-    explicit FinalKmerMap(uint32_t num_shards_log2) : m_mask((uint64_t(1) << num_shards_log2) - 1) {
-        m_shards.resize(uint64_t(1) << num_shards_log2);
-        for (auto& s : m_shards) s = std::make_unique<Shard>();
-    }
-
-    uint64_t num_shards() const { return m_shards.size(); }
-    Shard& shard(uint64_t i) { return *m_shards[i]; }
-    const Shard& shard(uint64_t i) const { return *m_shards[i]; }
-    uint64_t shard_of(kmer_int_t k) const { return KmerHasher{}(k)&m_mask; }
-
-    // Lookup; returns UINT32_MAX if not present.
-    uint32_t lookup(kmer_int_t k) const {
-        const auto& s = *m_shards[KmerHasher{}(k)&m_mask];
-        auto it = s.map.find(k);
-        return it == s.map.end() ? 0xffffffffu : it->second;
-    }
-
-    bool contains(kmer_int_t k) const {
-        const auto& s = *m_shards[KmerHasher{}(k)&m_mask];
-        return s.map.find(k) != s.map.end();
-    }
-
-    uint64_t size() const {
-        uint64_t n = 0;
-        for (auto& s : m_shards) n += s->map.size();
-        return n;
-    }
-
-private:
-    uint64_t m_mask;
-    std::vector<std::unique_ptr<Shard>> m_shards;
 };
 
 }  // namespace cdgb

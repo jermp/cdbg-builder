@@ -39,14 +39,22 @@ cdgb-build -i <filenames_list> -k <k> -o <out_basename> [-t <num_threads>]
 
 Options:
 
-| Flag         | Description                                               | Default |
-|--------------|-----------------------------------------------------------|---------|
-| `-i PATH`    | Text file with one input path per line (one color each)   | —       |
-| `-k INT`     | k-mer length (≤ 63)                                       | —       |
-| `-o NAME`    | Output basename; writes `NAME.fa` and `NAME.colors`       | —       |
-| `-t INT`     | Number of worker threads                                  | 1       |
-| `--shards N` | Use `2^N` hash shards in the concurrent k-mer map         | 8       |
-| `-v`         | Verbose output                                            | off     |
+| Flag                 | Description                                                       | Default |
+|----------------------|-------------------------------------------------------------------|---------|
+| `-i PATH`            | Text file with one input path per line (one color each)           | —       |
+| `-k INT`             | k-mer length (≤ 63)                                               | —       |
+| `-o NAME`            | Output basename; writes `NAME.fa` and `NAME.colors`               | —       |
+| `-t INT`             | Number of worker threads                                          | 1       |
+| `-m INT`             | Minimizer length used for bucketing                               | auto    |
+| `--buckets-log2 INT` | `2^N` minimizer-derived bucket files on disk                      | 10      |
+| `--tmp-dir PATH`     | Scratch directory for the bucket files (removed on success)       | mkdtemp |
+| `-v`                 | Verbose output                                                    | off     |
+
+The build pipeline is GGCAT-style: stream input → write super-k-mers
+into per-minimizer bucket files on disk → walk each bucket independently
+→ stitch fragments across buckets via shared (k-1)-mer junctions. RAM
+usage stays bounded by the largest single bucket rather than the full
+k-mer set.
 
 ## Example: *Salmonella enterica* pangenome (4,546 genomes)
 
