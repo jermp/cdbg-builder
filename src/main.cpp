@@ -20,13 +20,11 @@
 #include "bucket_io.hpp"
 #include "bucket_ingester.hpp"
 #include "bucket_walker.hpp"
-#include "build_config.hpp"
 #include "color_set_dict.hpp"
 #include "hybrid_color_sets.hpp"
 #include "minimizer.hpp"
-#include "prof.hpp"
-#include "progress.hpp"
 #include "stitch.hpp"
+#include "util.hpp"
 
 namespace {
 class timer {

@@ -34,8 +34,8 @@
 
 #include <unordered_dense/unordered_dense.h>
 
-#include "prof.hpp"
 #include "super_kmer.hpp"
+#include "util.hpp"
 
 namespace cdgb {
 
