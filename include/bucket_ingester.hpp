@@ -71,7 +71,7 @@ inline void emit_super_kmers(const uint8_t* bases, uint32_t L, uint32_t k, uint3
         uint32_t base_len = (last_kmer - first_kmer) + k;
         uint8_t flags = 0;
         if (is_run_begin) flags |= SK_FLAG_IS_ACGT_BEGIN;
-        if (is_run_end)   flags |= SK_FLAG_IS_ACGT_END;
+        if (is_run_end) flags |= SK_FLAG_IS_ACGT_END;
         rec_scratch.clear();
         write_super_kmer(flags, color, bases + base_start, base_len, rec_scratch);
         sink.append(bucket, rec_scratch.data(), rec_scratch.size());

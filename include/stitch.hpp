@@ -46,9 +46,7 @@ namespace detail {
 
 inline kmer_int_t encode_kminus1(const char* s, uint32_t n) {
     kmer_int_t x = 0;
-    for (uint32_t i = 0; i < n; ++i) {
-        x = (x << 2) | (kmer_int_t)nuc_to_2bit(s[i]);
-    }
+    for (uint32_t i = 0; i < n; ++i) { x = (x << 2) | (kmer_int_t)nuc_to_2bit(s[i]); }
     return x;
 }
 
@@ -58,11 +56,21 @@ inline std::string revcomp_string(const std::string& s) {
         char c = s[s.size() - 1 - i];
         char rc;
         switch (c) {
-            case 'A': rc = 'T'; break;
-            case 'C': rc = 'G'; break;
-            case 'G': rc = 'C'; break;
-            case 'T': rc = 'A'; break;
-            default:  rc = 'N'; break;
+            case 'A':
+                rc = 'T';
+                break;
+            case 'C':
+                rc = 'G';
+                break;
+            case 'G':
+                rc = 'C';
+                break;
+            case 'T':
+                rc = 'A';
+                break;
+            default:
+                rc = 'N';
+                break;
         }
         out[i] = rc;
     }
@@ -78,14 +86,15 @@ struct EndRef {
     bool is_canonical_fwd;
 };
 
-inline kmer_int_t side_junction_canonical(const StitchableUnitig& u, uint32_t k,
-                                          uint8_t side, bool& is_canonical_fwd) {
-    const char* p = (side == SIDE_LEFT)
-        ? u.seq.data()
-        : u.seq.data() + (u.seq.size() - (k - 1));
+inline kmer_int_t side_junction_canonical(const StitchableUnitig& u, uint32_t k, uint8_t side,
+                                          bool& is_canonical_fwd) {
+    const char* p = (side == SIDE_LEFT) ? u.seq.data() : u.seq.data() + (u.seq.size() - (k - 1));
     kmer_int_t fwd = encode_kminus1(p, k - 1);
     kmer_int_t rc = reverse_complement(fwd, k - 1);
-    if (fwd <= rc) { is_canonical_fwd = true; return fwd; }
+    if (fwd <= rc) {
+        is_canonical_fwd = true;
+        return fwd;
+    }
     is_canonical_fwd = false;
     return rc;
 }
@@ -210,17 +219,13 @@ inline void stitch_unitigs(std::vector<StitchableUnitig>& frag, uint32_t k,
     // Pass A: start at unitigs with a free own-LEFT side.
     for (uint32_t i = 0; i < frag.size(); ++i) {
         if (visited[i]) continue;
-        if (adj[i][SIDE_LEFT].other == UINT32_MAX) {
-            walk_chain(i, /*start_flipped=*/false);
-        }
+        if (adj[i][SIDE_LEFT].other == UINT32_MAX) { walk_chain(i, /*start_flipped=*/false); }
     }
     // Pass B: start at unitigs with a free own-RIGHT side (and own-LEFT
     // already linked, otherwise pass A would have caught it).
     for (uint32_t i = 0; i < frag.size(); ++i) {
         if (visited[i]) continue;
-        if (adj[i][SIDE_RIGHT].other == UINT32_MAX) {
-            walk_chain(i, /*start_flipped=*/true);
-        }
+        if (adj[i][SIDE_RIGHT].other == UINT32_MAX) { walk_chain(i, /*start_flipped=*/true); }
     }
     // Pass C: pure cross-bucket cycles (both sides linked but the chain
     // closes on itself).

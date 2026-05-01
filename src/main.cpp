@@ -45,36 +45,29 @@ private:
 bool parse_args(int argc, char** argv, cdgb::BuildConfig& cfg) {
     cmd_line_parser::parser parser(argc, argv);
     parser.add("filenames_list",
-               "Text file with one input path per line. The file at line i has color i.",
-               "-i", true);
-    parser.add("out_basename",
-               "Output basename. Produces <basename>.fa and <basename>.colors.",
+               "Text file with one input path per line. The file at line i has color i.", "-i",
+               true);
+    parser.add("out_basename", "Output basename. Produces <basename>.fa and <basename>.colors.",
                "-o", true);
-    parser.add("k",
-               "K-mer length (must be <= " + std::to_string(cdgb::MAX_K) + ").",
-               "-k", true);
+    parser.add("k", "K-mer length (must be <= " + std::to_string(cdgb::MAX_K) + ").", "-k", true);
     parser.add("num_threads", "Number of worker threads (default 1).", "-t", false);
-    parser.add("m",
-               "Minimizer length (default: auto, derived from k).",
-               "-m", false);
-    parser.add("buckets_log2",
-               "log2 of the bucket count (default 10 -> 1024).",
-               "--buckets-log2", false);
-    parser.add("tmp_dir",
-               "Scratch directory for bucket files (default: mkdtemp under $TMPDIR).",
+    parser.add("m", "Minimizer length (default: auto, derived from k).", "-m", false);
+    parser.add("buckets_log2", "log2 of the bucket count (default 10 -> 1024).", "--buckets-log2",
+               false);
+    parser.add("tmp_dir", "Scratch directory for bucket files (default: mkdtemp under $TMPDIR).",
                "--tmp-dir", false);
     parser.add("verbose", "Verbose output.", "--verbose", false, true);
 
     if (!parser.parse()) return false;
 
     cfg.filenames_list = parser.get<std::string>("filenames_list");
-    cfg.out_basename   = parser.get<std::string>("out_basename");
-    cfg.k              = parser.get<uint32_t>("k");
-    if (parser.parsed("num_threads"))  cfg.num_threads = parser.get<uint32_t>("num_threads");
-    if (parser.parsed("m"))            cfg.m = parser.get<uint32_t>("m");
+    cfg.out_basename = parser.get<std::string>("out_basename");
+    cfg.k = parser.get<uint32_t>("k");
+    if (parser.parsed("num_threads")) cfg.num_threads = parser.get<uint32_t>("num_threads");
+    if (parser.parsed("m")) cfg.m = parser.get<uint32_t>("m");
     if (parser.parsed("buckets_log2")) cfg.bucket_log2 = parser.get<uint32_t>("buckets_log2");
-    if (parser.parsed("tmp_dir"))      cfg.tmp_dir = parser.get<std::string>("tmp_dir");
-    if (parser.parsed("verbose"))      cfg.verbose = parser.get<bool>("verbose");
+    if (parser.parsed("tmp_dir")) cfg.tmp_dir = parser.get<std::string>("tmp_dir");
+    if (parser.parsed("verbose")) cfg.verbose = parser.get<bool>("verbose");
 
     if (cfg.k == 0 || cfg.k > cdgb::MAX_K) {
         std::cerr << "error: k must satisfy 1 <= k <= " << cdgb::MAX_K << "\n";
@@ -117,10 +110,8 @@ int main(int argc, char** argv) {
     }
     const uint32_t num_buckets = 1u << cfg.bucket_log2;
 
-    std::cout << "k = " << cfg.k << ", m = " << cfg.m
-              << ", num_colors = " << files.size()
-              << ", num_threads = " << cfg.num_threads
-              << ", num_buckets = " << num_buckets << "\n";
+    std::cout << "k = " << cfg.k << ", m = " << cfg.m << ", num_colors = " << files.size()
+              << ", num_threads = " << cfg.num_threads << ", num_buckets = " << num_buckets << "\n";
 
     auto t_start = std::chrono::steady_clock::now();
     auto print_total = [&] {
@@ -152,8 +143,7 @@ int main(int argc, char** argv) {
         Timer _("bucket-write");
         std::atomic<uint64_t> done{0};
         cdgb::Progress prog("bucket-write", done, files.size());
-        cdgb::ingest_bucketed(files, cfg.k, cfg.m, cfg.bucket_log2, writer,
-                              cfg.num_threads, &done);
+        cdgb::ingest_bucketed(files, cfg.k, cfg.m, cfg.bucket_log2, writer, cfg.num_threads, &done);
         prog.stop();
     }
     writer.close();
@@ -189,9 +179,7 @@ int main(int argc, char** argv) {
         std::cout << "  distinct color classes: " << global_dict.size() << "\n";
 
         std::vector<std::vector<size_t>> by_class(global_dict.size());
-        for (size_t i = 0; i < all_unitigs.size(); ++i) {
-            by_class[unitig_cid[i]].push_back(i);
-        }
+        for (size_t i = 0; i < all_unitigs.size(); ++i) { by_class[unitig_cid[i]].push_back(i); }
 
         std::ofstream fa(cfg.out_basename + ".fa");
         if (!fa) throw std::runtime_error("cannot open " + cfg.out_basename + ".fa");

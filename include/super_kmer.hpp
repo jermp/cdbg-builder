@@ -73,7 +73,7 @@ inline uint64_t varint_read(const uint8_t* buf, size_t buf_len, size_t& pos) {
 // ---- Super-k-mer record ------------------------------------------------------
 
 inline constexpr uint8_t SK_FLAG_IS_ACGT_BEGIN = 1u << 0;
-inline constexpr uint8_t SK_FLAG_IS_ACGT_END   = 1u << 1;
+inline constexpr uint8_t SK_FLAG_IS_ACGT_END = 1u << 1;
 
 inline void write_super_kmer(uint8_t flags, uint32_t color, const uint8_t* bases, uint32_t len,
                              std::vector<uint8_t>& out) {

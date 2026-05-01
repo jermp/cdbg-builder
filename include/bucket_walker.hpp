@@ -43,11 +43,18 @@ struct KmerEntry {
     std::vector<uint32_t> extra;
 
     void add_color(uint32_t c) {
-        if (inline_a == INVALID) { inline_a = c; return; }
+        if (inline_a == INVALID) {
+            inline_a = c;
+            return;
+        }
         if (inline_a == c) return;
-        if (inline_b == INVALID) { inline_b = c; return; }
+        if (inline_b == INVALID) {
+            inline_b = c;
+            return;
+        }
         if (inline_b == c) return;
-        for (uint32_t x : extra) if (x == c) return;
+        for (uint32_t x : extra)
+            if (x == c) return;
         extra.push_back(c);
     }
 
@@ -64,19 +71,19 @@ struct KmerEntry {
 };
 
 // Open-end marker, in unitig-sequence orientation.
-inline constexpr uint8_t UNITIG_OPEN_LEFT  = 1u << 0;
+inline constexpr uint8_t UNITIG_OPEN_LEFT = 1u << 0;
 inline constexpr uint8_t UNITIG_OPEN_RIGHT = 1u << 1;
 
 struct StitchableUnitig {
-    std::string seq;                 // ACGT characters
-    std::vector<uint32_t> colors;    // sorted, deduped color set
-    uint8_t open_flags = 0;          // bits from UNITIG_OPEN_*
+    std::string seq;               // ACGT characters
+    std::vector<uint32_t> colors;  // sorted, deduped color set
+    uint8_t open_flags = 0;        // bits from UNITIG_OPEN_*
 };
 
 namespace detail {
 
 // Per-canonical-k-mer flags for phantom edges, in canonical orientation.
-inline constexpr uint8_t KMER_PHANTOM_LEFT  = 1u << 0;  // phantom predecessor exists
+inline constexpr uint8_t KMER_PHANTOM_LEFT = 1u << 0;   // phantom predecessor exists
 inline constexpr uint8_t KMER_PHANTOM_RIGHT = 1u << 1;  // phantom successor exists
 
 struct BucketKmerInfo {
@@ -102,7 +109,7 @@ inline void load_bucket(const std::string& path, uint32_t k, BucketKmerMap& out)
         for (uint32_t i = 0; i < k - 1; ++i) {
             uint8_t v = bases[i];
             fwd = ((fwd << 2) | v) & mask;
-            rc  = (rc >> 2) | ((kmer_int_t)(v ^ 3) << k_minus_1_x2);
+            rc = (rc >> 2) | ((kmer_int_t)(v ^ 3) << k_minus_1_x2);
         }
 
         kmer_int_t first_can = 0, last_can = 0;
@@ -112,7 +119,7 @@ inline void load_bucket(const std::string& path, uint32_t k, BucketKmerMap& out)
         for (uint32_t i = k - 1; i < bases.size(); ++i) {
             uint8_t v = bases[i];
             fwd = ((fwd << 2) | v) & mask;
-            rc  = (rc >> 2) | ((kmer_int_t)(v ^ 3) << k_minus_1_x2);
+            rc = (rc >> 2) | ((kmer_int_t)(v ^ 3) << k_minus_1_x2);
             bool is_fwd = (fwd <= rc);
             kmer_int_t can = is_fwd ? fwd : rc;
             out[can].colors.add_color(color);
@@ -161,12 +168,8 @@ inline uint8_t local_ext_mask(kmer_int_t can, uint32_t k, const BucketKmerMap& m
 
 // In walking orientation (rc=false means we walk through the canonical
 // forward), forward-side of `m` is its low nibble; flipped under rc.
-inline uint8_t fwd_nibble(uint8_t m, bool rc) {
-    return (uint8_t)((rc ? (m >> 4) : m) & 0xf);
-}
-inline uint8_t back_nibble(uint8_t m, bool rc) {
-    return (uint8_t)((rc ? m : (m >> 4)) & 0xf);
-}
+inline uint8_t fwd_nibble(uint8_t m, bool rc) { return (uint8_t)((rc ? (m >> 4) : m) & 0xf); }
+inline uint8_t back_nibble(uint8_t m, bool rc) { return (uint8_t)((rc ? m : (m >> 4)) & 0xf); }
 
 // Phantom on the forward / back side in walking orientation.
 inline bool phantom_on_fwd(uint8_t phantom, bool rc) {
@@ -185,8 +188,13 @@ inline BStep bstep(kmer_int_t can, bool rc, uint32_t k, uint8_t nt) {
     kmer_int_t next_fwd = shift_append(cur, nt, k);
     kmer_int_t next_rev = reverse_complement(next_fwd, k);
     BStep r;
-    if (next_fwd <= next_rev) { r.next_can = next_fwd; r.next_rc = false; }
-    else                      { r.next_can = next_rev; r.next_rc = true;  }
+    if (next_fwd <= next_rev) {
+        r.next_can = next_fwd;
+        r.next_rc = false;
+    } else {
+        r.next_can = next_rev;
+        r.next_rc = true;
+    }
     return r;
 }
 
@@ -199,10 +207,9 @@ struct LeftEndCheck {
     bool is_left_end;
     bool back_is_phantom_only;  // true => unitig will be open-left
 };
-inline LeftEndCheck classify_left_end(kmer_int_t can, bool rc, uint32_t cid, uint32_t k,
-                                      const BucketKmerMap& m,
-                                      const std::unordered_map<kmer_int_t, uint32_t,
-                                                               KmerHasher>& cid_of) {
+inline LeftEndCheck classify_left_end(
+    kmer_int_t can, bool rc, uint32_t cid, uint32_t k, const BucketKmerMap& m,
+    const std::unordered_map<kmer_int_t, uint32_t, KmerHasher>& cid_of) {
     auto it = m.find(can);
     uint8_t phantom = it->second.phantom;
     uint8_t mask = local_ext_mask(can, k, m);
@@ -222,7 +229,7 @@ inline LeftEndCheck classify_left_end(kmer_int_t can, bool rc, uint32_t cid, uin
     kmer_int_t pred_can = sr.next_can;
     bool pred_rc = !sr.next_rc;
     auto pit = m.find(pred_can);
-    if (pit == m.end()) return {true, false};   // shouldn't happen: local_back_n said it does
+    if (pit == m.end()) return {true, false};  // shouldn't happen: local_back_n said it does
     uint8_t pred_phantom = pit->second.phantom;
     uint8_t pred_mask = local_ext_mask(pred_can, k, m);
     int pred_local_fwd = __builtin_popcount(fwd_nibble(pred_mask, pred_rc));
@@ -253,8 +260,7 @@ inline void process_bucket(const std::string& path, uint32_t k,
     std::unordered_map<kmer_int_t, uint8_t, KmerHasher> visited;
     visited.reserve(kmer_info.size());
 
-    auto extend_and_emit = [&](kmer_int_t start_can, bool start_rc, uint32_t cid,
-                               bool open_left) {
+    auto extend_and_emit = [&](kmer_int_t start_can, bool start_rc, uint32_t cid, bool open_left) {
         StitchableUnitig u;
         kmer_int_t cur = start_rc ? reverse_complement(start_can, k) : start_can;
         u.seq = kmer_to_string(cur, k);
@@ -272,8 +278,8 @@ inline void process_bucket(const std::string& path, uint32_t k,
             uint8_t fwd_n = fwd_nibble(mask, rc);
             int local_fwd = __builtin_popcount(fwd_n);
             int phantom_fwd = phantom_on_fwd(phantom, rc) ? 1 : 0;
-            if (local_fwd + phantom_fwd != 1) break;       // closed (branch / dead end)
-            if (local_fwd == 0) {                          // open right
+            if (local_fwd + phantom_fwd != 1) break;  // closed (branch / dead end)
+            if (local_fwd == 0) {                     // open right
                 u.open_flags |= UNITIG_OPEN_RIGHT;
                 break;
             }
@@ -305,12 +311,17 @@ inline void process_bucket(const std::string& path, uint32_t k,
         uint32_t cid = cid_of[can];
         // Try both orientations.
         auto le_f = classify_left_end(can, false, cid, k, kmer_info, cid_of);
-        auto le_r = classify_left_end(can, true,  cid, k, kmer_info, cid_of);
+        auto le_r = classify_left_end(can, true, cid, k, kmer_info, cid_of);
         bool start_rc;
         bool open_left;
-        if (le_f.is_left_end) { start_rc = false; open_left = le_f.back_is_phantom_only; }
-        else if (le_r.is_left_end) { start_rc = true; open_left = le_r.back_is_phantom_only; }
-        else continue;
+        if (le_f.is_left_end) {
+            start_rc = false;
+            open_left = le_f.back_is_phantom_only;
+        } else if (le_r.is_left_end) {
+            start_rc = true;
+            open_left = le_r.back_is_phantom_only;
+        } else
+            continue;
         extend_and_emit(can, start_rc, cid, open_left);
     }
 
