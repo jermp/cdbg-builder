@@ -120,10 +120,11 @@ int main(int argc, char** argv) {
         std::cout << "[total construction time] " << (ms / 1000.0) << " s\n";
     };
 
-    // Resolve a scratch directory. If the user supplied --tmp-dir, it
-    // must exist and be empty: the tool wipes the entire directory at
-    // the end of construction, and we don't want to clobber unrelated
-    // user files that happen to be in there.
+    // Resolve a scratch directory. If the user supplied --tmp-dir, we
+    // create it if missing. Once construction starts, the tool wipes
+    // the entire directory at the end -- so if the path already exists,
+    // it must be a directory and it must be empty (we won't clobber
+    // unrelated user files).
     std::string tmp_dir = cfg.tmp_dir;
     if (tmp_dir.empty()) {
         std::string tmpl =
@@ -137,16 +138,24 @@ int main(int argc, char** argv) {
         tmp_dir = buf.data();
     } else {
         std::error_code ec;
-        if (!std::filesystem::exists(tmp_dir, ec) || !std::filesystem::is_directory(tmp_dir, ec)) {
-            std::cerr << "error: --tmp-dir " << tmp_dir
-                      << " does not exist or is not a directory\n";
-            return 1;
-        }
-        if (!std::filesystem::is_empty(tmp_dir, ec)) {
-            std::cerr << "error: --tmp-dir " << tmp_dir
-                      << " is not empty (the tool will remove the directory on exit, so it must"
-                         " start empty)\n";
-            return 1;
+        if (std::filesystem::exists(tmp_dir, ec)) {
+            if (!std::filesystem::is_directory(tmp_dir, ec)) {
+                std::cerr << "error: --tmp-dir " << tmp_dir << " exists but is not a directory\n";
+                return 1;
+            }
+            if (!std::filesystem::is_empty(tmp_dir, ec)) {
+                std::cerr << "error: --tmp-dir " << tmp_dir
+                          << " is not empty (the tool will remove the directory on exit, so it"
+                             " must start empty)\n";
+                return 1;
+            }
+        } else {
+            std::filesystem::create_directories(tmp_dir, ec);
+            if (ec) {
+                std::cerr << "error: cannot create --tmp-dir " << tmp_dir << ": " << ec.message()
+                          << "\n";
+                return 1;
+            }
         }
     }
     std::cout << "  tmp_dir = " << tmp_dir << "\n";
