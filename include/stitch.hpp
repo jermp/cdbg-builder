@@ -31,6 +31,7 @@
 // only departure from GGCAT's behaviour (which is uncolored).
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <iostream>
 #include <string>
@@ -107,7 +108,8 @@ struct link {
 }  // namespace detail
 
 inline void stitch_unitigs(std::vector<stitchable_unitig>& frag, uint32_t k,
-                           std::vector<stitchable_unitig>& out) {
+                           std::vector<stitchable_unitig>& out,
+                           std::atomic<uint64_t>* done = nullptr) {
     using detail::SIDE_LEFT;
     using detail::SIDE_RIGHT;
     using detail::end_ref;
@@ -115,6 +117,7 @@ inline void stitch_unitigs(std::vector<stitchable_unitig>& frag, uint32_t k,
 
     if (k < 2) {
         out = std::move(frag);
+        if (done) done->fetch_add(out.size(), std::memory_order_relaxed);
         return;
     }
 
@@ -177,6 +180,7 @@ inline void stitch_unitigs(std::vector<stitchable_unitig>& frag, uint32_t k,
         merged.colors = frag[start_idx].colors;
         merged.seq = take_seq(start_idx, start_flipped);
         visited[start_idx] = 1;
+        if (done) done->fetch_add(1, std::memory_order_relaxed);
 
         // The merged-LEFT side of the chain corresponds to start's own
         // SIDE_LEFT (if !start_flipped) or own SIDE_RIGHT (if start_flipped).
@@ -209,6 +213,7 @@ inline void stitch_unitigs(std::vector<stitchable_unitig>& frag, uint32_t k,
             std::string add = take_seq(nxt, f_nxt);
             merged.seq.append(add.begin() + (k - 1), add.end());
             visited[nxt] = 1;
+            if (done) done->fetch_add(1, std::memory_order_relaxed);
             cur = nxt;
             f_cur = f_nxt;
         }

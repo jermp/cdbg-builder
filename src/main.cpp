@@ -164,7 +164,10 @@ int main(int argc, char** argv) {
     std::vector<cdgb::stitchable_unitig> all_unitigs;
     {
         timer _("stitch");
-        cdgb::stitch_unitigs(frag_unitigs, cfg.k, all_unitigs);
+        std::atomic<uint64_t> done{0};
+        cdgb::progress prog("stitch", done, frag_unitigs.size());
+        cdgb::stitch_unitigs(frag_unitigs, cfg.k, all_unitigs, &done);
+        prog.stop();
         frag_unitigs = {};
         std::cout << "  unitigs after stitching: " << all_unitigs.size() << "\n";
     }
