@@ -152,20 +152,42 @@ private:
         return (uint8_t)((rc ? mask : (mask >> 4)) & 0xf);
     }
 
+    // Filter `bits` (a 4-bit fwd or back nibble computed from compute_ext_mask
+    // in walking orientation) to only count neighbors whose color_set_id
+    // equals `cid`. The neighbor reached by base `nt` from `(can, rc)` along
+    // direction `is_back` is looked up via step.
+    int colored_count(uint8_t bits, kmer_int_t can, bool rc, uint32_t cid,
+                      bool is_back) const {
+        int count = 0;
+        for (uint8_t nt = 0; nt < 4; ++nt) {
+            if (!(bits & (1u << nt))) continue;
+            auto sr = detail::step(can, is_back ? !rc : rc, m_k, nt);
+            if (color_id(sr.next_can) == cid) ++count;
+        }
+        return count;
+    }
+
     bool is_left_end(kmer_int_t can, bool rc, uint32_t cid) const {
         uint8_t m = detail::compute_ext_mask(can, m_k, m_fkm);
         uint8_t back = back_side(m, rc);
-        if (__builtin_popcount(back) != 1) return true;
-        uint8_t nt = (uint8_t)__builtin_ctz(back);
-        // Step "backward in rc" == step "forward in !rc" with that NT, then flip.
+        // Branches in the colored dBG only matter when the branching
+        // neighbors share our color set; predecessors with different colors
+        // are part of a different unitig and don't fragment ours.
+        int back_colored = colored_count(back, can, rc, cid, /*is_back=*/true);
+        if (back_colored != 1) return true;
+        uint8_t nt = 0;
+        for (uint8_t b = 0; b < 4; ++b) {
+            if (!(back & (1u << b))) continue;
+            auto sr = detail::step(can, !rc, m_k, b);
+            if (color_id(sr.next_can) == cid) { nt = b; break; }
+        }
         auto sr = detail::step(can, !rc, m_k, nt);
         kmer_int_t pred = sr.next_can;
         bool pred_rc = !sr.next_rc;
-        // Predecessor's fwd-extension count in pred_rc must be 1 AND color must match.
         uint8_t mp = detail::compute_ext_mask(pred, m_k, m_fkm);
         uint8_t pf = fwd_side(mp, pred_rc);
-        if (__builtin_popcount(pf) != 1) return true;
-        if (color_id(pred) != cid) return true;
+        int pf_colored = colored_count(pf, pred, pred_rc, cid, /*is_back=*/false);
+        if (pf_colored != 1) return true;
         return false;
     }
 
@@ -205,15 +227,21 @@ private:
         for (;;) {
             uint8_t m = detail::compute_ext_mask(can, m_k, m_fkm);
             uint8_t fs = fwd_side(m, rc);
-            if (__builtin_popcount(fs) != 1) break;
-            uint8_t nt = (uint8_t)__builtin_ctz(fs);
+            int fs_colored = colored_count(fs, can, rc, cid, /*is_back=*/false);
+            if (fs_colored != 1) break;
+            uint8_t nt = 0;
+            for (uint8_t b = 0; b < 4; ++b) {
+                if (!(fs & (1u << b))) continue;
+                auto sr = detail::step(can, rc, m_k, b);
+                if (color_id(sr.next_can) == cid) { nt = b; break; }
+            }
             auto sr = detail::step(can, rc, m_k, nt);
-            // back-degree of next on the side we arrive on must be 1.
-            uint8_t mn = detail::compute_ext_mask(sr.next_can, m_k, m_fkm);
-            uint8_t bn = back_side(mn, sr.next_rc);
-            if (__builtin_popcount(bn) != 1) break;
             uint32_t next_cid = color_id(sr.next_can);
             if (next_cid != cid) break;
+            uint8_t mn = detail::compute_ext_mask(sr.next_can, m_k, m_fkm);
+            uint8_t bn = back_side(mn, sr.next_rc);
+            int bn_colored = colored_count(bn, sr.next_can, sr.next_rc, cid, /*is_back=*/true);
+            if (bn_colored != 1) break;
             uint64_t s2;
             size_t idx2;
             if (!locate(sr.next_can, s2, idx2)) break;
