@@ -1,30 +1,34 @@
 #pragma once
 
-// Disk-backed bucket I/O for the minimizer-bucketed ingest path.
+// Disk-backed bucket I/O for the minimizer-bucketed ingest path, with
+// inline compaction.
 //
-// The writer side is sharded by minimizer-derived bucket id. Each ingest
-// thread owns a per-bucket buffer; when a buffer fills (or the thread
-// finishes a file), the thread takes the bucket's mutex and appends its
-// buffer to the bucket's gzip stream. Bucket files are streaming gzip
-// (level 1) so per-bucket on-disk size matches the GGCAT-style compressed
-// format; super-k-mers in the same bucket share their minimizer m-mer,
-// which compresses very well.
+// Each bucket on disk holds a stream of *compacted* super-k-mer records
+// (see super_kmer.hpp): a super-k-mer that occurs in many input files is
+// stored once with the union of its colors. Compaction happens online in
+// per-bucket hashmaps; ingest threads flush their per-thread buffers into
+// the bucket's hashmap under the bucket mutex, and the hashmap spills its
+// contents to disk (gzip level 1) whenever it crosses a memory budget. The
+// bucket walker correctly merges color sets across multiple spilled
+// records for the same super-k-mer, so spilling is purely a memory bound.
 //
-// The reader side decompresses the whole bucket file into memory and yields
-// records via super_kmer.hpp. Buckets are bounded in size by 1/B of the
-// dataset, so for our target inputs (a few-thousand bacterial genomes)
-// per-bucket size stays comfortably in RAM.
+// On dense pangenome inputs (e.g. many closely-related bacterial genomes)
+// most super-k-mers are shared across colors, so compaction is the main
+// disk-write reduction over a naive one-record-per-occurrence layout.
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <sys/stat.h>
+#include <unordered_map>
 #include <vector>
 #include <zlib.h>
 
@@ -32,28 +36,131 @@
 
 namespace cdgb {
 
+// ---- Per-bucket in-memory compactor + gzip-streaming output -----------------
+
+// Default per-bucket hashmap memory budget (estimated). With 1024 buckets
+// at this budget the global ingest peak from the compactors is ~256 MiB.
+inline constexpr size_t DEFAULT_COMPACTOR_SPILL_BYTES = 256 * 1024;
+
+class BucketCompactor {
+public:
+    BucketCompactor(std::string path, size_t spill_bytes) : m_path(std::move(path)), m_spill_bytes(spill_bytes) {
+        m_file = gzopen(m_path.c_str(), "wb1");
+        if (!m_file)
+            throw std::runtime_error("cannot open bucket file: " + m_path + ": " +
+                                     std::strerror(errno));
+        gzbuffer(m_file, 256 * 1024);
+    }
+
+    ~BucketCompactor() { close(); }
+
+    BucketCompactor(const BucketCompactor&) = delete;
+    BucketCompactor& operator=(const BucketCompactor&) = delete;
+
+    const std::string& path() const { return m_path; }
+    uint64_t total_uncompressed_bytes() const {
+        return m_total_uncompressed.load(std::memory_order_relaxed);
+    }
+
+    // Insert a batch of records (parsed). `bases_storage` holds the 2-bit
+    // values (one per byte) for every record; each record points into it
+    // via [bases_off, bases_off + bases_len). Caller may clear/reset its
+    // buffers after this returns.
+    struct PendingRecord {
+        uint32_t color;
+        uint32_t bases_off;
+        uint32_t bases_len;
+        uint8_t flags;
+    };
+
+    void insert_batch(const std::vector<PendingRecord>& recs,
+                      const std::vector<uint8_t>& bases_storage) {
+        if (recs.empty()) return;
+        std::lock_guard<std::mutex> lk(m_mu);
+        for (const auto& r : recs) {
+            std::string key((const char*)bases_storage.data() + r.bases_off, r.bases_len);
+            auto it = m_dedup.find(key);
+            if (it == m_dedup.end()) {
+                Entry e;
+                // Within a single batch from one input thread, a fresh
+                // entry sees only one set of flags; subsequent merges
+                // across batches/colors AND-shrink the begin/end bits.
+                e.flags = r.flags;
+                e.colors.push_back(r.color);
+                m_bytes += key.size() + sizeof(uint32_t);
+                m_dedup.emplace(std::move(key), std::move(e));
+            } else {
+                Entry& e = it->second;
+                e.flags &= r.flags;  // AND across contributors
+                auto& cs = e.colors;
+                auto pos = std::lower_bound(cs.begin(), cs.end(), r.color);
+                if (pos == cs.end() || *pos != r.color) {
+                    cs.insert(pos, r.color);
+                    m_bytes += sizeof(uint32_t);
+                }
+            }
+        }
+        if (m_bytes >= m_spill_bytes) spill_locked();
+    }
+
+    void close() {
+        std::lock_guard<std::mutex> lk(m_mu);
+        if (m_file) {
+            spill_locked();
+            gzclose(m_file);
+            m_file = nullptr;
+        }
+    }
+
+private:
+    struct Entry {
+        std::vector<uint32_t> colors;  // ascending, deduped
+        uint8_t flags = 0;
+    };
+
+    void spill_locked() {
+        if (m_dedup.empty()) return;
+        std::vector<uint8_t> rec_buf;
+        rec_buf.reserve(256);
+        uint64_t spilled = 0;
+        for (auto& kv : m_dedup) {
+            const std::string& key = kv.first;
+            const Entry& e = kv.second;
+            rec_buf.clear();
+            write_super_kmer(e.flags, e.colors.data(), (uint32_t)e.colors.size(),
+                             (const uint8_t*)key.data(), (uint32_t)key.size(), rec_buf);
+            int n = gzwrite(m_file, rec_buf.data(), (unsigned)rec_buf.size());
+            if (n <= 0 || (size_t)n != rec_buf.size())
+                throw std::runtime_error("short write to " + m_path);
+            spilled += rec_buf.size();
+        }
+        m_total_uncompressed.fetch_add(spilled, std::memory_order_relaxed);
+        m_dedup.clear();
+        m_bytes = 0;
+    }
+
+    std::string m_path;
+    size_t m_spill_bytes;
+    std::mutex m_mu;
+    gzFile m_file = nullptr;
+    std::unordered_map<std::string, Entry> m_dedup;
+    size_t m_bytes = 0;
+    std::atomic<uint64_t> m_total_uncompressed{0};
+};
+
+// ---- BucketWriter: owns one BucketCompactor per bucket ----------------------
+
 class BucketWriter {
 public:
-    BucketWriter(const std::string& dir, uint32_t num_buckets, size_t flush_bytes = 64 * 1024)
-        : m_dir(dir)
-        , m_num_buckets(num_buckets)
-        , m_flush_bytes(flush_bytes)
-        , m_mus(num_buckets)
-        , m_files(num_buckets, nullptr) {
+    BucketWriter(const std::string& dir, uint32_t num_buckets,
+                 size_t flush_bases = 64 * 1024,
+                 size_t spill_bytes = DEFAULT_COMPACTOR_SPILL_BYTES)
+        : m_dir(dir), m_num_buckets(num_buckets), m_flush_bases(flush_bases) {
         std::filesystem::create_directories(m_dir);
+        m_compactors.reserve(num_buckets);
         for (uint32_t b = 0; b < num_buckets; ++b) {
-            std::string p = bucket_path(b);
-            // Level 1 (Z_BEST_SPEED): fast streaming gzip; on dense
-            // 2-bit-packed DNA records the cost is small but the on-disk
-            // savings are large (super-k-mers in the same bucket share
-            // their minimizer, so they compress strongly together).
-            gzFile f = gzopen(p.c_str(), "wb1");
-            if (!f)
-                throw std::runtime_error("cannot open bucket file: " + p + ": " +
-                                         std::strerror(errno));
-            // 256 KiB internal buffer reduces syscall overhead per chunk.
-            gzbuffer(f, 256 * 1024);
-            m_files[b] = f;
+            m_compactors.emplace_back(
+                std::make_unique<BucketCompactor>(bucket_path(b), spill_bytes));
         }
     }
 
@@ -63,46 +170,39 @@ public:
     BucketWriter& operator=(const BucketWriter&) = delete;
 
     uint32_t num_buckets() const { return m_num_buckets; }
-    size_t flush_bytes() const { return m_flush_bytes; }
+    // Per-thread, per-bucket buffer threshold in *bases* (2-bit values).
+    size_t flush_bases() const { return m_flush_bases; }
+
     std::string bucket_path(uint32_t b) const {
         return m_dir + "/bucket_" + std::to_string(b) + ".bin";
     }
 
-    // Append `buf` to bucket `b`'s file under the bucket's mutex. The caller
-    // typically passes its per-thread buffer here once it has reached the
-    // flush threshold.
-    void flush(uint32_t b, std::vector<uint8_t>& buf) {
-        if (buf.empty()) return;
-        std::lock_guard<std::mutex> lk(m_mus[b]);
-        int n = gzwrite(m_files[b], buf.data(), (unsigned)buf.size());
-        if (n <= 0 || (size_t)n != buf.size()) {
-            throw std::runtime_error("short write to " + bucket_path(b));
-        }
-        m_total_uncompressed.fetch_add(buf.size(), std::memory_order_relaxed);
-        buf.clear();
+    void flush(uint32_t b, std::vector<BucketCompactor::PendingRecord>& recs,
+               std::vector<uint8_t>& bases_buf) {
+        if (recs.empty()) return;
+        m_compactors[b]->insert_batch(recs, bases_buf);
+        recs.clear();
+        bases_buf.clear();
     }
 
     void close() {
+        if (m_closed) return;
+        for (auto& c : m_compactors) c->close();
+        // Stat each file once for the on-disk byte total.
+        uint64_t total_compressed = 0;
+        uint64_t total_uncompressed = 0;
         for (uint32_t b = 0; b < m_num_buckets; ++b) {
-            if (m_files[b]) {
-                gzclose(m_files[b]);
-                m_files[b] = nullptr;
-            }
+            struct stat st;
+            if (::stat(bucket_path(b).c_str(), &st) == 0)
+                total_compressed += (uint64_t)st.st_size;
+            total_uncompressed += m_compactors[b]->total_uncompressed_bytes();
         }
-        if (m_total_compressed.load(std::memory_order_relaxed) == 0) {
-            // First close call: stat each file to measure on-disk bytes.
-            uint64_t total = 0;
-            for (uint32_t b = 0; b < m_num_buckets; ++b) {
-                struct stat st;
-                if (::stat(bucket_path(b).c_str(), &st) == 0) total += (uint64_t)st.st_size;
-            }
-            m_total_compressed.store(total, std::memory_order_relaxed);
-        }
+        m_total_compressed.store(total_compressed, std::memory_order_relaxed);
+        m_total_uncompressed.store(total_uncompressed, std::memory_order_relaxed);
+        m_closed = true;
     }
 
-    // Bytes actually written to disk (compressed).
     uint64_t total_bytes() const { return m_total_compressed.load(std::memory_order_relaxed); }
-    // Logical record bytes fed into the compressor (pre-compression).
     uint64_t total_uncompressed_bytes() const {
         return m_total_uncompressed.load(std::memory_order_relaxed);
     }
@@ -110,35 +210,46 @@ public:
 private:
     std::string m_dir;
     uint32_t m_num_buckets;
-    size_t m_flush_bytes;
-    std::vector<std::mutex> m_mus;
-    std::vector<gzFile> m_files;
-    std::atomic<uint64_t> m_total_uncompressed{0};
+    size_t m_flush_bases;
+    std::vector<std::unique_ptr<BucketCompactor>> m_compactors;
     std::atomic<uint64_t> m_total_compressed{0};
+    std::atomic<uint64_t> m_total_uncompressed{0};
+    bool m_closed = false;
 };
 
-// Per-thread sidecar that batches records destined for each bucket.
+// ---- Per-thread batching sidecar -------------------------------------------
+//
+// Each ingest worker owns one of these. For each bucket it accumulates a
+// flat list of pending records plus a parallel 2-bit-value buffer for the
+// bases. When a bucket's bases-buffer crosses `flush_bases`, the thread
+// flushes that bucket's batch into the writer (which delegates to the
+// per-bucket compactor under that bucket's mutex).
+
 struct PerThreadBucketBuffers {
-    std::vector<std::vector<uint8_t>> bufs;
+    std::vector<std::vector<BucketCompactor::PendingRecord>> recs;
+    std::vector<std::vector<uint8_t>> bases;
     BucketWriter* sink = nullptr;
 
-    explicit PerThreadBucketBuffers(BucketWriter& w) : bufs(w.num_buckets()), sink(&w) {}
+    explicit PerThreadBucketBuffers(BucketWriter& w)
+        : recs(w.num_buckets()), bases(w.num_buckets()), sink(&w) {}
 
-    // Append a record to bucket `b`; flush if the buffer crossed the threshold.
-    void append(uint32_t b, const uint8_t* rec, size_t rec_len) {
-        auto& buf = bufs[b];
-        size_t off = buf.size();
-        buf.resize(off + rec_len);
-        std::memcpy(buf.data() + off, rec, rec_len);
-        if (buf.size() >= sink->flush_bytes()) sink->flush(b, buf);
+    void append(uint32_t b, uint8_t flags, uint32_t color, const uint8_t* sk_bases,
+                uint32_t len) {
+        auto& bbuf = bases[b];
+        uint32_t off = (uint32_t)bbuf.size();
+        bbuf.insert(bbuf.end(), sk_bases, sk_bases + len);
+        recs[b].push_back({color, off, len, (uint8_t)(flags & 0x3u)});
+        if (bbuf.size() >= sink->flush_bases()) sink->flush(b, recs[b], bbuf);
     }
 
     void flush_all() {
-        for (uint32_t b = 0; b < (uint32_t)bufs.size(); ++b) {
-            if (!bufs[b].empty()) sink->flush(b, bufs[b]);
+        for (uint32_t b = 0; b < (uint32_t)recs.size(); ++b) {
+            if (!recs[b].empty()) sink->flush(b, recs[b], bases[b]);
         }
     }
 };
+
+// ---- BucketReader: streams compacted records from disk ----------------------
 
 class BucketReader {
 public:
@@ -162,11 +273,11 @@ public:
         gzclose(f);
     }
 
-    // Iterate records in order. Returns false when no more records are available.
-    bool next(uint8_t& flags, uint32_t& color, std::vector<uint8_t>& bases) {
+    // Iterate records in order. Returns false when no more records remain.
+    bool next(uint8_t& flags, std::vector<uint32_t>& colors, std::vector<uint8_t>& bases) {
         if (m_pos >= m_buf.size()) return false;
-        size_t consumed =
-            read_super_kmer(m_buf.data() + m_pos, m_buf.size() - m_pos, flags, color, bases);
+        size_t consumed = read_super_kmer(m_buf.data() + m_pos, m_buf.size() - m_pos, flags,
+                                          colors, bases);
         if (consumed == 0) return false;
         m_pos += consumed;
         return true;

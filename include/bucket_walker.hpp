@@ -97,9 +97,9 @@ using BucketKmerMap = std::unordered_map<kmer_int_t, BucketKmerInfo, KmerHasher>
 inline void load_bucket(const std::string& path, uint32_t k, BucketKmerMap& out) {
     BucketReader reader(path);
     uint8_t flags = 0;
-    uint32_t color = 0;
+    std::vector<uint32_t> colors;
     std::vector<uint8_t> bases;
-    while (reader.next(flags, color, bases)) {
+    while (reader.next(flags, colors, bases)) {
         if (bases.size() < k) continue;
 
         const kmer_int_t mask = kmer_mask(k);
@@ -122,7 +122,8 @@ inline void load_bucket(const std::string& path, uint32_t k, BucketKmerMap& out)
             rc = (rc >> 2) | ((kmer_int_t)(v ^ 3) << k_minus_1_x2);
             bool is_fwd = (fwd <= rc);
             kmer_int_t can = is_fwd ? fwd : rc;
-            out[can].colors.add_color(color);
+            auto& entry = out[can];
+            for (uint32_t c : colors) entry.colors.add_color(c);
             if (!have_first) {
                 first_can = can;
                 first_is_fwd = is_fwd;
