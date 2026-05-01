@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include <essentials.hpp>
+#include <parser.hpp>
 
 #include "bucket_io.hpp"
 #include "bucket_ingester.hpp"
@@ -27,29 +28,6 @@
 #include "stitch.hpp"
 
 namespace {
-
-void print_usage(const char* argv0) {
-    std::cerr
-        << "cdgb-build: build a colored compacted de Bruijn graph and emit\n"
-           "  - <out>.fa      FASTA of monochromatic colored unitigs (header = color_set_id)\n"
-           "  - <out>.colors  binary in Fulgor's `hybrid` color-set format\n"
-           "\n"
-           "usage:\n"
-           "  "
-        << argv0
-        << " -i <filenames_list> -k <k> -o <out_basename> [options]\n"
-           "\n"
-           "options:\n"
-           "  -t <N>              worker threads (default 1)\n"
-           "  -m <N>              minimizer length (default: auto, derived from k)\n"
-           "  --buckets-log2 <N>  log2(num_buckets) (default 10 -> 1024 buckets)\n"
-           "  --tmp-dir <PATH>    scratch directory for bucket files (default mkdtemp)\n"
-           "\n"
-           "<filenames_list> is a text file containing one input path per line.\n"
-           "Each input file is one color, in line order (file at line i has color i).\n"
-           "Inputs may be FASTA, FASTQ, or gzipped variants of either.\n";
-}
-
 class Timer {
 public:
     Timer(const char* label) : m_label(label), m_t0(std::chrono::steady_clock::now()) {}
@@ -65,25 +43,43 @@ private:
 };
 
 bool parse_args(int argc, char** argv, cdgb::BuildConfig& cfg) {
-    for (int i = 1; i < argc; ++i) {
-        std::string a = argv[i];
-        auto need = [&](const char* opt) {
-            if (i + 1 >= argc) throw std::runtime_error(std::string("missing value for ") + opt);
-            return std::string(argv[++i]);
-        };
-        if (a == "-i") cfg.filenames_list = need("-i");
-        else if (a == "-k") cfg.k = (uint32_t)std::stoul(need("-k"));
-        else if (a == "-o") cfg.out_basename = need("-o");
-        else if (a == "-t") cfg.num_threads = (uint32_t)std::stoul(need("-t"));
-        else if (a == "-m") cfg.m = (uint32_t)std::stoul(need("-m"));
-        else if (a == "--buckets-log2") cfg.bucket_log2 = (uint32_t)std::stoul(need("--buckets-log2"));
-        else if (a == "--tmp-dir") cfg.tmp_dir = need("--tmp-dir");
-        else if (a == "-v" || a == "--verbose") cfg.verbose = true;
-        else if (a == "-h" || a == "--help") return false;
-        else { std::cerr << "unknown arg: " << a << "\n"; return false; }
+    cmd_line_parser::parser parser(argc, argv);
+    parser.add("filenames_list",
+               "Text file with one input path per line. The file at line i has color i.",
+               "-i", true);
+    parser.add("out_basename",
+               "Output basename. Produces <basename>.fa and <basename>.colors.",
+               "-o", true);
+    parser.add("k",
+               "K-mer length (must be <= " + std::to_string(cdgb::MAX_K) + ").",
+               "-k", true);
+    parser.add("num_threads", "Number of worker threads (default 1).", "-t", false);
+    parser.add("m",
+               "Minimizer length (default: auto, derived from k).",
+               "-m", false);
+    parser.add("buckets_log2",
+               "log2 of the bucket count (default 10 -> 1024).",
+               "--buckets-log2", false);
+    parser.add("tmp_dir",
+               "Scratch directory for bucket files (default: mkdtemp under $TMPDIR).",
+               "--tmp-dir", false);
+    parser.add("verbose", "Verbose output.", "--verbose", false, true);
+
+    if (!parser.parse()) return false;
+
+    cfg.filenames_list = parser.get<std::string>("filenames_list");
+    cfg.out_basename   = parser.get<std::string>("out_basename");
+    cfg.k              = parser.get<uint32_t>("k");
+    if (parser.parsed("num_threads"))  cfg.num_threads = parser.get<uint32_t>("num_threads");
+    if (parser.parsed("m"))            cfg.m = parser.get<uint32_t>("m");
+    if (parser.parsed("buckets_log2")) cfg.bucket_log2 = parser.get<uint32_t>("buckets_log2");
+    if (parser.parsed("tmp_dir"))      cfg.tmp_dir = parser.get<std::string>("tmp_dir");
+    if (parser.parsed("verbose"))      cfg.verbose = parser.get<bool>("verbose");
+
+    if (cfg.k == 0 || cfg.k > cdgb::MAX_K) {
+        std::cerr << "error: k must satisfy 1 <= k <= " << cdgb::MAX_K << "\n";
+        return false;
     }
-    if (cfg.filenames_list.empty() || cfg.out_basename.empty() || cfg.k == 0) return false;
-    if (cfg.k > cdgb::MAX_K) throw std::runtime_error("k must be <= 63");
     return true;
 }
 
@@ -102,16 +98,7 @@ std::vector<std::string> read_filenames(const std::string& path) {
 
 int main(int argc, char** argv) {
     cdgb::BuildConfig cfg;
-    try {
-        if (!parse_args(argc, argv, cfg)) {
-            print_usage(argv[0]);
-            return 1;
-        }
-    } catch (std::exception& e) {
-        std::cerr << "argument error: " << e.what() << "\n";
-        print_usage(argv[0]);
-        return 1;
-    }
+    if (!parse_args(argc, argv, cfg)) return 1;
 
     auto files = read_filenames(cfg.filenames_list);
     if (files.empty()) {
