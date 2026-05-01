@@ -80,12 +80,12 @@ inline uint32_t compute_best_m(uint32_t k) {
 // Sliding-window minimum over a stream of (uint64_t hash, int32_t pos) pairs,
 // returning the current minimum's hash. Uses a monotonic deque so amortised
 // per-step cost is O(1).
-struct MinQueue {
-    struct E {
+struct min_queue {
+    struct entry {
         uint64_t h;
         int32_t pos;
     };
-    std::deque<E> q;
+    std::deque<entry> q;
     int32_t window_size = 0;
 
     void reset(int32_t window) {

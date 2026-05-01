@@ -40,7 +40,7 @@ namespace cdgb {
 // previous O(N) linear-scan dedup on each insert was the dominant cost
 // of bucket processing; deferring dedup to a single sort+unique brings
 // it down to O(N log N) per k-mer total.
-struct KmerEntry {
+struct kmer_entry {
     std::vector<uint32_t> colors;
 
     void add_color(uint32_t c) { colors.push_back(c); }
@@ -56,7 +56,7 @@ struct KmerEntry {
 inline constexpr uint8_t UNITIG_OPEN_LEFT = 1u << 0;
 inline constexpr uint8_t UNITIG_OPEN_RIGHT = 1u << 1;
 
-struct StitchableUnitig {
+struct stitchable_unitig {
     std::string seq;               // ACGT characters
     std::vector<uint32_t> colors;  // sorted, deduped color set
     uint8_t open_flags = 0;        // bits from UNITIG_OPEN_*
@@ -68,16 +68,16 @@ namespace detail {
 inline constexpr uint8_t KMER_PHANTOM_LEFT = 1u << 0;   // phantom predecessor exists
 inline constexpr uint8_t KMER_PHANTOM_RIGHT = 1u << 1;  // phantom successor exists
 
-struct BucketKmerInfo {
-    KmerEntry colors;
+struct bucket_kmer_info {
+    kmer_entry colors;
     uint8_t phantom = 0;
 };
 
-using BucketKmerMap = ankerl::unordered_dense::map<kmer_int_t, BucketKmerInfo, KmerHasher>;
+using bucket_kmer_map = ankerl::unordered_dense::map<kmer_int_t, bucket_kmer_info, kmer_hasher>;
 
 // Build the per-canonical-k-mer info from a bucket's super-k-mer stream.
-inline void load_bucket(const std::string& path, uint32_t k, BucketKmerMap& out) {
-    BucketReader reader(path);
+inline void load_bucket(const std::string& path, uint32_t k, bucket_kmer_map& out) {
+    bucket_reader reader(path);
     uint8_t flags = 0;
     std::vector<uint32_t> colors;
     std::vector<uint8_t> bases;
@@ -136,7 +136,7 @@ inline void load_bucket(const std::string& path, uint32_t k, BucketKmerMap& out)
 
 // 8-bit local extension mask, bits 0..3 = forward-side successors of `can`,
 // bits 4..7 = back-side predecessors (= forward-side successors of rc(can)).
-inline uint8_t local_ext_mask(kmer_int_t can, uint32_t k, const BucketKmerMap& m) {
+inline uint8_t local_ext_mask(kmer_int_t can, uint32_t k, const bucket_kmer_map& m) {
     uint8_t out = 0;
     kmer_int_t fwd = can;
     kmer_int_t rev = reverse_complement(can, k);
@@ -162,15 +162,15 @@ inline bool phantom_on_back(uint8_t phantom, bool rc) {
     return rc ? (phantom & KMER_PHANTOM_RIGHT) : (phantom & KMER_PHANTOM_LEFT);
 }
 
-struct BStep {
+struct b_step {
     kmer_int_t next_can;
     bool next_rc;
 };
-inline BStep bstep(kmer_int_t can, bool rc, uint32_t k, uint8_t nt) {
+inline b_step bstep(kmer_int_t can, bool rc, uint32_t k, uint8_t nt) {
     kmer_int_t cur = rc ? reverse_complement(can, k) : can;
     kmer_int_t next_fwd = shift_append(cur, nt, k);
     kmer_int_t next_rev = reverse_complement(next_fwd, k);
-    BStep r;
+    b_step r;
     if (next_fwd <= next_rev) {
         r.next_can = next_fwd;
         r.next_rc = false;
@@ -186,13 +186,13 @@ inline BStep bstep(kmer_int_t can, bool rc, uint32_t k, uint8_t nt) {
 // both local and phantom edges + color-set agreement). Also reports whether
 // the back-side reason for being a left-end was a phantom-only edge — that
 // makes the resulting unitig OPEN_LEFT.
-struct LeftEndCheck {
+struct left_end_check {
     bool is_left_end;
     bool back_is_phantom_only;  // true => unitig will be open-left
 };
-inline LeftEndCheck classify_left_end(
-    kmer_int_t can, bool rc, uint32_t cid, uint32_t k, const BucketKmerMap& m,
-    const ankerl::unordered_dense::map<kmer_int_t, uint32_t, KmerHasher>& cid_of) {
+inline left_end_check classify_left_end(
+    kmer_int_t can, bool rc, uint32_t cid, uint32_t k, const bucket_kmer_map& m,
+    const ankerl::unordered_dense::map<kmer_int_t, uint32_t, kmer_hasher>& cid_of) {
     auto it = m.find(can);
     uint8_t phantom = it->second.phantom;
     uint8_t mask = local_ext_mask(can, k, m);
@@ -224,13 +224,13 @@ inline LeftEndCheck classify_left_end(
 }
 
 inline void process_bucket(const std::string& path, uint32_t k,
-                           std::vector<StitchableUnitig>& out_local) {
-    BucketKmerMap kmer_info;
+                           std::vector<stitchable_unitig>& out_local) {
+    bucket_kmer_map kmer_info;
     load_bucket(path, k, kmer_info);
 
     // Build local color-set dict and a parallel map cid_of[can] for quick lookups.
-    ColorSetDict local_dict;
-    ankerl::unordered_dense::map<kmer_int_t, uint32_t, KmerHasher> cid_of;
+    color_set_dict local_dict;
+    ankerl::unordered_dense::map<kmer_int_t, uint32_t, kmer_hasher> cid_of;
     cid_of.reserve(kmer_info.size());
     for (auto& kv : kmer_info) {
         std::vector<uint32_t> sorted = kv.second.colors.to_sorted();
@@ -238,13 +238,13 @@ inline void process_bucket(const std::string& path, uint32_t k,
         cid_of.emplace(kv.first, cid);
     }
     // Free per-k-mer color storage; we keep phantom flags in kmer_info.
-    for (auto& kv : kmer_info) kv.second.colors = KmerEntry{};
+    for (auto& kv : kmer_info) kv.second.colors = kmer_entry{};
 
-    ankerl::unordered_dense::map<kmer_int_t, uint8_t, KmerHasher> visited;
+    ankerl::unordered_dense::map<kmer_int_t, uint8_t, kmer_hasher> visited;
     visited.reserve(kmer_info.size());
 
     auto extend_and_emit = [&](kmer_int_t start_can, bool start_rc, uint32_t cid, bool open_left) {
-        StitchableUnitig u;
+        stitchable_unitig u;
         kmer_int_t cur = start_rc ? reverse_complement(start_can, k) : start_can;
         u.seq = kmer_to_string(cur, k);
         u.colors = local_dict.at(cid);
@@ -322,8 +322,8 @@ inline void process_bucket(const std::string& path, uint32_t k,
 
 // Parallel driver. Each worker processes one bucket at a time and appends its
 // stitchable unitigs to the shared output vector under `out_mu`.
-inline void process_buckets(const BucketWriter& writer, uint32_t k, uint32_t num_threads,
-                            std::vector<StitchableUnitig>& out, std::mutex& out_mu,
+inline void process_buckets(const bucket_writer& writer, uint32_t k, uint32_t num_threads,
+                            std::vector<stitchable_unitig>& out, std::mutex& out_mu,
                             std::atomic<uint64_t>* done = nullptr) {
     if (num_threads == 0) num_threads = 1;
     const uint32_t B = writer.num_buckets();
@@ -332,7 +332,7 @@ inline void process_buckets(const BucketWriter& writer, uint32_t k, uint32_t num
     workers.reserve(num_threads);
 
     auto run = [&]() {
-        std::vector<StitchableUnitig> local;
+        std::vector<stitchable_unitig> local;
         for (;;) {
             uint32_t b = next.fetch_add(1);
             if (b >= B) break;

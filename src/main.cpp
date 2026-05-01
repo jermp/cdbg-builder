@@ -24,14 +24,15 @@
 #include "color_set_dict.hpp"
 #include "hybrid_color_sets.hpp"
 #include "minimizer.hpp"
+#include "prof.hpp"
 #include "progress.hpp"
 #include "stitch.hpp"
 
 namespace {
-class Timer {
+class timer {
 public:
-    Timer(const char* label) : m_label(label), m_t0(std::chrono::steady_clock::now()) {}
-    ~Timer() {
+    timer(const char* label) : m_label(label), m_t0(std::chrono::steady_clock::now()) {}
+    ~timer() {
         auto t1 = std::chrono::steady_clock::now();
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - m_t0).count();
         std::cout << "[" << m_label << "] " << (ms / 1000.0) << " s\n";
@@ -42,7 +43,7 @@ private:
     std::chrono::steady_clock::time_point m_t0;
 };
 
-bool parse_args(int argc, char** argv, cdgb::BuildConfig& cfg) {
+bool parse_args(int argc, char** argv, cdgb::build_config& cfg) {
     cmd_line_parser::parser parser(argc, argv);
     parser.add("filenames_list",
                "Text file with one input path per line. The file at line i has color i.", "-i",
@@ -90,7 +91,7 @@ std::vector<std::string> read_filenames(const std::string& path) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    cdgb::BuildConfig cfg;
+    cdgb::build_config cfg;
     if (!parse_args(argc, argv, cfg)) return 1;
 
     auto files = read_filenames(cfg.filenames_list);
@@ -138,42 +139,43 @@ int main(int argc, char** argv) {
     }
     std::cout << "  tmp_dir = " << tmp_dir << "\n";
 
-    cdgb::BucketWriter writer(tmp_dir, num_buckets);
+    cdgb::bucket_writer writer(tmp_dir, num_buckets);
     {
-        Timer _("bucket-write");
+        timer _("bucket-write");
         std::atomic<uint64_t> done{0};
-        cdgb::Progress prog("bucket-write", done, files.size());
+        cdgb::progress prog("bucket-write", done, files.size());
         cdgb::ingest_bucketed(files, cfg.k, cfg.m, cfg.bucket_log2, writer, cfg.num_threads, &done);
         prog.stop();
     }
     writer.close();
     std::cout << "  bucket bytes written: " << writer.total_bytes() << " (compressed; "
               << writer.total_uncompressed_bytes() << " uncompressed)\n";
+    cdgb::bucket_prof().print(cfg.num_threads);
 
-    std::vector<cdgb::StitchableUnitig> frag_unitigs;
+    std::vector<cdgb::stitchable_unitig> frag_unitigs;
     std::mutex out_mu;
     {
-        Timer _("bucket-process");
+        timer _("bucket-process");
         std::atomic<uint64_t> done{0};
-        cdgb::Progress prog("bucket-process", done, num_buckets);
+        cdgb::progress prog("bucket-process", done, num_buckets);
         cdgb::process_buckets(writer, cfg.k, cfg.num_threads, frag_unitigs, out_mu, &done);
         prog.stop();
         std::cout << "  bucket fragments: " << frag_unitigs.size() << "\n";
     }
 
-    std::vector<cdgb::StitchableUnitig> all_unitigs;
+    std::vector<cdgb::stitchable_unitig> all_unitigs;
     {
-        Timer _("stitch");
+        timer _("stitch");
         cdgb::stitch_unitigs(frag_unitigs, cfg.k, all_unitigs);
         frag_unitigs = {};
         std::cout << "  unitigs after stitching: " << all_unitigs.size() << "\n";
     }
 
     // Globally intern color sets and write FASTA + .colors.
-    cdgb::ColorSetDict global_dict;
+    cdgb::color_set_dict global_dict;
     std::vector<uint32_t> unitig_cid(all_unitigs.size());
     {
-        Timer _("emit fasta + colors");
+        timer _("emit fasta + colors");
         for (size_t i = 0; i < all_unitigs.size(); ++i) {
             unitig_cid[i] = global_dict.intern(std::move(all_unitigs[i].colors));
         }
@@ -191,12 +193,12 @@ int main(int argc, char** argv) {
         }
         fa.close();
 
-        cdgb::HybridBuilder hb((uint32_t)files.size());
+        cdgb::hybrid_builder hb((uint32_t)files.size());
         for (uint32_t cid = 0; cid < global_dict.size(); ++cid) {
             const auto& cs = global_dict.at(cid);
             hb.encode_color_set(cs.data(), cs.size());
         }
-        cdgb::Hybrid h;
+        cdgb::hybrid h;
         hb.build(h);
         essentials::save(h, (cfg.out_basename + ".colors").c_str());
     }

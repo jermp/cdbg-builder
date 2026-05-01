@@ -15,8 +15,8 @@ namespace cdgb {
 //
 // Hashing/equality work on the contiguous byte view of the vector to keep the
 // hot path cheap.
-struct ColorSetDict {
-    struct Hash {
+struct color_set_dict {
+    struct hash {
         // FNV-1a output is high-quality enough; skip ankerl's extra mix.
         using is_avalanching = void;
         size_t operator()(const std::vector<uint32_t>& v) const noexcept {
@@ -47,7 +47,7 @@ struct ColorSetDict {
 
 private:
     std::vector<std::vector<uint32_t>> m_classes;
-    ankerl::unordered_dense::map<std::vector<uint32_t>, uint32_t, Hash> m_index;
+    ankerl::unordered_dense::map<std::vector<uint32_t>, uint32_t, hash> m_index;
 };
 
 }  // namespace cdgb
