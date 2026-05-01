@@ -171,10 +171,9 @@ int run_bucketed(cdgb::BuildConfig& cfg, const std::vector<std::string>& files) 
     std::vector<cdgb::StitchableUnitig> all_unitigs;
     {
         Timer _("stitch");
-        // TODO(cross-bucket-stitching): re-enable once orientation bug is
-        // fixed; for now emit fragments directly.
-        all_unitigs = std::move(frag_unitigs);
-        std::cout << "  unitigs (no stitching yet): " << all_unitigs.size() << "\n";
+        cdgb::stitch_unitigs(frag_unitigs, cfg.k, all_unitigs);
+        frag_unitigs = {};
+        std::cout << "  unitigs after stitching: " << all_unitigs.size() << "\n";
     }
 
     // Globally intern color sets and write FASTA + .colors.
