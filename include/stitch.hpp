@@ -27,8 +27,21 @@
 // to (nxt, nxt_side); nxt's flip state is f_nxt = (nxt_side == RIGHT).
 // Junctions are guaranteed to align by the link rules above.
 //
-// We also require the two unitigs' color sets to be equal — this is the
-// only departure from GGCAT's behaviour (which is uncolored).
+// We additionally require the two unitigs' color sets to be equal before
+// gluing — emitted unitigs are monochromatic. GGCAT does the same; the
+// difference is *when* each k-mer's color-class id is assigned. GGCAT
+// interns color sets to a small integer id inside its `kmers_merge`
+// phase, so its per-bucket walk and its cross-bucket `links_compaction`
+// (the analog of our stitch) can both gate on cheap integer
+// comparisons. We do the same thing slightly later: after process_buckets
+// emits fragments still holding `std::vector<uint32_t>` color lists,
+// main runs an `intern color sets` pass that calls
+// color_set_dict::intern on each fragment and stores the returned id in
+// stitchable_unitig::cid. From that point on, the stitch equality check
+// is a uint32_t compare and walk_chain inherits the cid by integer
+// assignment instead of copying a thousand-entry vector.
+// Functionally equivalent to GGCAT's gating; structurally one extra
+// pass instead of folding the interning into per-bucket processing.
 
 #include <array>
 #include <atomic>
@@ -125,6 +138,7 @@ inline void stitch_unitigs(std::vector<stitchable_unitig>& frag, uint32_t k,
     using detail::SIDE_LEFT;
     using detail::SIDE_RIGHT;
     using detail::end_ref;
+    using detail::junction_ends;
     using detail::link;
 
     if (k < 2) {
@@ -135,7 +149,7 @@ inline void stitch_unitigs(std::vector<stitchable_unitig>& frag, uint32_t k,
 
     // 1) Index every open end by its canonical (k-1)-mer junction.
     std::cerr << "[stitch] indexing " << frag.size() << " fragments...\n";
-    ankerl::unordered_dense::map<kmer_int_t, detail::junction_ends, kmer_hasher> by_junction;
+    ankerl::unordered_dense::map<kmer_int_t, junction_ends, kmer_hasher> by_junction;
     by_junction.reserve(frag.size() * 2);
     auto add_end = [&](kmer_int_t key, end_ref ref) {
         auto& je = by_junction[key];
@@ -178,7 +192,8 @@ inline void stitch_unitigs(std::vector<stitchable_unitig>& frag, uint32_t k,
         if (je.count != 2) continue;  // skip empty / singleton / overflow
         const end_ref& e1 = je.a;
         const end_ref& e2 = je.b;
-        if (frag[e1.unitig_idx].colors != frag[e2.unitig_idx].colors) continue;
+        // O(1) color-class comparison (cid was assigned by main before stitch).
+        if (frag[e1.unitig_idx].cid != frag[e2.unitig_idx].cid) continue;
         if (!pair_compatible(e1, e2)) continue;
         // Both directions of the link.
         adj[e1.unitig_idx][e1.side] = {e2.unitig_idx, e2.side};
@@ -202,7 +217,9 @@ inline void stitch_unitigs(std::vector<stitchable_unitig>& frag, uint32_t k,
 
     auto walk_chain = [&](uint32_t start_idx, bool start_flipped) {
         stitchable_unitig merged;
-        merged.colors = frag[start_idx].colors;
+        // Inherit cid; chain members have equal cids by construction (the
+        // adjacency build only links pairs with matching cid).
+        merged.cid = frag[start_idx].cid;
         merged.seq = take_seq(start_idx, start_flipped);
         visited[start_idx] = 1;
         if (done) done->fetch_add(1, std::memory_order_relaxed);

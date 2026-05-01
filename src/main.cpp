@@ -120,9 +120,11 @@ int main(int argc, char** argv) {
         std::cout << "[total construction time] " << (ms / 1000.0) << " s\n";
     };
 
-    // Resolve a scratch directory.
+    // Resolve a scratch directory. If the user supplied --tmp-dir, it
+    // must exist and be empty: the tool wipes the entire directory at
+    // the end of construction, and we don't want to clobber unrelated
+    // user files that happen to be in there.
     std::string tmp_dir = cfg.tmp_dir;
-    bool tmp_owned = false;
     if (tmp_dir.empty()) {
         std::string tmpl =
             (std::filesystem::temp_directory_path() / "cdgb_buckets_XXXXXX").string();
@@ -133,7 +135,19 @@ int main(int argc, char** argv) {
             return 1;
         }
         tmp_dir = buf.data();
-        tmp_owned = true;
+    } else {
+        std::error_code ec;
+        if (!std::filesystem::exists(tmp_dir, ec) || !std::filesystem::is_directory(tmp_dir, ec)) {
+            std::cerr << "error: --tmp-dir " << tmp_dir
+                      << " does not exist or is not a directory\n";
+            return 1;
+        }
+        if (!std::filesystem::is_empty(tmp_dir, ec)) {
+            std::cerr << "error: --tmp-dir " << tmp_dir
+                      << " is not empty (the tool will remove the directory on exit, so it must"
+                         " start empty)\n";
+            return 1;
+        }
     }
     std::cout << "  tmp_dir = " << tmp_dir << "\n";
 
@@ -161,6 +175,21 @@ int main(int argc, char** argv) {
         std::cout << "  bucket fragments: " << frag_unitigs.size() << "\n";
     }
 
+    // Globally intern each fragment's color set into a uint32_t cid.
+    // Doing this BEFORE stitch turns stitch_unitigs's color-set equality
+    // check from O(color_count) (vector compare) into O(1) (uint32_t
+    // compare), and likewise turns walk_chain's color-set copy into a
+    // single integer assignment. On the 4546-genome run that drops the
+    // stitch phase from minutes to seconds.
+    cdgb::color_set_dict global_dict;
+    {
+        timer _("intern color sets");
+        for (auto& u : frag_unitigs) {
+            u.cid = global_dict.intern(std::move(u.colors));
+        }
+        std::cout << "  distinct color classes: " << global_dict.size() << "\n";
+    }
+
     std::vector<cdgb::stitchable_unitig> all_unitigs;
     {
         timer _("stitch");
@@ -172,18 +201,14 @@ int main(int argc, char** argv) {
         std::cout << "  unitigs after stitching: " << all_unitigs.size() << "\n";
     }
 
-    // Globally intern color sets and write FASTA + .colors.
-    cdgb::color_set_dict global_dict;
-    std::vector<uint32_t> unitig_cid(all_unitigs.size());
+    // Emit FASTA + .colors. Both files use the cid that's already on
+    // each unitig (set by the interning pass above).
     {
         timer _("emit fasta + colors");
-        for (size_t i = 0; i < all_unitigs.size(); ++i) {
-            unitig_cid[i] = global_dict.intern(std::move(all_unitigs[i].colors));
-        }
-        std::cout << "  distinct color classes: " << global_dict.size() << "\n";
-
         std::vector<std::vector<size_t>> by_class(global_dict.size());
-        for (size_t i = 0; i < all_unitigs.size(); ++i) { by_class[unitig_cid[i]].push_back(i); }
+        for (size_t i = 0; i < all_unitigs.size(); ++i) {
+            by_class[all_unitigs[i].cid].push_back(i);
+        }
 
         std::ofstream fa(cfg.out_basename + ".fa");
         if (!fa) throw std::runtime_error("cannot open " + cfg.out_basename + ".fa");
@@ -204,18 +229,12 @@ int main(int argc, char** argv) {
         essentials::save(h, (cfg.out_basename + ".colors").c_str());
     }
 
-    // Clean up bucket files. If we created the directory ourselves, remove it
-    // entirely; if the user supplied --tmp-dir, only remove the bucket files
-    // we wrote (leave the directory and any other contents alone).
+    // Clean up the scratch directory. We've enforced at startup that we
+    // own its contents (either we mkdtemp'd it, or the user passed an
+    // empty directory), so a single recursive remove is safe.
     {
         std::error_code ec;
-        if (tmp_owned) {
-            std::filesystem::remove_all(tmp_dir, ec);
-        } else {
-            for (uint32_t b = 0; b < num_buckets; ++b) {
-                std::filesystem::remove(writer.bucket_path(b), ec);
-            }
-        }
+        std::filesystem::remove_all(tmp_dir, ec);
     }
 
     std::cout << "done. wrote " << cfg.out_basename << ".fa and " << cfg.out_basename
