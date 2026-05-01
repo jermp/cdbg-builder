@@ -34,6 +34,7 @@ FILELIST="$WORK/filenames.txt"
 printf '%s\n' "${inputs[@]}" > "$FILELIST"
 
 OUT="$WORK/sal"
+mkdir -p "$WORK/buckets"
 "$BIN" -i "$FILELIST" -k "$K" -o "$OUT" -t "$THREADS" --tmp-dir "$WORK/buckets"
 python3 "$HERE/verify.py" --filenames "$FILELIST" --out "$OUT" -k "$K"
 python3 "$HERE/strict_topology_check.py" --filenames "$FILELIST" --out "$OUT" -k "$K"

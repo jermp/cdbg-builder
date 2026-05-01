@@ -58,10 +58,13 @@ inline constexpr uint8_t UNITIG_OPEN_RIGHT = 1u << 1;
 
 struct stitchable_unitig {
     std::string seq;               // ACGT characters
-    std::vector<uint32_t> colors;  // sorted, deduped; cleared after global interning
-    uint32_t cid = UINT32_MAX;     // global color-class id (set by main after process_buckets);
-                                   // stitch_unitigs uses this for cheap O(1) comparisons.
-    uint8_t open_flags = 0;        // bits from UNITIG_OPEN_*
+    // Color-class id. While process_bucket is emitting unitigs, this is
+    // a *local* cid into that bucket's local_dict; process_buckets then
+    // remaps it to a global cid as it merges each bucket's local_dict
+    // into the shared global color_set_dict. By the time stitch_unitigs
+    // and the FASTA emitter run, all cids are global.
+    uint32_t cid = UINT32_MAX;
+    uint8_t open_flags = 0;  // bits from UNITIG_OPEN_*
 };
 
 namespace detail {
@@ -226,17 +229,17 @@ inline left_end_check classify_left_end(
 }
 
 inline void process_bucket(const std::string& path, uint32_t k,
-                           std::vector<stitchable_unitig>& out_local) {
+                           std::vector<stitchable_unitig>& out_local,
+                           color_set_dict& out_local_dict) {
     bucket_kmer_map kmer_info;
     load_bucket(path, k, kmer_info);
 
     // Build local color-set dict and a parallel map cid_of[can] for quick lookups.
-    color_set_dict local_dict;
     ankerl::unordered_dense::map<kmer_int_t, uint32_t, kmer_hasher> cid_of;
     cid_of.reserve(kmer_info.size());
     for (auto& kv : kmer_info) {
         std::vector<uint32_t> sorted = kv.second.colors.to_sorted();
-        uint32_t cid = local_dict.intern(std::move(sorted));
+        uint32_t cid = out_local_dict.intern(std::move(sorted));
         cid_of.emplace(kv.first, cid);
     }
     // Free per-k-mer color storage; we keep phantom flags in kmer_info.
@@ -249,7 +252,11 @@ inline void process_bucket(const std::string& path, uint32_t k,
         stitchable_unitig u;
         kmer_int_t cur = start_rc ? reverse_complement(start_can, k) : start_can;
         u.seq = kmer_to_string(cur, k);
-        u.colors = local_dict.at(cid);
+        // Local cid; process_buckets remaps to global after merging the
+        // local_dict into the shared global dict. The actual color list
+        // lives in out_local_dict and is moved into the global dict
+        // there -- we never copy a color vector into the unitig.
+        u.cid = cid;
         if (open_left) u.open_flags |= UNITIG_OPEN_LEFT;
 
         kmer_int_t can = start_can;
@@ -322,10 +329,19 @@ inline void process_bucket(const std::string& path, uint32_t k,
 
 }  // namespace detail
 
-// Parallel driver. Each worker processes one bucket at a time and appends its
-// stitchable unitigs to the shared output vector under `out_mu`.
+// Parallel driver. Each worker processes one bucket at a time. After
+// each bucket the worker takes `global_mu` and merges that bucket's
+// local color_set_dict into the shared `global_dict`, building a
+// local->global cid table and remapping the bucket's unitigs in-place.
+// This folds what used to be a separate single-threaded "intern color
+// sets" pass over every emitted unitig (O(num_unitigs) ~6M)
+// into the parallel bucket-process phase, paying it on the
+// O(unique-color-sets-per-bucket) ~few thousand granularity instead.
+//
+// `out_mu` still serializes the final append into the shared `out`.
 inline void process_buckets(const bucket_writer& writer, uint32_t k, uint32_t num_threads,
                             std::vector<stitchable_unitig>& out, std::mutex& out_mu,
+                            color_set_dict& global_dict, std::mutex& global_mu,
                             std::atomic<uint64_t>* done = nullptr) {
     if (num_threads == 0) num_threads = 1;
     const uint32_t B = writer.num_buckets();
@@ -338,11 +354,27 @@ inline void process_buckets(const bucket_writer& writer, uint32_t k, uint32_t nu
         for (;;) {
             uint32_t b = next.fetch_add(1);
             if (b >= B) break;
+            std::vector<stitchable_unitig> bucket_unitigs;
+            color_set_dict local_dict;
             try {
-                detail::process_bucket(writer.bucket_path(b), k, local);
+                detail::process_bucket(writer.bucket_path(b), k, bucket_unitigs, local_dict);
             } catch (std::exception& e) {
                 std::cerr << "error processing bucket " << b << ": " << e.what() << '\n';
             }
+            // Merge this bucket's local dict into the shared global
+            // dict, build a local->global cid table, then remap each
+            // unitig's cid before we drop the local dict.
+            std::vector<uint32_t> local_to_global(local_dict.size());
+            {
+                std::lock_guard<std::mutex> lk(global_mu);
+                for (uint32_t lc = 0; lc < local_dict.size(); ++lc) {
+                    local_to_global[lc] =
+                        global_dict.intern(std::move(local_dict.mutable_at(lc)));
+                }
+            }
+            for (auto& u : bucket_unitigs) u.cid = local_to_global[u.cid];
+            local.insert(local.end(), std::make_move_iterator(bucket_unitigs.begin()),
+                         std::make_move_iterator(bucket_unitigs.end()));
             if (done) done->fetch_add(1, std::memory_order_relaxed);
         }
         std::lock_guard<std::mutex> lk(out_mu);
