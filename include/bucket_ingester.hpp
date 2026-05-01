@@ -97,11 +97,18 @@ inline void emit_super_kmers(const uint8_t* bases, uint32_t L, uint32_t k, uint3
 inline void ingest_file_bucketed(const std::string& path, uint32_t k, uint32_t m,
                                  uint32_t bucket_log2, uint32_t color,
                                  PerThreadBucketBuffers& sink) {
+    auto& prof = bucket_prof();
     SeqReader r(path);
     const char* s = nullptr;
     size_t l = 0;
     std::vector<uint8_t> bases_buf;
-    while (r.next(s, l)) {
+    for (;;) {
+        auto t_read = bucket_write_prof::clock::now();
+        bool ok = r.next(s, l);
+        prof.ns_seq_read.fetch_add(bucket_write_prof::since(t_read),
+                                   std::memory_order_relaxed);
+        if (!ok) break;
+        auto t_body = bucket_write_prof::clock::now();
         size_t pos = 0;
         while (pos < l) {
             // Find an ACGT-only run starting at pos.
@@ -117,7 +124,10 @@ inline void ingest_file_bucketed(const std::string& path, uint32_t k, uint32_t m
             pos = end;
             while (pos < l && nuc_to_2bit(s[pos]) == 0xff) ++pos;
         }
+        prof.ns_loop_body.fetch_add(bucket_write_prof::since(t_body),
+                                    std::memory_order_relaxed);
     }
+    prof.n_files.fetch_add(1, std::memory_order_relaxed);
 }
 
 }  // namespace detail

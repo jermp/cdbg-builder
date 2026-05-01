@@ -24,6 +24,7 @@
 #include "color_set_dict.hpp"
 #include "hybrid_color_sets.hpp"
 #include "minimizer.hpp"
+#include "prof.hpp"
 #include "progress.hpp"
 #include "stitch.hpp"
 
@@ -149,6 +150,7 @@ int main(int argc, char** argv) {
     writer.close();
     std::cout << "  bucket bytes written: " << writer.total_bytes() << " (compressed; "
               << writer.total_uncompressed_bytes() << " uncompressed)\n";
+    cdgb::bucket_prof().print(cfg.num_threads);
 
     std::vector<cdgb::StitchableUnitig> frag_unitigs;
     std::mutex out_mu;

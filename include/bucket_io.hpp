@@ -34,6 +34,7 @@
 
 #include <unordered_dense/unordered_dense.h>
 
+#include "prof.hpp"
 #include "super_kmer.hpp"
 
 namespace cdgb {
@@ -78,7 +79,12 @@ public:
     void insert_batch(const std::vector<PendingRecord>& recs,
                       const std::vector<uint8_t>& bases_storage) {
         if (recs.empty()) return;
+        auto& prof = bucket_prof();
+        auto t_lock = bucket_write_prof::clock::now();
         std::lock_guard<std::mutex> lk(m_mu);
+        prof.ns_lock_wait.fetch_add(bucket_write_prof::since(t_lock),
+                                    std::memory_order_relaxed);
+        auto t_map = bucket_write_prof::clock::now();
         for (const auto& r : recs) {
             std::string_view key((const char*)bases_storage.data() + r.bases_off,
                                  r.bases_len);
@@ -95,6 +101,7 @@ public:
                 e.colors.push_back(r.color);
                 m_bytes += key.size() + sizeof(uint32_t);
                 m_dedup.emplace(std::string(key), std::move(e));
+                prof.n_inserts.fetch_add(1, std::memory_order_relaxed);
             } else {
                 Entry& e = it->second;
                 e.flags &= r.flags;  // AND across contributors
@@ -106,7 +113,16 @@ public:
                 m_bytes += sizeof(uint32_t);
             }
         }
-        if (m_bytes >= m_spill_bytes) spill_locked();
+        prof.ns_hashmap.fetch_add(bucket_write_prof::since(t_map),
+                                  std::memory_order_relaxed);
+        prof.n_records.fetch_add(recs.size(), std::memory_order_relaxed);
+        if (m_bytes >= m_spill_bytes) {
+            auto t_sp = bucket_write_prof::clock::now();
+            spill_locked();
+            prof.ns_spill.fetch_add(bucket_write_prof::since(t_sp),
+                                    std::memory_order_relaxed);
+            prof.n_spills.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     void close() {
@@ -209,7 +225,12 @@ public:
     void flush(uint32_t b, std::vector<BucketCompactor::PendingRecord>& recs,
                std::vector<uint8_t>& bases_buf) {
         if (recs.empty()) return;
+        auto& prof = bucket_prof();
+        auto t = bucket_write_prof::clock::now();
         m_compactors[b]->insert_batch(recs, bases_buf);
+        prof.ns_flush.fetch_add(bucket_write_prof::since(t),
+                                std::memory_order_relaxed);
+        prof.n_flushes.fetch_add(1, std::memory_order_relaxed);
         recs.clear();
         bases_buf.clear();
     }
