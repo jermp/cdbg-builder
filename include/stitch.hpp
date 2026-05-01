@@ -27,12 +27,15 @@
 // to (nxt, nxt_side); nxt's flip state is f_nxt = (nxt_side == RIGHT).
 // Junctions are guaranteed to align by the link rules above.
 //
-// We also require the two unitigs' color sets to be equal — this is the
-// only departure from GGCAT's behaviour (which is uncolored). Each
-// fragment carries a `cid` (global color-class id, assigned by main
-// after process_buckets via color_set_dict::intern) so the equality
-// check is a cheap uint32_t comparison instead of an O(color_count)
-// vector compare.
+// We additionally require the two unitigs' color sets to be equal before
+// gluing. GGCAT also builds a colored compacted dBG, but it doesn't gate
+// its unitig-extension step on color-set equality at junctions; colors
+// are tracked separately and emitted later. We do gate at stitch time,
+// which would be O(color_count) per junction if we compared color
+// vectors directly. Instead, each fragment carries a `cid` (a global
+// color-class id assigned by main after process_buckets via
+// color_set_dict::intern), so the equality check here is a cheap
+// uint32_t comparison and walk_chain copies a single integer.
 
 #include <array>
 #include <atomic>
