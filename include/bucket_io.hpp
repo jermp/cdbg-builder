@@ -28,9 +28,10 @@
 #include <stdexcept>
 #include <string>
 #include <sys/stat.h>
-#include <unordered_map>
 #include <vector>
 #include <zlib.h>
+
+#include <unordered_dense/unordered_dense.h>
 
 #include "super_kmer.hpp"
 
@@ -148,7 +149,10 @@ private:
     size_t m_spill_bytes;
     std::mutex m_mu;
     gzFile m_file = nullptr;
-    std::unordered_map<std::string, Entry> m_dedup;
+    // unordered_dense::map: open-addressing flat hash table that's typically
+    // 2-3x faster than std::unordered_map on this insert/lookup workload
+    // (the per-bucket compactor is on the bucket-write hot path).
+    ankerl::unordered_dense::map<std::string, Entry> m_dedup;
     size_t m_bytes = 0;
     std::atomic<uint64_t> m_total_uncompressed{0};
 };

@@ -2,8 +2,9 @@
 
 #include <cstdint>
 #include <cstring>
-#include <unordered_map>
 #include <vector>
+
+#include <unordered_dense/unordered_dense.h>
 
 #include "kmer.hpp"
 
@@ -16,6 +17,8 @@ namespace cdgb {
 // hot path cheap.
 struct ColorSetDict {
     struct Hash {
+        // FNV-1a output is high-quality enough; skip ankerl's extra mix.
+        using is_avalanching = void;
         size_t operator()(const std::vector<uint32_t>& v) const noexcept {
             // FNV-1a over the bytes, fast and decent for small vectors.
             uint64_t h = 1469598103934665603ULL;
@@ -44,7 +47,7 @@ struct ColorSetDict {
 
 private:
     std::vector<std::vector<uint32_t>> m_classes;
-    std::unordered_map<std::vector<uint32_t>, uint32_t, Hash> m_index;
+    ankerl::unordered_dense::map<std::vector<uint32_t>, uint32_t, Hash> m_index;
 };
 
 }  // namespace cdgb
