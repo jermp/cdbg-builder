@@ -3,14 +3,17 @@
 // Disk-backed bucket I/O for the minimizer-bucketed ingest path.
 //
 // The writer side is sharded by minimizer-derived bucket id. Each ingest
-// thread owns a small (~4 KiB) per-bucket buffer; when a buffer fills (or
-// the thread finishes a file), the thread takes the bucket's mutex and
-// appends its buffer to the bucket's file.
+// thread owns a per-bucket buffer; when a buffer fills (or the thread
+// finishes a file), the thread takes the bucket's mutex and appends its
+// buffer to the bucket's gzip stream. Bucket files are streaming gzip
+// (level 1) so per-bucket on-disk size matches the GGCAT-style compressed
+// format; super-k-mers in the same bucket share their minimizer m-mer,
+// which compresses very well.
 //
-// The reader side reads a whole bucket file into memory and yields records
-// via super_kmer.hpp. Buckets are bounded in size by 1/B of the dataset, so
-// for our target inputs (a few-thousand bacterial genomes) per-bucket size
-// stays comfortably in RAM.
+// The reader side decompresses the whole bucket file into memory and yields
+// records via super_kmer.hpp. Buckets are bounded in size by 1/B of the
+// dataset, so for our target inputs (a few-thousand bacterial genomes)
+// per-bucket size stays comfortably in RAM.
 
 #include <atomic>
 #include <cerrno>
@@ -21,7 +24,9 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <sys/stat.h>
 #include <vector>
+#include <zlib.h>
 
 #include "super_kmer.hpp"
 
@@ -29,7 +34,7 @@ namespace cdgb {
 
 class BucketWriter {
 public:
-    BucketWriter(const std::string& dir, uint32_t num_buckets, size_t flush_bytes = 4096)
+    BucketWriter(const std::string& dir, uint32_t num_buckets, size_t flush_bytes = 64 * 1024)
         : m_dir(dir)
         , m_num_buckets(num_buckets)
         , m_flush_bytes(flush_bytes)
@@ -38,10 +43,16 @@ public:
         std::filesystem::create_directories(m_dir);
         for (uint32_t b = 0; b < num_buckets; ++b) {
             std::string p = bucket_path(b);
-            FILE* f = std::fopen(p.c_str(), "wb");
+            // Level 1 (Z_BEST_SPEED): fast streaming gzip; on dense
+            // 2-bit-packed DNA records the cost is small but the on-disk
+            // savings are large (super-k-mers in the same bucket share
+            // their minimizer, so they compress strongly together).
+            gzFile f = gzopen(p.c_str(), "wb1");
             if (!f)
                 throw std::runtime_error("cannot open bucket file: " + p + ": " +
                                          std::strerror(errno));
+            // 256 KiB internal buffer reduces syscall overhead per chunk.
+            gzbuffer(f, 256 * 1024);
             m_files[b] = f;
         }
     }
@@ -63,30 +74,47 @@ public:
     void flush(uint32_t b, std::vector<uint8_t>& buf) {
         if (buf.empty()) return;
         std::lock_guard<std::mutex> lk(m_mus[b]);
-        size_t n = std::fwrite(buf.data(), 1, buf.size(), m_files[b]);
-        if (n != buf.size()) { throw std::runtime_error("short write to " + bucket_path(b)); }
-        m_total_bytes.fetch_add(buf.size(), std::memory_order_relaxed);
+        int n = gzwrite(m_files[b], buf.data(), (unsigned)buf.size());
+        if (n <= 0 || (size_t)n != buf.size()) {
+            throw std::runtime_error("short write to " + bucket_path(b));
+        }
+        m_total_uncompressed.fetch_add(buf.size(), std::memory_order_relaxed);
         buf.clear();
     }
 
     void close() {
         for (uint32_t b = 0; b < m_num_buckets; ++b) {
             if (m_files[b]) {
-                std::fclose(m_files[b]);
+                gzclose(m_files[b]);
                 m_files[b] = nullptr;
             }
         }
+        if (m_total_compressed.load(std::memory_order_relaxed) == 0) {
+            // First close call: stat each file to measure on-disk bytes.
+            uint64_t total = 0;
+            for (uint32_t b = 0; b < m_num_buckets; ++b) {
+                struct stat st;
+                if (::stat(bucket_path(b).c_str(), &st) == 0) total += (uint64_t)st.st_size;
+            }
+            m_total_compressed.store(total, std::memory_order_relaxed);
+        }
     }
 
-    uint64_t total_bytes() const { return m_total_bytes.load(std::memory_order_relaxed); }
+    // Bytes actually written to disk (compressed).
+    uint64_t total_bytes() const { return m_total_compressed.load(std::memory_order_relaxed); }
+    // Logical record bytes fed into the compressor (pre-compression).
+    uint64_t total_uncompressed_bytes() const {
+        return m_total_uncompressed.load(std::memory_order_relaxed);
+    }
 
 private:
     std::string m_dir;
     uint32_t m_num_buckets;
     size_t m_flush_bytes;
     std::vector<std::mutex> m_mus;
-    std::vector<FILE*> m_files;
-    std::atomic<uint64_t> m_total_bytes{0};
+    std::vector<gzFile> m_files;
+    std::atomic<uint64_t> m_total_uncompressed{0};
+    std::atomic<uint64_t> m_total_compressed{0};
 };
 
 // Per-thread sidecar that batches records destined for each bucket.
@@ -115,24 +143,23 @@ struct PerThreadBucketBuffers {
 class BucketReader {
 public:
     explicit BucketReader(const std::string& path) {
-        FILE* f = std::fopen(path.c_str(), "rb");
+        gzFile f = gzopen(path.c_str(), "rb");
         if (!f) throw std::runtime_error("cannot open " + path + ": " + std::strerror(errno));
-        std::fseek(f, 0, SEEK_END);
-        long sz = std::ftell(f);
-        std::fseek(f, 0, SEEK_SET);
-        if (sz < 0) {
-            std::fclose(f);
-            throw std::runtime_error("ftell failed on " + path);
-        }
-        m_buf.resize((size_t)sz);
-        if (sz > 0) {
-            size_t n = std::fread(m_buf.data(), 1, (size_t)sz, f);
-            if (n != (size_t)sz) {
-                std::fclose(f);
-                throw std::runtime_error("short read from " + path);
+        gzbuffer(f, 256 * 1024);
+        constexpr size_t CHUNK = 64 * 1024;
+        size_t off = 0;
+        for (;;) {
+            if (m_buf.size() < off + CHUNK) m_buf.resize(off + CHUNK);
+            int n = gzread(f, m_buf.data() + off, (unsigned)CHUNK);
+            if (n < 0) {
+                gzclose(f);
+                throw std::runtime_error("gzread failed on " + path);
             }
+            if (n == 0) break;
+            off += (size_t)n;
         }
-        std::fclose(f);
+        m_buf.resize(off);
+        gzclose(f);
     }
 
     // Iterate records in order. Returns false when no more records are available.

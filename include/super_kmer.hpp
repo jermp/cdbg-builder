@@ -2,14 +2,18 @@
 
 // Binary record format for super-k-mers stored in a bucket file:
 //
-//   [flags : u8] [color_id : varint] [length_in_bases : varint] [2-bit packed bases]
+//   [color_id : varint] [length_with_flags : varint] [2-bit packed bases]
 //
-// Flags:
+// length_with_flags is `(length_in_bases << 2) | flags`, where flags is:
 //   bit 0 (IS_ACGT_BEGIN) = this super-k-mer's first k-mer (in input order) is
 //                           the actual first k-mer of an ACGT-only run, i.e. it
 //                           has no predecessor in the input.
 //   bit 1 (IS_ACGT_END)   = analogously, this super-k-mer's last k-mer is the
 //                           last k-mer of its ACGT run.
+//
+// Packing the flags into the length varint (matching GGCAT's `varint_flags`
+// encoding) saves a byte per super-k-mer record vs. storing flags as a
+// separate u8.
 //
 // When IS_ACGT_BEGIN is unset, this super-k-mer's first k-mer has a predecessor
 // k-mer in the input that lives in a different bucket; the cross-bucket
@@ -77,9 +81,8 @@ inline constexpr uint8_t SK_FLAG_IS_ACGT_END = 1u << 1;
 
 inline void write_super_kmer(uint8_t flags, uint32_t color, const uint8_t* bases, uint32_t len,
                              std::vector<uint8_t>& out) {
-    out.push_back(flags);
     varint_write(color, out);
-    varint_write(len, out);
+    varint_write(((uint64_t)len << 2) | (flags & 0x3u), out);
     pack_2bit(bases, len, out);
 }
 
@@ -89,9 +92,10 @@ inline size_t read_super_kmer(const uint8_t* buf, size_t buf_len, uint8_t& out_f
                               uint32_t& out_color, std::vector<uint8_t>& out_bases) {
     if (buf_len < 1) return 0;
     size_t p = 0;
-    out_flags = buf[p++];
     uint64_t color = varint_read(buf, buf_len, p);
-    uint64_t len = varint_read(buf, buf_len, p);
+    uint64_t lenflags = varint_read(buf, buf_len, p);
+    uint64_t len = lenflags >> 2;
+    out_flags = (uint8_t)(lenflags & 0x3u);
     size_t base_bytes = (size_t)((len + 3) / 4);
     if (p + base_bytes > buf_len) return 0;
     out_color = (uint32_t)color;
