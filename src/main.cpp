@@ -161,26 +161,40 @@ int main(int argc, char** argv) {
         std::cout << "  bucket fragments: " << frag_unitigs.size() << "\n";
     }
 
+    // Globally intern each fragment's color set into a uint32_t cid.
+    // Doing this BEFORE stitch turns stitch_unitigs's color-set equality
+    // check from O(color_count) (vector compare) into O(1) (uint32_t
+    // compare), and likewise turns walk_chain's color-set copy into a
+    // single integer assignment. On the 4546-genome run that drops the
+    // stitch phase from minutes to seconds.
+    cdgb::color_set_dict global_dict;
+    {
+        timer _("intern color sets");
+        for (auto& u : frag_unitigs) {
+            u.cid = global_dict.intern(std::move(u.colors));
+        }
+        std::cout << "  distinct color classes: " << global_dict.size() << "\n";
+    }
+
     std::vector<cdgb::stitchable_unitig> all_unitigs;
     {
         timer _("stitch");
-        cdgb::stitch_unitigs(frag_unitigs, cfg.k, all_unitigs);
+        std::atomic<uint64_t> done{0};
+        cdgb::progress prog("stitch", done, frag_unitigs.size());
+        cdgb::stitch_unitigs(frag_unitigs, cfg.k, all_unitigs, &done);
+        prog.stop();
         frag_unitigs = {};
         std::cout << "  unitigs after stitching: " << all_unitigs.size() << "\n";
     }
 
-    // Globally intern color sets and write FASTA + .colors.
-    cdgb::color_set_dict global_dict;
-    std::vector<uint32_t> unitig_cid(all_unitigs.size());
+    // Emit FASTA + .colors. Both files use the cid that's already on
+    // each unitig (set by the interning pass above).
     {
         timer _("emit fasta + colors");
-        for (size_t i = 0; i < all_unitigs.size(); ++i) {
-            unitig_cid[i] = global_dict.intern(std::move(all_unitigs[i].colors));
-        }
-        std::cout << "  distinct color classes: " << global_dict.size() << "\n";
-
         std::vector<std::vector<size_t>> by_class(global_dict.size());
-        for (size_t i = 0; i < all_unitigs.size(); ++i) { by_class[unitig_cid[i]].push_back(i); }
+        for (size_t i = 0; i < all_unitigs.size(); ++i) {
+            by_class[all_unitigs[i].cid].push_back(i);
+        }
 
         std::ofstream fa(cfg.out_basename + ".fa");
         if (!fa) throw std::runtime_error("cannot open " + cfg.out_basename + ".fa");

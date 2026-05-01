@@ -58,7 +58,9 @@ inline constexpr uint8_t UNITIG_OPEN_RIGHT = 1u << 1;
 
 struct stitchable_unitig {
     std::string seq;               // ACGT characters
-    std::vector<uint32_t> colors;  // sorted, deduped color set
+    std::vector<uint32_t> colors;  // sorted, deduped; cleared after global interning
+    uint32_t cid = UINT32_MAX;     // global color-class id (set by main after process_buckets);
+                                   // stitch_unitigs uses this for cheap O(1) comparisons.
     uint8_t open_flags = 0;        // bits from UNITIG_OPEN_*
 };
 
