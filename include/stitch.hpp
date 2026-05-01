@@ -153,7 +153,8 @@ inline void stitch_unitigs(std::vector<stitchable_unitig>& frag, uint32_t k,
     by_junction.reserve(frag.size() * 2);
     auto add_end = [&](kmer_int_t key, end_ref ref) {
         auto& je = by_junction[key];
-        if (je.count == 0) je.a = ref;
+        if (je.count == 0)
+            je.a = ref;
         else if (je.count == 1)
             je.b = ref;
         // count >= 2 stays as-is; we just bump the counter so the build

@@ -57,7 +57,7 @@ inline constexpr uint8_t UNITIG_OPEN_LEFT = 1u << 0;
 inline constexpr uint8_t UNITIG_OPEN_RIGHT = 1u << 1;
 
 struct stitchable_unitig {
-    std::string seq;               // ACGT characters
+    std::string seq;  // ACGT characters
     // Color-class id. While process_bucket is emitting unitigs, this is
     // a *local* cid into that bucket's local_dict; process_buckets then
     // remaps it to a global cid as it merges each bucket's local_dict
@@ -368,8 +368,7 @@ inline void process_buckets(const bucket_writer& writer, uint32_t k, uint32_t nu
             {
                 std::lock_guard<std::mutex> lk(global_mu);
                 for (uint32_t lc = 0; lc < local_dict.size(); ++lc) {
-                    local_to_global[lc] =
-                        global_dict.intern(std::move(local_dict.mutable_at(lc)));
+                    local_to_global[lc] = global_dict.intern(std::move(local_dict.mutable_at(lc)));
                 }
             }
             for (auto& u : bucket_unitigs) u.cid = local_to_global[u.cid];
