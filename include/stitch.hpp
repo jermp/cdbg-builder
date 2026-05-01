@@ -95,16 +95,15 @@ struct end_ref {
     bool is_canonical_fwd;
 };
 
-// Fixed-size value for `by_junction`. The walker only acts on
-// junctions with exactly two ends, so we keep up to 2 inline and
-// reject anything more via `count` saturating at 3 (overflow). This
-// avoids one std::vector allocation per junction; on inputs with
-// millions of junctions that allocator pressure dominated the
-// indexing phase.
+// Fixed-size value for `by_junction`. The walker only acts on junctions
+// with exactly two ends, so we keep up to 2 inline and reject the rest
+// via `count` going to 3+ (overflow). This avoids one std::vector
+// allocation per junction, which dominated the upfront indexing time on
+// large inputs (millions of junctions -> millions of heap allocs).
 struct junction_ends {
     end_ref a;
     end_ref b;
-    uint8_t count = 0;  // 0, 1, 2, or 3 (overflow)
+    uint8_t count = 0;  // 0, 1, 2, or 3 (overflow: more than 2 ends)
 };
 
 inline kmer_int_t side_junction_canonical(const stitchable_unitig& u, uint32_t k, uint8_t side,
@@ -151,6 +150,8 @@ inline void stitch_unitigs(std::vector<stitchable_unitig>& frag, uint32_t k,
         if (je.count == 0) je.a = ref;
         else if (je.count == 1)
             je.b = ref;
+        // count >= 2 stays as-is; we just bump the counter so the build
+        // step below sees the overflow.
         if (je.count < 3) ++je.count;
     };
     for (uint32_t i = 0; i < frag.size(); ++i) {
