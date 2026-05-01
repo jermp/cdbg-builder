@@ -147,7 +147,8 @@ int main(int argc, char** argv) {
         prog.stop();
     }
     writer.close();
-    std::cout << "  bucket bytes written: " << writer.total_bytes() << "\n";
+    std::cout << "  bucket bytes written: " << writer.total_bytes() << " (compressed; "
+              << writer.total_uncompressed_bytes() << " uncompressed)\n";
 
     std::vector<cdgb::StitchableUnitig> frag_unitigs;
     std::mutex out_mu;

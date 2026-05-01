@@ -33,8 +33,8 @@ namespace detail {
 // `bases` holds 2-bit-encoded bases. Records are appended via `sink` to the
 // appropriate bucket files.
 inline void emit_super_kmers(const uint8_t* bases, uint32_t L, uint32_t k, uint32_t m,
-                             uint32_t color, uint32_t bucket_log2, PerThreadBucketBuffers& sink,
-                             std::vector<uint8_t>& rec_scratch) {
+                             uint32_t color, uint32_t bucket_log2,
+                             PerThreadBucketBuffers& sink) {
     if (L < k) return;
     const uint32_t K = L - k + 1;  // number of k-mers
     const uint32_t W = k - m + 1;  // window size, in m-mer indices
@@ -72,9 +72,7 @@ inline void emit_super_kmers(const uint8_t* bases, uint32_t L, uint32_t k, uint3
         uint8_t flags = 0;
         if (is_run_begin) flags |= SK_FLAG_IS_ACGT_BEGIN;
         if (is_run_end) flags |= SK_FLAG_IS_ACGT_END;
-        rec_scratch.clear();
-        write_super_kmer(flags, color, bases + base_start, base_len, rec_scratch);
-        sink.append(bucket, rec_scratch.data(), rec_scratch.size());
+        sink.append(bucket, flags, color, bases + base_start, base_len);
     };
 
     for (uint32_t i = 1; i < K; ++i) {
@@ -103,7 +101,6 @@ inline void ingest_file_bucketed(const std::string& path, uint32_t k, uint32_t m
     const char* s = nullptr;
     size_t l = 0;
     std::vector<uint8_t> bases_buf;
-    std::vector<uint8_t> rec_scratch;
     while (r.next(s, l)) {
         size_t pos = 0;
         while (pos < l) {
@@ -115,7 +112,7 @@ inline void ingest_file_bucketed(const std::string& path, uint32_t k, uint32_t m
                 bases_buf.resize(run_len);
                 for (size_t i = 0; i < run_len; ++i) { bases_buf[i] = nuc_to_2bit(s[pos + i]); }
                 emit_super_kmers(bases_buf.data(), (uint32_t)run_len, k, m, color, bucket_log2,
-                                 sink, rec_scratch);
+                                 sink);
             }
             pos = end;
             while (pos < l && nuc_to_2bit(s[pos]) == 0xff) ++pos;
