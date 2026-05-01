@@ -99,6 +99,10 @@ inline bool string_to_kmer(const char* s, uint32_t k, kmer_int_t& out) {
 }
 
 struct KmerHasher {
+    // splitmix64-quality output; tell ankerl::unordered_dense it doesn't
+    // need to re-mix.
+    using is_avalanching = void;
+
     size_t operator()(kmer_int_t x) const noexcept {
         // splitmix-style 64x64 mix on the two halves, combined.
         uint64_t lo = (uint64_t)x;

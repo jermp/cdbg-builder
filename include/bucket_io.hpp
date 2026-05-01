@@ -27,10 +27,12 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <sys/stat.h>
-#include <unordered_map>
 #include <vector>
 #include <zlib.h>
+
+#include <unordered_dense/unordered_dense.h>
 
 #include "super_kmer.hpp"
 
@@ -78,7 +80,11 @@ public:
         if (recs.empty()) return;
         std::lock_guard<std::mutex> lk(m_mu);
         for (const auto& r : recs) {
-            std::string key((const char*)bases_storage.data() + r.bases_off, r.bases_len);
+            std::string_view key((const char*)bases_storage.data() + r.bases_off,
+                                 r.bases_len);
+            // Transparent find avoids allocating a std::string on the hot
+            // (already-seen) path. The std::string is constructed only on
+            // a miss, when we actually have to insert into the map.
             auto it = m_dedup.find(key);
             if (it == m_dedup.end()) {
                 Entry e;
@@ -88,7 +94,7 @@ public:
                 e.flags = r.flags;
                 e.colors.push_back(r.color);
                 m_bytes += key.size() + sizeof(uint32_t);
-                m_dedup.emplace(std::move(key), std::move(e));
+                m_dedup.emplace(std::string(key), std::move(e));
             } else {
                 Entry& e = it->second;
                 e.flags &= r.flags;  // AND across contributors
@@ -144,11 +150,29 @@ private:
         m_bytes = 0;
     }
 
+    // Transparent hash/eq so find() can take a string_view directly without
+    // building a std::string. Saves a heap allocation + copy on every
+    // already-seen super-k-mer, which is the common case once the first
+    // input file has populated each bucket's hashmap.
+    struct StringHash {
+        using is_transparent = void;
+        using is_avalanching = void;
+        size_t operator()(std::string_view sv) const noexcept {
+            return ankerl::unordered_dense::hash<std::string_view>{}(sv);
+        }
+    };
+    struct StringEq {
+        using is_transparent = void;
+        bool operator()(std::string_view a, std::string_view b) const noexcept {
+            return a == b;
+        }
+    };
+
     std::string m_path;
     size_t m_spill_bytes;
     std::mutex m_mu;
     gzFile m_file = nullptr;
-    std::unordered_map<std::string, Entry> m_dedup;
+    ankerl::unordered_dense::map<std::string, Entry, StringHash, StringEq> m_dedup;
     size_t m_bytes = 0;
     std::atomic<uint64_t> m_total_uncompressed{0};
 };

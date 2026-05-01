@@ -23,8 +23,9 @@
 #include <mutex>
 #include <string>
 #include <thread>
-#include <unordered_map>
 #include <vector>
+
+#include <unordered_dense/unordered_dense.h>
 
 #include "bucket_io.hpp"
 #include "color_set_dict.hpp"
@@ -72,7 +73,7 @@ struct BucketKmerInfo {
     uint8_t phantom = 0;
 };
 
-using BucketKmerMap = std::unordered_map<kmer_int_t, BucketKmerInfo, KmerHasher>;
+using BucketKmerMap = ankerl::unordered_dense::map<kmer_int_t, BucketKmerInfo, KmerHasher>;
 
 // Build the per-canonical-k-mer info from a bucket's super-k-mer stream.
 inline void load_bucket(const std::string& path, uint32_t k, BucketKmerMap& out) {
@@ -191,7 +192,7 @@ struct LeftEndCheck {
 };
 inline LeftEndCheck classify_left_end(
     kmer_int_t can, bool rc, uint32_t cid, uint32_t k, const BucketKmerMap& m,
-    const std::unordered_map<kmer_int_t, uint32_t, KmerHasher>& cid_of) {
+    const ankerl::unordered_dense::map<kmer_int_t, uint32_t, KmerHasher>& cid_of) {
     auto it = m.find(can);
     uint8_t phantom = it->second.phantom;
     uint8_t mask = local_ext_mask(can, k, m);
@@ -229,7 +230,7 @@ inline void process_bucket(const std::string& path, uint32_t k,
 
     // Build local color-set dict and a parallel map cid_of[can] for quick lookups.
     ColorSetDict local_dict;
-    std::unordered_map<kmer_int_t, uint32_t, KmerHasher> cid_of;
+    ankerl::unordered_dense::map<kmer_int_t, uint32_t, KmerHasher> cid_of;
     cid_of.reserve(kmer_info.size());
     for (auto& kv : kmer_info) {
         std::vector<uint32_t> sorted = kv.second.colors.to_sorted();
@@ -239,7 +240,7 @@ inline void process_bucket(const std::string& path, uint32_t k,
     // Free per-k-mer color storage; we keep phantom flags in kmer_info.
     for (auto& kv : kmer_info) kv.second.colors = KmerEntry{};
 
-    std::unordered_map<kmer_int_t, uint8_t, KmerHasher> visited;
+    ankerl::unordered_dense::map<kmer_int_t, uint8_t, KmerHasher> visited;
     visited.reserve(kmer_info.size());
 
     auto extend_and_emit = [&](kmer_int_t start_can, bool start_rc, uint32_t cid, bool open_left) {
