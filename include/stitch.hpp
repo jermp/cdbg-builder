@@ -2,7 +2,7 @@
 
 // Cross-bucket unitig stitching.
 //
-// Per-bucket walking emits StitchableUnitig fragments split at
+// Per-bucket walking emits stitchable_unitig fragments split at
 // minimizer-change boundaries. Each fragment marks each side as OPEN
 // (the walk stopped because the next k-mer was in another bucket) or
 // closed.
@@ -80,13 +80,13 @@ inline std::string revcomp_string(const std::string& s) {
 constexpr uint8_t SIDE_LEFT = 0;
 constexpr uint8_t SIDE_RIGHT = 1;
 
-struct EndRef {
+struct end_ref {
     uint32_t unitig_idx;
     uint8_t side;
     bool is_canonical_fwd;
 };
 
-inline kmer_int_t side_junction_canonical(const StitchableUnitig& u, uint32_t k, uint8_t side,
+inline kmer_int_t side_junction_canonical(const stitchable_unitig& u, uint32_t k, uint8_t side,
                                           bool& is_canonical_fwd) {
     const char* p = (side == SIDE_LEFT) ? u.seq.data() : u.seq.data() + (u.seq.size() - (k - 1));
     kmer_int_t fwd = encode_kminus1(p, k - 1);
@@ -99,19 +99,19 @@ inline kmer_int_t side_junction_canonical(const StitchableUnitig& u, uint32_t k,
     return rc;
 }
 
-struct Link {
+struct link {
     uint32_t other = UINT32_MAX;
     uint8_t other_side = 0;
 };
 
 }  // namespace detail
 
-inline void stitch_unitigs(std::vector<StitchableUnitig>& frag, uint32_t k,
-                           std::vector<StitchableUnitig>& out) {
+inline void stitch_unitigs(std::vector<stitchable_unitig>& frag, uint32_t k,
+                           std::vector<stitchable_unitig>& out) {
     using detail::SIDE_LEFT;
     using detail::SIDE_RIGHT;
-    using detail::EndRef;
-    using detail::Link;
+    using detail::end_ref;
+    using detail::link;
 
     if (k < 2) {
         out = std::move(frag);
@@ -119,7 +119,7 @@ inline void stitch_unitigs(std::vector<StitchableUnitig>& frag, uint32_t k,
     }
 
     // 1) Index every open end by its canonical (k-1)-mer junction.
-    std::unordered_map<kmer_int_t, std::vector<EndRef>, KmerHasher> by_junction;
+    std::unordered_map<kmer_int_t, std::vector<end_ref>, kmer_hasher> by_junction;
     by_junction.reserve(frag.size() * 2);
     for (uint32_t i = 0; i < frag.size(); ++i) {
         const auto& u = frag[i];
@@ -138,9 +138,9 @@ inline void stitch_unitigs(std::vector<StitchableUnitig>& frag, uint32_t k,
 
     // 2) Build adjacency. adj[u][side] = (other_unitig, other_side) on the
     //    own-frame `side` of u that the link enters.
-    std::vector<std::array<Link, 2>> adj(frag.size());
+    std::vector<std::array<link, 2>> adj(frag.size());
 
-    auto pair_compatible = [](const EndRef& a, const EndRef& b) {
+    auto pair_compatible = [](const end_ref& a, const end_ref& b) {
         // (R,L) or (L,R) with same is_canonical_fwd, OR same side with
         // different is_canonical_fwd.
         if (a.side != b.side) return a.is_canonical_fwd == b.is_canonical_fwd;
@@ -150,8 +150,8 @@ inline void stitch_unitigs(std::vector<StitchableUnitig>& frag, uint32_t k,
     for (auto& kv : by_junction) {
         auto& v = kv.second;
         if (v.size() != 2) continue;
-        const EndRef& e1 = v[0];
-        const EndRef& e2 = v[1];
+        const end_ref& e1 = v[0];
+        const end_ref& e2 = v[1];
         if (frag[e1.unitig_idx].colors != frag[e2.unitig_idx].colors) continue;
         if (!pair_compatible(e1, e2)) continue;
         // Both directions of the link.
@@ -173,7 +173,7 @@ inline void stitch_unitigs(std::vector<StitchableUnitig>& frag, uint32_t k,
     };
 
     auto walk_chain = [&](uint32_t start_idx, bool start_flipped) {
-        StitchableUnitig merged;
+        stitchable_unitig merged;
         merged.colors = frag[start_idx].colors;
         merged.seq = take_seq(start_idx, start_flipped);
         visited[start_idx] = 1;
@@ -189,12 +189,12 @@ inline void stitch_unitigs(std::vector<StitchableUnitig>& frag, uint32_t k,
         for (;;) {
             // The own-frame side of cur exposed at merged-RIGHT.
             uint8_t exit_side_own = f_cur ? SIDE_LEFT : SIDE_RIGHT;
-            const Link& link = adj[cur][exit_side_own];
-            if (link.other == UINT32_MAX) {
+            const link& lnk = adj[cur][exit_side_own];
+            if (lnk.other == UINT32_MAX) {
                 if (open_at_side(cur, exit_side_own)) merged.open_flags |= UNITIG_OPEN_RIGHT;
                 break;
             }
-            uint32_t nxt = link.other;
+            uint32_t nxt = lnk.other;
             if (visited[nxt]) {
                 // Cycle closure: stop here. The cycle's k-mers have all
                 // already been emitted via earlier appends; we must NOT
@@ -205,7 +205,7 @@ inline void stitch_unitigs(std::vector<StitchableUnitig>& frag, uint32_t k,
             // Entering through nxt's RIGHT means nxt is flipped (so its own
             // R becomes its merged-LEFT); entering through nxt's LEFT means
             // nxt is unflipped.
-            bool f_nxt = (link.other_side == SIDE_RIGHT);
+            bool f_nxt = (lnk.other_side == SIDE_RIGHT);
             std::string add = take_seq(nxt, f_nxt);
             merged.seq.append(add.begin() + (k - 1), add.end());
             visited[nxt] = 1;

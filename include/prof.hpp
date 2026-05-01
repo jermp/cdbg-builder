@@ -16,7 +16,7 @@ struct bucket_write_prof {
     using clock = std::chrono::steady_clock;
 
     // ---- ingest-loop stages (covers the ingest_file_bucketed body) ----
-    // SeqReader::next: gzip decode + kseq parsing.
+    // seq_reader::next: gzip decode + kseq parsing.
     std::atomic<uint64_t> ns_seq_read{0};
     // Whole loop body (ACGT scan, 2-bit conversion, emit_super_kmers,
     // including its calls into the per-thread buffer and any flushes).

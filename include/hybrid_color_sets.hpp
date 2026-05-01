@@ -40,7 +40,7 @@
 
 namespace cdgb {
 
-struct Hybrid {
+struct hybrid {
     template <typename Visitor>
     void visit(Visitor& visitor) {
         visit_impl(visitor, *this);
@@ -67,9 +67,9 @@ private:
     }
 };
 
-struct HybridBuilder {
-    HybridBuilder() = default;
-    explicit HybridBuilder(uint32_t num_colors) { init(num_colors); }
+struct hybrid_builder {
+    hybrid_builder() = default;
+    explicit hybrid_builder(uint32_t num_colors) { init(num_colors); }
 
     void init(uint32_t num_colors) {
         m_num_colors = num_colors;
@@ -132,7 +132,7 @@ struct HybridBuilder {
         ++m_num_color_sets;
     }
 
-    void build(Hybrid& h) {
+    void build(hybrid& h) {
         h.m_num_colors = m_num_colors;
         h.m_sparse_set_threshold_size = m_sparse_set_threshold_size;
         h.m_very_dense_set_threshold_size = m_very_dense_set_threshold_size;

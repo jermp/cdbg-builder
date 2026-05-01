@@ -17,11 +17,11 @@ namespace cdgb {
 // a single line in place via '\r'; otherwise it emits one line per tick so
 // progress is still visible in piped logs.
 //
-// Workers don't talk to Progress directly — they bump `counter`, and Progress
-// only reads it. This keeps the hot path lock-free and Progress optional.
-class Progress {
+// Workers don't talk to progress directly — they bump `counter`, and progress
+// only reads it. This keeps the hot path lock-free and progress optional.
+class progress {
 public:
-    Progress(std::string label, std::atomic<uint64_t>& counter, uint64_t total,
+    progress(std::string label, std::atomic<uint64_t>& counter, uint64_t total,
              std::ostream& os = std::cerr,
              std::chrono::milliseconds interval = std::chrono::milliseconds(500))
         : m_label(std::move(label))
@@ -34,10 +34,10 @@ public:
         m_thread = std::thread([this] { run(); });
     }
 
-    ~Progress() { stop(); }
+    ~progress() { stop(); }
 
-    Progress(const Progress&) = delete;
-    Progress& operator=(const Progress&) = delete;
+    progress(const progress&) = delete;
+    progress& operator=(const progress&) = delete;
 
     void stop() {
         bool was = m_stopped.exchange(true);

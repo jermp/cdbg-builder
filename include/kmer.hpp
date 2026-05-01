@@ -98,7 +98,7 @@ inline bool string_to_kmer(const char* s, uint32_t k, kmer_int_t& out) {
     return true;
 }
 
-struct KmerHasher {
+struct kmer_hasher {
     // splitmix64-quality output; tell ankerl::unordered_dense it doesn't
     // need to re-mix.
     using is_avalanching = void;

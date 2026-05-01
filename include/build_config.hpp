@@ -5,7 +5,7 @@
 
 namespace cdgb {
 
-struct BuildConfig {
+struct build_config {
     std::string filenames_list;  // text file: one input path per line
     std::string out_basename;    // produces <basename>.fa and <basename>.colors
     uint32_t k = 31;

@@ -10,7 +10,7 @@
 //
 // The output is a directory of B bucket files, each holding a stream of
 // super-k-mer records (see super_kmer.hpp). Thread safety: each ingest worker
-// holds a private PerThreadBucketBuffers; concurrency on the shared bucket
+// holds a private per_thread_bucket_buffers; concurrency on the shared bucket
 // files is one mutex per bucket.
 
 #include <atomic>
@@ -34,7 +34,7 @@ namespace detail {
 // appropriate bucket files.
 inline void emit_super_kmers(const uint8_t* bases, uint32_t L, uint32_t k, uint32_t m,
                              uint32_t color, uint32_t bucket_log2,
-                             PerThreadBucketBuffers& sink) {
+                             per_thread_bucket_buffers& sink) {
     if (L < k) return;
     const uint32_t K = L - k + 1;  // number of k-mers
     const uint32_t W = k - m + 1;  // window size, in m-mer indices
@@ -48,7 +48,7 @@ inline void emit_super_kmers(const uint8_t* bases, uint32_t L, uint32_t k, uint3
     uint64_t fwd = 0, rc = 0;
     if (!nthash_init(bases, m, fwd, rc)) return;  // run is ACGT-only, shouldn't happen
 
-    MinQueue mq;
+    min_queue mq;
     mq.reset((int32_t)W);
     mq.push(canonical_mhash(fwd, rc), 0);
 
@@ -96,9 +96,9 @@ inline void emit_super_kmers(const uint8_t* bases, uint32_t L, uint32_t k, uint3
 
 inline void ingest_file_bucketed(const std::string& path, uint32_t k, uint32_t m,
                                  uint32_t bucket_log2, uint32_t color,
-                                 PerThreadBucketBuffers& sink) {
+                                 per_thread_bucket_buffers& sink) {
     auto& prof = bucket_prof();
-    SeqReader r(path);
+    seq_reader r(path);
     const char* s = nullptr;
     size_t l = 0;
     std::vector<uint8_t> bases_buf;
@@ -135,7 +135,7 @@ inline void ingest_file_bucketed(const std::string& path, uint32_t k, uint32_t m
 // Parallel driver. Spawns `num_threads` workers, each pulling files from a
 // shared queue. `done` (if non-null) is incremented after each file finishes.
 inline void ingest_bucketed(const std::vector<std::string>& files, uint32_t k, uint32_t m,
-                            uint32_t bucket_log2, BucketWriter& writer, uint32_t num_threads,
+                            uint32_t bucket_log2, bucket_writer& writer, uint32_t num_threads,
                             std::atomic<uint64_t>* done = nullptr) {
     if (num_threads == 0) num_threads = 1;
     std::atomic<size_t> next{0};
@@ -143,7 +143,7 @@ inline void ingest_bucketed(const std::vector<std::string>& files, uint32_t k, u
     workers.reserve(num_threads);
 
     auto run = [&]() {
-        PerThreadBucketBuffers bufs(writer);
+        per_thread_bucket_buffers bufs(writer);
         for (;;) {
             size_t i = next.fetch_add(1);
             if (i >= files.size()) break;
