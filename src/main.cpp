@@ -27,6 +27,7 @@
 #include "ingester.hpp"
 #include "minimizer.hpp"
 #include "progress.hpp"
+#include "stitch.hpp"
 #include "unitig_walker.hpp"
 
 namespace {
@@ -156,15 +157,24 @@ int run_bucketed(cdgb::BuildConfig& cfg, const std::vector<std::string>& files) 
     writer.close();
     std::cout << "  bucket bytes written: " << writer.total_bytes() << "\n";
 
-    std::vector<cdgb::BucketUnitig> all_unitigs;
+    std::vector<cdgb::StitchableUnitig> frag_unitigs;
     std::mutex out_mu;
     {
         Timer _("bucket-process");
         std::atomic<uint64_t> done{0};
         cdgb::Progress prog("bucket-process", done, num_buckets);
-        cdgb::process_buckets(writer, cfg.k, cfg.num_threads, all_unitigs, out_mu, &done);
+        cdgb::process_buckets(writer, cfg.k, cfg.num_threads, frag_unitigs, out_mu, &done);
         prog.stop();
-        std::cout << "  unitigs: " << all_unitigs.size() << "\n";
+        std::cout << "  bucket fragments: " << frag_unitigs.size() << "\n";
+    }
+
+    std::vector<cdgb::StitchableUnitig> all_unitigs;
+    {
+        Timer _("stitch");
+        // TODO(cross-bucket-stitching): re-enable once orientation bug is
+        // fixed; for now emit fragments directly.
+        all_unitigs = std::move(frag_unitigs);
+        std::cout << "  unitigs (no stitching yet): " << all_unitigs.size() << "\n";
     }
 
     // Globally intern color sets and write FASTA + .colors.

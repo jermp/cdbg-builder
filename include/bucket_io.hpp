@@ -136,9 +136,10 @@ public:
     }
 
     // Iterate records in order. Returns false when no more records are available.
-    bool next(uint32_t& color, std::vector<uint8_t>& bases) {
+    bool next(uint8_t& flags, uint32_t& color, std::vector<uint8_t>& bases) {
         if (m_pos >= m_buf.size()) return false;
-        size_t consumed = read_super_kmer(m_buf.data() + m_pos, m_buf.size() - m_pos, color, bases);
+        size_t consumed = read_super_kmer(m_buf.data() + m_pos, m_buf.size() - m_pos,
+                                          flags, color, bases);
         if (consumed == 0) return false;
         m_pos += consumed;
         return true;

@@ -2,16 +2,21 @@
 
 // Binary record format for super-k-mers stored in a bucket file:
 //
-//   [color_id : varint] [length_in_bases : varint] [2-bit packed bases]
+//   [flags : u8] [color_id : varint] [length_in_bases : varint] [2-bit packed bases]
+//
+// Flags:
+//   bit 0 (IS_ACGT_BEGIN) = this super-k-mer's first k-mer (in input order) is
+//                           the actual first k-mer of an ACGT-only run, i.e. it
+//                           has no predecessor in the input.
+//   bit 1 (IS_ACGT_END)   = analogously, this super-k-mer's last k-mer is the
+//                           last k-mer of its ACGT run.
+//
+// When IS_ACGT_BEGIN is unset, this super-k-mer's first k-mer has a predecessor
+// k-mer in the input that lives in a different bucket; the cross-bucket
+// stitcher uses that fact later. Same for IS_ACGT_END on the right side.
 //
 // Bases are packed 4 per byte, lowest 2 bits = first base of the run. Records
-// are concatenated in the file with no padding between them (the byte
-// containing the last base may have unused high bits, which is fine because
-// the next record starts on the next byte).
-//
-// We deliberately omit GGCAT's INCL_BEGIN/INCL_END flag bits and minimizer
-// position: this first cut does not stitch unitigs across buckets, so we
-// don't need that information.
+// are concatenated in the file with no padding between them.
 
 #include <cstdint>
 #include <cstring>
@@ -67,18 +72,24 @@ inline uint64_t varint_read(const uint8_t* buf, size_t buf_len, size_t& pos) {
 
 // ---- Super-k-mer record ------------------------------------------------------
 
-inline void write_super_kmer(uint32_t color, const uint8_t* bases, uint32_t len,
+inline constexpr uint8_t SK_FLAG_IS_ACGT_BEGIN = 1u << 0;
+inline constexpr uint8_t SK_FLAG_IS_ACGT_END   = 1u << 1;
+
+inline void write_super_kmer(uint8_t flags, uint32_t color, const uint8_t* bases, uint32_t len,
                              std::vector<uint8_t>& out) {
+    out.push_back(flags);
     varint_write(color, out);
     varint_write(len, out);
     pack_2bit(bases, len, out);
 }
 
-// Returns the byte length consumed; sets out_color, out_len, and copies bases
+// Returns the byte length consumed; sets out_flags, out_color and copies bases
 // into out_bases. Returns 0 on malformed/EOF.
-inline size_t read_super_kmer(const uint8_t* buf, size_t buf_len, uint32_t& out_color,
-                              std::vector<uint8_t>& out_bases) {
+inline size_t read_super_kmer(const uint8_t* buf, size_t buf_len, uint8_t& out_flags,
+                              uint32_t& out_color, std::vector<uint8_t>& out_bases) {
+    if (buf_len < 1) return 0;
     size_t p = 0;
+    out_flags = buf[p++];
     uint64_t color = varint_read(buf, buf_len, p);
     uint64_t len = varint_read(buf, buf_len, p);
     size_t base_bytes = (size_t)((len + 3) / 4);

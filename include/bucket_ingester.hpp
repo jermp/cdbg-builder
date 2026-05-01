@@ -61,14 +61,19 @@ inline void emit_super_kmers(const uint8_t* bases, uint32_t L, uint32_t k, uint3
     }
 
     uint32_t super_start = 0;  // first k-mer index in the running super-k-mer
+    bool is_first_super = true;
     uint64_t cur_min = mq.min_hash();
     uint32_t cur_bucket = bucket_of(cur_min);
 
-    auto emit_super = [&](uint32_t first_kmer, uint32_t last_kmer, uint32_t bucket) {
+    auto emit_super = [&](uint32_t first_kmer, uint32_t last_kmer, uint32_t bucket,
+                          bool is_run_begin, bool is_run_end) {
         uint32_t base_start = first_kmer;
         uint32_t base_len = (last_kmer - first_kmer) + k;
+        uint8_t flags = 0;
+        if (is_run_begin) flags |= SK_FLAG_IS_ACGT_BEGIN;
+        if (is_run_end)   flags |= SK_FLAG_IS_ACGT_END;
         rec_scratch.clear();
-        write_super_kmer(color, bases + base_start, base_len, rec_scratch);
+        write_super_kmer(flags, color, bases + base_start, base_len, rec_scratch);
         sink.append(bucket, rec_scratch.data(), rec_scratch.size());
     };
 
@@ -81,13 +86,14 @@ inline void emit_super_kmers(const uint8_t* bases, uint32_t L, uint32_t k, uint3
 
         uint64_t new_min = mq.min_hash();
         if (new_min != cur_min) {
-            emit_super(super_start, i - 1, cur_bucket);
+            emit_super(super_start, i - 1, cur_bucket, is_first_super, /*is_run_end=*/false);
             super_start = i;
+            is_first_super = false;
             cur_min = new_min;
             cur_bucket = bucket_of(new_min);
         }
     }
-    emit_super(super_start, K - 1, cur_bucket);
+    emit_super(super_start, K - 1, cur_bucket, is_first_super, /*is_run_end=*/true);
 }
 
 inline void ingest_file_bucketed(const std::string& path, uint32_t k, uint32_t m,
