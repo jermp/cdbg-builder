@@ -103,8 +103,7 @@ inline void write_super_kmer(uint8_t flags, const uint32_t* colors, uint32_t num
 // Returns the byte length consumed; sets out_flags, out_colors and copies
 // bases into out_bases. Returns 0 on malformed/EOF.
 inline size_t read_super_kmer(const uint8_t* buf, size_t buf_len, uint8_t& out_flags,
-                              std::vector<uint32_t>& out_colors,
-                              std::vector<uint8_t>& out_bases) {
+                              std::vector<uint32_t>& out_colors, std::vector<uint8_t>& out_bases) {
     if (buf_len < 1) return 0;
     size_t p = 0;
     uint64_t num_colors = varint_read(buf, buf_len, p);

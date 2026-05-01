@@ -47,7 +47,8 @@ inline constexpr size_t DEFAULT_COMPACTOR_SPILL_BYTES = 256 * 1024;
 
 class bucket_compactor {
 public:
-    bucket_compactor(std::string path, size_t spill_bytes) : m_path(std::move(path)), m_spill_bytes(spill_bytes) {
+    bucket_compactor(std::string path, size_t spill_bytes)
+        : m_path(std::move(path)), m_spill_bytes(spill_bytes) {
         m_file = gzopen(m_path.c_str(), "wb1");
         if (!m_file)
             throw std::runtime_error("cannot open bucket file: " + m_path + ": " +
@@ -86,8 +87,7 @@ public:
                                     std::memory_order_relaxed);
         auto t_map = bucket_write_prof::clock::now();
         for (const auto& r : recs) {
-            std::string_view key((const char*)bases_storage.data() + r.bases_off,
-                                 r.bases_len);
+            std::string_view key((const char*)bases_storage.data() + r.bases_off, r.bases_len);
             // Transparent find avoids allocating a std::string on the hot
             // (already-seen) path. The std::string is constructed only on
             // a miss, when we actually have to insert into the map.
@@ -179,9 +179,7 @@ private:
     };
     struct string_eq {
         using is_transparent = void;
-        bool operator()(std::string_view a, std::string_view b) const noexcept {
-            return a == b;
-        }
+        bool operator()(std::string_view a, std::string_view b) const noexcept { return a == b; }
     };
 
     std::string m_path;
@@ -197,8 +195,7 @@ private:
 
 class bucket_writer {
 public:
-    bucket_writer(const std::string& dir, uint32_t num_buckets,
-                 size_t flush_bases = 64 * 1024,
+    bucket_writer(const std::string& dir, uint32_t num_buckets, size_t flush_bases = 64 * 1024,
                  size_t spill_bytes = DEFAULT_COMPACTOR_SPILL_BYTES)
         : m_dir(dir), m_num_buckets(num_buckets), m_flush_bases(flush_bases) {
         std::filesystem::create_directories(m_dir);
@@ -243,8 +240,7 @@ public:
         uint64_t total_uncompressed = 0;
         for (uint32_t b = 0; b < m_num_buckets; ++b) {
             struct stat st;
-            if (::stat(bucket_path(b).c_str(), &st) == 0)
-                total_compressed += (uint64_t)st.st_size;
+            if (::stat(bucket_path(b).c_str(), &st) == 0) total_compressed += (uint64_t)st.st_size;
             total_uncompressed += m_compactors[b]->total_uncompressed_bytes();
         }
         m_total_compressed.store(total_compressed, std::memory_order_relaxed);
@@ -283,8 +279,7 @@ struct per_thread_bucket_buffers {
     explicit per_thread_bucket_buffers(bucket_writer& w)
         : recs(w.num_buckets()), bases(w.num_buckets()), sink(&w) {}
 
-    void append(uint32_t b, uint8_t flags, uint32_t color, const uint8_t* sk_bases,
-                uint32_t len) {
+    void append(uint32_t b, uint8_t flags, uint32_t color, const uint8_t* sk_bases, uint32_t len) {
         auto& bbuf = bases[b];
         uint32_t off = (uint32_t)bbuf.size();
         bbuf.insert(bbuf.end(), sk_bases, sk_bases + len);
@@ -326,8 +321,8 @@ public:
     // Iterate records in order. Returns false when no more records remain.
     bool next(uint8_t& flags, std::vector<uint32_t>& colors, std::vector<uint8_t>& bases) {
         if (m_pos >= m_buf.size()) return false;
-        size_t consumed = read_super_kmer(m_buf.data() + m_pos, m_buf.size() - m_pos, flags,
-                                          colors, bases);
+        size_t consumed =
+            read_super_kmer(m_buf.data() + m_pos, m_buf.size() - m_pos, flags, colors, bases);
         if (consumed == 0) return false;
         m_pos += consumed;
         return true;
