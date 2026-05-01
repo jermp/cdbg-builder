@@ -194,7 +194,7 @@ int main(int argc, char** argv) {
         }
         fa.close();
 
-        cdgb::hybrid_builder hb((uint32_t)files.size());
+        cdgb::hybrid_builder hb(files.size());
         for (uint32_t cid = 0; cid < global_dict.size(); ++cid) {
             const auto& cs = global_dict.at(cid);
             hb.encode_color_set(cs.data(), cs.size());
