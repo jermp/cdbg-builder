@@ -4,7 +4,7 @@
 
 #include <parser.hpp>
 
-#include "cdbg_builder.hpp"
+#include "builder.hpp"
 #include "kmer.hpp"
 #include "util.hpp"
 
@@ -46,7 +46,7 @@ int main(int argc, char** argv) {
     if (!parse_args(argc, argv, cfg)) return 1;
 
     try {
-        cdgb::cdbg_builder builder(cfg);
+        cdgb::builder builder(cfg);
         builder.build();
     } catch (std::exception const& e) {
         std::cerr << "error: " << e.what() << '\n';

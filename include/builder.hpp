@@ -5,7 +5,7 @@
 // Wraps the full pipeline (minimizer-bucketed ingest -> per-bucket dBG
 // build + global color interning -> stitch -> emit FASTA + .colors) so
 // that downstream tools can construct a `build_config`, instantiate a
-// `cdbg_builder`, and call `build()`. Mirrors the call shape used by
+// `builder`, and call `build()`. Mirrors the call shape used by
 // Fulgor's `index<ColorSets>::builder` for its ccdBG dependency
 // (https://github.com/jermp/fulgor/blob/main/include/builders/builder.hpp).
 //
@@ -17,7 +17,7 @@
 //   cfg.k = 31;
 //   cfg.num_threads = 8;
 //
-//   cdgb::cdbg_builder b(cfg);
+//   cdgb::builder b(cfg);
 //   b.build();
 //   // After build():
 //   //   b.num_colors()         -- one per input file
@@ -59,9 +59,9 @@
 
 namespace cdgb {
 
-struct cdbg_builder {
-    cdbg_builder() = default;
-    explicit cdbg_builder(build_config const& cfg) : m_cfg(cfg) {}
+struct builder {
+    builder() = default;
+    explicit builder(build_config const& cfg) : m_cfg(cfg) {}
 
     // Run the full pipeline. Throws std::runtime_error on bad config or
     // I/O error. On success, writes m_cfg.out_basename + {".fa", ".colors"}
