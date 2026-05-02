@@ -12,6 +12,7 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <sys/resource.h>
 #include <thread>
 #include <unistd.h>
 
@@ -53,30 +54,23 @@ private:
 
 // ---- process-memory query ---------------------------------------------------
 //
-// Read /proc/self/status to get peak / current resident set size in bytes.
-// Returns 0 on any I/O error (e.g. on a non-Linux host). The peak is
-// maintained by the kernel itself (VmHWM); reading it at end of build()
-// gives a true high-water mark across the run with zero hot-path
-// overhead.
+// Peak resident set size in bytes via getrusage(RUSAGE_SELF) — POSIX,
+// portable across Linux / macOS / BSD. The kernel maintains the peak
+// continuously, so a single read at end of build() gives a true
+// high-water mark with zero hot-path overhead.
+//
+// Unit gotcha: Linux's man page says ru_maxrss is in KiB; Darwin
+// returns bytes. The #ifdef below normalises to bytes on both.
 
-inline uint64_t proc_status_kb_(char const* prefix) {
-    std::ifstream st("/proc/self/status");
-    if (!st) return 0;
-    size_t plen = std::strlen(prefix);
-    std::string line;
-    while (std::getline(st, line)) {
-        if (line.size() < plen || line.compare(0, plen, prefix) != 0) continue;
-        size_t pos = line.find_first_of("0123456789", plen);
-        if (pos == std::string::npos) return 0;
-        try {
-            return std::stoull(line.substr(pos));
-        } catch (...) { return 0; }
-    }
-    return 0;
+inline uint64_t process_peak_rss_bytes() {
+    struct rusage ru;
+    if (::getrusage(RUSAGE_SELF, &ru) != 0) return 0;
+#ifdef __APPLE__
+    return (uint64_t)ru.ru_maxrss;
+#else
+    return (uint64_t)ru.ru_maxrss * 1024ULL;
+#endif
 }
-
-inline uint64_t process_peak_rss_bytes() { return proc_status_kb_("VmHWM:") * 1024ULL; }
-inline uint64_t process_current_rss_bytes() { return proc_status_kb_("VmRSS:") * 1024ULL; }
 
 // Pretty-printer: 3.42 GiB / 728 MiB / 12 KiB, picking the largest
 // unit at which the number is >= 1.
