@@ -142,7 +142,8 @@ public:
                                std::chrono::milliseconds interval = std::chrono::milliseconds(100))
         : m_label(std::move(label)), m_interval(interval) {
         uint64_t cur = current_rss_bytes();
-        if (cur == 0) return;  // unsupported platform; stop() prints nothing
+        m_supported = (cur != 0);
+        if (!m_supported) return;
         m_peak.store(cur, std::memory_order_relaxed);
         m_running.store(true, std::memory_order_relaxed);
         m_thread = std::thread([this] { run(); });
@@ -153,7 +154,17 @@ public:
     rss_phase_tracker& operator=(rss_phase_tracker const&) = delete;
 
     void stop() {
-        if (!m_running.exchange(false)) return;
+        if (m_stopped) return;
+        m_stopped = true;
+        if (!m_supported) {
+            // Always emit a line so the per-phase instrumentation is
+            // visibly present even when current RSS isn't readable
+            // (non-Linux, sandboxed /proc, etc.). Without this the
+            // line silently disappears and the user has to guess.
+            std::cout << "  [" << m_label << " peak RSS] unavailable\n";
+            return;
+        }
+        m_running.store(false, std::memory_order_relaxed);
         if (m_thread.joinable()) m_thread.join();
         // One last sample to catch a peak between the final tick and stop().
         update(current_rss_bytes());
@@ -178,6 +189,8 @@ private:
     std::chrono::milliseconds m_interval;
     std::atomic<uint64_t> m_peak{0};
     std::atomic<bool> m_running{false};
+    bool m_supported = false;
+    bool m_stopped = false;
     std::thread m_thread;
 };
 
