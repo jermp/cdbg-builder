@@ -118,6 +118,9 @@ struct builder {
         // phase by the *compressed* color-set size, not the sum of
         // class sizes.
         streaming_color_set_dict global_dict(m_num_colors);
+        if (m_color_bvb_spill_bytes > 0) {
+            global_dict.enable_spill(tmp_dir + "/colors.bits", m_color_bvb_spill_bytes);
+        }
         std::mutex global_mu;
         {
             timer _("bucket-process");
@@ -153,7 +156,17 @@ struct builder {
         // zero hot-path cost.
         m_peak_rss_bytes = process_peak_rss_bytes();
         if (m_peak_rss_bytes) {
-            std::cout << "[peak resident memory] " << format_bytes(m_peak_rss_bytes) << "\n";
+            std::cout << "[peak resident memory] " << format_bytes(m_peak_rss_bytes);
+            if (m_cfg.max_ram_gb > 0) {
+                uint64_t budget = (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0);
+                if (m_peak_rss_bytes <= budget) {
+                    std::cout << "  (within budget of " << format_bytes(budget) << ")";
+                } else {
+                    std::cout << "  (OVER budget of " << format_bytes(budget) << " by "
+                              << format_bytes(m_peak_rss_bytes - budget) << ")";
+                }
+            }
+            std::cout << "\n";
         }
 
         std::cout << "done. wrote " << m_cfg.out_basename << ".fa and " << m_cfg.out_basename
@@ -169,6 +182,16 @@ struct builder {
     build_config const& config() const { return m_cfg; }
 
 private:
+    // Soft-cap policy. Reads m_cfg.max_ram_gb (0 = unset) and decides:
+    //   - bucket_log2 (more buckets -> smaller per-bucket data structures)
+    //   - color-bvb spill threshold (in bytes; 0 = never spill)
+    // Tighter budgets push bucket_log2 toward 13 (8192 buckets, GGCAT's
+    // upper end) and shrink the bvb spill threshold proportionally.
+    // The user-facing CLI override (--buckets-log2) takes precedence
+    // over this auto-tune.
+    static constexpr uint32_t MIN_BUCKETS_LOG2 = 10;
+    static constexpr uint32_t MAX_BUCKETS_LOG2 = 13;
+
     void validate_and_resolve_config() {
         if (m_cfg.filenames_list.empty())
             throw std::runtime_error("build_config::filenames_list is empty");
@@ -181,6 +204,69 @@ private:
         if (m_cfg.m < 2 || m_cfg.m > m_cfg.k)
             throw std::runtime_error("invalid m=" + std::to_string(m_cfg.m) +
                                      " (need 2 <= m <= k)");
+        if (m_cfg.bucket_log2 == 0) {
+            // User didn't pin --buckets-log2. Auto-pick.
+            m_cfg.bucket_log2 = auto_bucket_log2();
+        } else if (m_cfg.bucket_log2 < MIN_BUCKETS_LOG2 || m_cfg.bucket_log2 > MAX_BUCKETS_LOG2) {
+            throw std::runtime_error("--buckets-log2 must be in [" +
+                                     std::to_string(MIN_BUCKETS_LOG2) + ", " +
+                                     std::to_string(MAX_BUCKETS_LOG2) + "]");
+        }
+        // bucket_writer opens one gzFile per bucket. Raise the soft FD
+        // limit if needed; clamp bucket_log2 if even the hard limit
+        // isn't enough.
+        m_cfg.bucket_log2 = ensure_fd_capacity_for_buckets_(m_cfg.bucket_log2);
+        m_color_bvb_spill_bytes = auto_color_bvb_spill_bytes();
+    }
+
+    // Try to raise RLIMIT_NOFILE so we can open `1 << log2` bucket
+    // files plus a small headroom for stdin/stdout/sidecar/inputs. If
+    // even the hard limit is too small, clamp log2 down and warn.
+    static uint32_t ensure_fd_capacity_for_buckets_(uint32_t log2) {
+        constexpr uint32_t HEADROOM = 64;
+        struct rlimit r;
+        if (::getrlimit(RLIMIT_NOFILE, &r) != 0) return log2;  // best effort
+        uint32_t needed = (1u << log2) + HEADROOM;
+        if (r.rlim_cur >= needed) return log2;
+        rlim_t target = std::min<rlim_t>(needed, r.rlim_max);
+        struct rlimit nr = r;
+        nr.rlim_cur = target;
+        ::setrlimit(RLIMIT_NOFILE, &nr);
+        ::getrlimit(RLIMIT_NOFILE, &nr);
+        if (nr.rlim_cur >= needed) return log2;
+        // Hard limit too small. Clamp log2 to what we can actually open.
+        uint32_t avail = (uint32_t)nr.rlim_cur > HEADROOM ? (uint32_t)nr.rlim_cur - HEADROOM : 0;
+        uint32_t fitted = MIN_BUCKETS_LOG2;
+        while (fitted < log2 && (1u << (fitted + 1)) <= avail) ++fitted;
+        if (fitted < log2) {
+            std::cerr << "warning: RLIMIT_NOFILE hard limit " << nr.rlim_max
+                      << " can't accommodate 2^" << log2 << " buckets; clamping bucket_log2 to "
+                      << fitted << ". Raise the hard limit (e.g. ulimit -Hn) for tighter budgets.\n";
+        }
+        return fitted;
+    }
+
+    // Heuristic. Tighter --max-ram -> more buckets so each per-thread
+    // bucket_kmer_map is smaller. Without --max-ram, default to the
+    // historical 1024 buckets.
+    uint32_t auto_bucket_log2() const {
+        if (m_cfg.max_ram_gb <= 0) return MIN_BUCKETS_LOG2;
+        // Rule of thumb from the 4546-genome / 8-thread / 6.79 GiB
+        // measurement: each doubling of bucket_log2 roughly halves
+        // peak. So budget < 8 GiB -> 11, < 4 GiB -> 12, < 2 GiB -> 13.
+        if (m_cfg.max_ram_gb >= 8.0) return MIN_BUCKETS_LOG2;       // 1024
+        if (m_cfg.max_ram_gb >= 4.0) return MIN_BUCKETS_LOG2 + 1;   // 2048
+        if (m_cfg.max_ram_gb >= 2.0) return MIN_BUCKETS_LOG2 + 2;   // 4096
+        return MAX_BUCKETS_LOG2;                                    // 8192
+    }
+
+    // Heuristic. Cap the streaming-color bvb at ~1/4 of the budget, so
+    // it spills before crowding out the rest.
+    uint64_t auto_color_bvb_spill_bytes() const {
+        if (m_cfg.max_ram_gb <= 0) return 0;  // never spill
+        double bytes = m_cfg.max_ram_gb * (1024.0 * 1024.0 * 1024.0) * 0.25;
+        if (bytes < (double)(64 * 1024 * 1024)) bytes = 64 * 1024 * 1024;  // floor at 64 MiB
+        return (uint64_t)bytes;
     }
 
     static std::vector<std::string> read_filenames(std::string const& path) {
@@ -301,6 +387,7 @@ private:
     uint64_t m_num_unitigs = 0;
     uint64_t m_num_color_classes = 0;
     uint64_t m_peak_rss_bytes = 0;
+    uint64_t m_color_bvb_spill_bytes = 0;  // 0 = never spill
 };
 
 }  // namespace cdgb

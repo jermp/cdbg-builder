@@ -20,10 +20,17 @@ bool parse_args(int argc, char** argv, cdgb::build_config& cfg) {
     parser.add("k", "K-mer length (must be <= " + std::to_string(cdgb::MAX_K) + ").", "-k", true);
     parser.add("num_threads", "Number of worker threads (default 1).", "-t", false);
     parser.add("m", "Minimizer length (default: auto, derived from k).", "-m", false);
-    parser.add("buckets_log2", "log2 of the bucket count (default 10 -> 1024).", "--buckets-log2",
-               false);
+    parser.add("buckets_log2",
+               "log2 of the bucket count (default: auto -- derived from --max-ram if set,"
+               " else 10).",
+               "--buckets-log2", false);
     parser.add("tmp_dir", "Scratch directory for bucket files (default: mkdtemp under $TMPDIR).",
                "--tmp-dir", false);
+    parser.add("max_ram_gb",
+               "Soft RAM budget in GiB. The builder auto-tunes bucket_log2 and spills the"
+               " color bit_vector to disk to try to stay within this budget; the actual"
+               " peak RSS is reported at the end (no hard kill if exceeded).",
+               "--max-ram", false);
     parser.add("verbose", "Verbose output.", "--verbose", false, true);
 
     if (!parser.parse()) return false;
@@ -35,6 +42,7 @@ bool parse_args(int argc, char** argv, cdgb::build_config& cfg) {
     if (parser.parsed("m")) cfg.m = parser.get<uint32_t>("m");
     if (parser.parsed("buckets_log2")) cfg.bucket_log2 = parser.get<uint32_t>("buckets_log2");
     if (parser.parsed("tmp_dir")) cfg.tmp_dir = parser.get<std::string>("tmp_dir");
+    if (parser.parsed("max_ram_gb")) cfg.max_ram_gb = parser.get<double>("max_ram_gb");
     if (parser.parsed("verbose")) cfg.verbose = parser.get<bool>("verbose");
     return true;
 }

@@ -26,8 +26,16 @@ struct build_config {
     uint32_t k = 31;
     uint32_t num_threads = 1;
     uint32_t m = 0;             // minimizer length, 0 = auto (compute_best_m(k))
-    uint32_t bucket_log2 = 10;  // 2^10 = 1024 minimizer buckets
+    uint32_t bucket_log2 = 0;   // 0 = auto (derived from max_ram_gb if set, else 10)
     std::string tmp_dir;        // scratch dir; empty -> mkdtemp under $TMPDIR
+    // Soft RAM budget in GiB. 0 = no budget. When set, the builder
+    // auto-picks bucket_log2 (more buckets -> smaller per-bucket data
+    // structures) and streams the encoded color bit_vector to a
+    // sidecar file when it would exceed a fraction of the budget.
+    // The peak RSS is reported at end-of-build; if it exceeded the
+    // budget, the report says so (the build is not killed -- the
+    // budget is a soft target, not a hard cap).
+    double max_ram_gb = 0.0;
     bool verbose = false;
 };
 
