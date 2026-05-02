@@ -15,7 +15,7 @@ namespace cdgb {
 
 // Iterates sequences in a FASTA / FASTQ / .gz file. Owns the gzFile handle.
 struct seq_reader {
-    seq_reader(const std::string& path) {
+    seq_reader(std::string const& path) {
         m_fp = gzopen(path.c_str(), "r");
         if (!m_fp) throw std::runtime_error("could not open input file: " + path);
         m_seq = kseq_init(m_fp);
@@ -26,12 +26,12 @@ struct seq_reader {
         if (m_fp) gzclose(m_fp);
     }
 
-    seq_reader(const seq_reader&) = delete;
-    seq_reader& operator=(const seq_reader&) = delete;
+    seq_reader(seq_reader const&) = delete;
+    seq_reader& operator=(seq_reader const&) = delete;
 
     // Returns true and fills out_seq + out_len on success; false on EOF.
     // Pointer is owned by the reader and invalidated by the next call.
-    bool next(const char*& out_seq, size_t& out_len) {
+    bool next(char const*& out_seq, size_t& out_len) {
         int r = kseq_read(m_seq);
         if (r < 0) return false;
         out_seq = m_seq->seq.s;

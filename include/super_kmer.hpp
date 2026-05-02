@@ -40,7 +40,7 @@ namespace cdgb {
 // Append `n` 2-bit-encoded bases from `src` (each entry in [0,3]) to `dst`.
 // Bases are packed into bytes with base i occupying bits (2*(i%4)..2*(i%4)+1)
 // of byte (i/4).
-inline void pack_2bit(const uint8_t* src, size_t n, std::vector<uint8_t>& dst) {
+inline void pack_2bit(uint8_t const* src, size_t n, std::vector<uint8_t>& dst) {
     size_t bytes_needed = (n + 3) / 4;
     size_t off = dst.size();
     dst.resize(off + bytes_needed, 0);
@@ -51,7 +51,7 @@ inline void pack_2bit(const uint8_t* src, size_t n, std::vector<uint8_t>& dst) {
 
 // Unpack `n` bases from `src` (starting at base index 0 in src's first byte)
 // into `dst` (cleared and resized to n).
-inline void unpack_2bit(const uint8_t* src, size_t n, std::vector<uint8_t>& dst) {
+inline void unpack_2bit(uint8_t const* src, size_t n, std::vector<uint8_t>& dst) {
     dst.assign(n, 0);
     for (size_t i = 0; i < n; ++i) { dst[i] = (src[i >> 2] >> (2 * (i & 3))) & 3u; }
 }
@@ -67,7 +67,7 @@ inline void varint_write(uint64_t v, std::vector<uint8_t>& out) {
 }
 
 // Read a varint starting at out[pos], advancing pos. Returns 0 on overflow.
-inline uint64_t varint_read(const uint8_t* buf, size_t buf_len, size_t& pos) {
+inline uint64_t varint_read(uint8_t const* buf, size_t buf_len, size_t& pos) {
     uint64_t v = 0;
     unsigned shift = 0;
     while (pos < buf_len) {
@@ -87,8 +87,8 @@ inline constexpr uint8_t SK_FLAG_IS_ACGT_END = 1u << 1;
 
 // Serialize a compacted super-k-mer record (one or more colors) into `out`.
 // `colors` must be sorted ascending and contain no duplicates.
-inline void write_super_kmer(uint8_t flags, const uint32_t* colors, uint32_t num_colors,
-                             const uint8_t* bases, uint32_t len, std::vector<uint8_t>& out) {
+inline void write_super_kmer(uint8_t flags, uint32_t const* colors, uint32_t num_colors,
+                             uint8_t const* bases, uint32_t len, std::vector<uint8_t>& out) {
     varint_write(num_colors, out);
     uint32_t prev = 0;
     for (uint32_t i = 0; i < num_colors; ++i) {
@@ -102,7 +102,7 @@ inline void write_super_kmer(uint8_t flags, const uint32_t* colors, uint32_t num
 
 // Returns the byte length consumed; sets out_flags, out_colors and copies
 // bases into out_bases. Returns 0 on malformed/EOF.
-inline size_t read_super_kmer(const uint8_t* buf, size_t buf_len, uint8_t& out_flags,
+inline size_t read_super_kmer(uint8_t const* buf, size_t buf_len, uint8_t& out_flags,
                               std::vector<uint32_t>& out_colors, std::vector<uint8_t>& out_bases) {
     if (buf_len < 1) return 0;
     size_t p = 0;

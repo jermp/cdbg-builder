@@ -58,10 +58,10 @@ public:
 
     ~bucket_compactor() { close(); }
 
-    bucket_compactor(const bucket_compactor&) = delete;
-    bucket_compactor& operator=(const bucket_compactor&) = delete;
+    bucket_compactor(bucket_compactor const&) = delete;
+    bucket_compactor& operator=(bucket_compactor const&) = delete;
 
-    const std::string& path() const { return m_path; }
+    std::string const& path() const { return m_path; }
     uint64_t total_uncompressed_bytes() const {
         return m_total_uncompressed.load(std::memory_order_relaxed);
     }
@@ -77,16 +77,16 @@ public:
         uint8_t flags;
     };
 
-    void insert_batch(const std::vector<pending_record>& recs,
-                      const std::vector<uint8_t>& bases_storage) {
+    void insert_batch(std::vector<pending_record> const& recs,
+                      std::vector<uint8_t> const& bases_storage) {
         if (recs.empty()) return;
         auto& prof = bucket_prof();
         auto t_lock = bucket_write_prof::clock::now();
         std::lock_guard<std::mutex> lk(m_mu);
         prof.ns_lock_wait.fetch_add(bucket_write_prof::since(t_lock), std::memory_order_relaxed);
         auto t_map = bucket_write_prof::clock::now();
-        for (const auto& r : recs) {
-            std::string_view key((const char*)bases_storage.data() + r.bases_off, r.bases_len);
+        for (auto const& r : recs) {
+            std::string_view key((char const*)bases_storage.data() + r.bases_off, r.bases_len);
             // Transparent find avoids allocating a std::string on the hot
             // (already-seen) path. The std::string is constructed only on
             // a miss, when we actually have to insert into the map.
@@ -143,7 +143,7 @@ private:
         rec_buf.reserve(256);
         uint64_t spilled = 0;
         for (auto& kv : m_dedup) {
-            const std::string& key = kv.first;
+            std::string const& key = kv.first;
             entry& e = kv.second;
             // Sort+unique once per spill; the insert-time path is just
             // push_back, so duplicates are common when the same color
@@ -152,7 +152,7 @@ private:
             e.colors.erase(std::unique(e.colors.begin(), e.colors.end()), e.colors.end());
             rec_buf.clear();
             write_super_kmer(e.flags, e.colors.data(), (uint32_t)e.colors.size(),
-                             (const uint8_t*)key.data(), (uint32_t)key.size(), rec_buf);
+                             (uint8_t const*)key.data(), (uint32_t)key.size(), rec_buf);
             int n = gzwrite(m_file, rec_buf.data(), (unsigned)rec_buf.size());
             if (n <= 0 || (size_t)n != rec_buf.size())
                 throw std::runtime_error("short write to " + m_path);
@@ -192,7 +192,7 @@ private:
 
 class bucket_writer {
 public:
-    bucket_writer(const std::string& dir, uint32_t num_buckets, size_t flush_bases = 64 * 1024,
+    bucket_writer(std::string const& dir, uint32_t num_buckets, size_t flush_bases = 64 * 1024,
                   size_t spill_bytes = DEFAULT_COMPACTOR_SPILL_BYTES)
         : m_dir(dir), m_num_buckets(num_buckets), m_flush_bases(flush_bases) {
         std::filesystem::create_directories(m_dir);
@@ -205,8 +205,8 @@ public:
 
     ~bucket_writer() { close(); }
 
-    bucket_writer(const bucket_writer&) = delete;
-    bucket_writer& operator=(const bucket_writer&) = delete;
+    bucket_writer(bucket_writer const&) = delete;
+    bucket_writer& operator=(bucket_writer const&) = delete;
 
     uint32_t num_buckets() const { return m_num_buckets; }
     // Per-thread, per-bucket buffer threshold in *bases* (2-bit values).
@@ -275,7 +275,7 @@ struct per_thread_bucket_buffers {
     explicit per_thread_bucket_buffers(bucket_writer& w)
         : recs(w.num_buckets()), bases(w.num_buckets()), sink(&w) {}
 
-    void append(uint32_t b, uint8_t flags, uint32_t color, const uint8_t* sk_bases, uint32_t len) {
+    void append(uint32_t b, uint8_t flags, uint32_t color, uint8_t const* sk_bases, uint32_t len) {
         auto& bbuf = bases[b];
         uint32_t off = (uint32_t)bbuf.size();
         bbuf.insert(bbuf.end(), sk_bases, sk_bases + len);
@@ -294,7 +294,7 @@ struct per_thread_bucket_buffers {
 
 class bucket_reader {
 public:
-    explicit bucket_reader(const std::string& path) {
+    explicit bucket_reader(std::string const& path) {
         gzFile f = gzopen(path.c_str(), "rb");
         if (!f) throw std::runtime_error("cannot open " + path + ": " + std::strerror(errno));
         gzbuffer(f, 256 * 1024);

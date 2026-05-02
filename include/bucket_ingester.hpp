@@ -32,7 +32,7 @@ namespace detail {
 // Emit super-k-mers for a single ACGT-only run of length L (>= k).
 // `bases` holds 2-bit-encoded bases. Records are appended via `sink` to the
 // appropriate bucket files.
-inline void emit_super_kmers(const uint8_t* bases, uint32_t L, uint32_t k, uint32_t m,
+inline void emit_super_kmers(uint8_t const* bases, uint32_t L, uint32_t k, uint32_t m,
                              uint32_t color, uint32_t bucket_log2,
                              per_thread_bucket_buffers& sink) {
     if (L < k) return;
@@ -94,12 +94,12 @@ inline void emit_super_kmers(const uint8_t* bases, uint32_t L, uint32_t k, uint3
     emit_super(super_start, K - 1, cur_bucket, is_first_super, /*is_run_end=*/true);
 }
 
-inline void ingest_file_bucketed(const std::string& path, uint32_t k, uint32_t m,
+inline void ingest_file_bucketed(std::string const& path, uint32_t k, uint32_t m,
                                  uint32_t bucket_log2, uint32_t color,
                                  per_thread_bucket_buffers& sink) {
     auto& prof = bucket_prof();
     seq_reader r(path);
-    const char* s = nullptr;
+    char const* s = nullptr;
     size_t l = 0;
     std::vector<uint8_t> bases_buf;
     for (;;) {
@@ -132,7 +132,7 @@ inline void ingest_file_bucketed(const std::string& path, uint32_t k, uint32_t m
 
 // Parallel driver. Spawns `num_threads` workers, each pulling files from a
 // shared queue. `done` (if non-null) is incremented after each file finishes.
-inline void ingest_bucketed(const std::vector<std::string>& files, uint32_t k, uint32_t m,
+inline void ingest_bucketed(std::vector<std::string> const& files, uint32_t k, uint32_t m,
                             uint32_t bucket_log2, bucket_writer& writer, uint32_t num_threads,
                             std::atomic<uint64_t>* done = nullptr) {
     if (num_threads == 0) num_threads = 1;

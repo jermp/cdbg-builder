@@ -39,7 +39,7 @@ inline uint64_t comp_seed(uint8_t b) { return NT_SEED[b ^ 3u]; }
 // Initialize fwd/rc ntHash for the m-mer at `s[0..m]`. Returns false if any
 // base is non-ACGT (in which case fwd/rc are not set). rc-hash of `s[0..m]`
 // is defined as the fwd ntHash of revcomp(s[0..m]).
-inline bool nthash_init(const uint8_t* s, uint32_t m, uint64_t& fwd, uint64_t& rc) {
+inline bool nthash_init(uint8_t const* s, uint32_t m, uint64_t& fwd, uint64_t& rc) {
     uint64_t f = 0, r = 0;
     for (uint32_t i = 0; i < m; ++i) {
         uint8_t b = s[i];
