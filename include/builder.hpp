@@ -141,6 +141,14 @@ struct builder {
 
         cleanup_tmp_dir(tmp_dir);
 
+        // Peak resident set size across the whole build, as tracked by
+        // the kernel (VmHWM in /proc/self/status). One read at the end;
+        // zero hot-path cost.
+        m_peak_rss_bytes = process_peak_rss_bytes();
+        if (m_peak_rss_bytes) {
+            std::cout << "[peak resident memory] " << format_bytes(m_peak_rss_bytes) << "\n";
+        }
+
         std::cout << "done. wrote " << m_cfg.out_basename << ".fa and " << m_cfg.out_basename
                   << ".colors\n";
         print_total();
@@ -150,6 +158,7 @@ struct builder {
     uint32_t num_colors() const { return m_num_colors; }
     uint64_t num_unitigs() const { return m_num_unitigs; }
     uint64_t num_color_classes() const { return m_num_color_classes; }
+    uint64_t peak_rss_bytes() const { return m_peak_rss_bytes; }
     build_config const& config() const { return m_cfg; }
 
 private:
@@ -281,6 +290,7 @@ private:
     uint32_t m_num_colors = 0;
     uint64_t m_num_unitigs = 0;
     uint64_t m_num_color_classes = 0;
+    uint64_t m_peak_rss_bytes = 0;
 };
 
 }  // namespace cdgb

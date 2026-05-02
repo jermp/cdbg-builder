@@ -8,8 +8,11 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <fstream>
 #include <iostream>
 #include <string>
+#include <sys/resource.h>
 #include <thread>
 #include <unistd.h>
 
@@ -48,6 +51,44 @@ private:
     char const* m_label;
     std::chrono::steady_clock::time_point m_t0;
 };
+
+// ---- process-memory query ---------------------------------------------------
+//
+// Peak resident set size in bytes via getrusage(RUSAGE_SELF) — POSIX,
+// portable across Linux / macOS / BSD. The kernel maintains the peak
+// continuously, so a single read at end of build() gives a true
+// high-water mark with zero hot-path overhead.
+//
+// Unit gotcha: Linux's man page says ru_maxrss is in KiB; Darwin
+// returns bytes. The #ifdef below normalises to bytes on both.
+
+inline uint64_t process_peak_rss_bytes() {
+    struct rusage ru;
+    if (::getrusage(RUSAGE_SELF, &ru) != 0) return 0;
+#ifdef __APPLE__
+    return (uint64_t)ru.ru_maxrss;
+#else
+    return (uint64_t)ru.ru_maxrss * 1024ULL;
+#endif
+}
+
+// Pretty-printer: 3.42 GiB / 728 MiB / 12 KiB, picking the largest
+// unit at which the number is >= 1.
+inline std::string format_bytes(uint64_t b) {
+    static char const* units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+    double v = (double)b;
+    int u = 0;
+    while (v >= 1024.0 && u + 1 < (int)(sizeof(units) / sizeof(units[0]))) {
+        v /= 1024.0;
+        ++u;
+    }
+    char buf[64];
+    if (u == 0)
+        std::snprintf(buf, sizeof(buf), "%llu B", (unsigned long long)b);
+    else
+        std::snprintf(buf, sizeof(buf), "%.2f %s", v, units[u]);
+    return buf;
+}
 
 // ---- progress reporter ------------------------------------------------------
 
