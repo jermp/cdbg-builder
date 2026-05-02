@@ -30,6 +30,7 @@
 #include "bucket_io.hpp"
 #include "color_set_dict.hpp"
 #include "kmer.hpp"
+#include "streaming_color_set_dict.hpp"
 #include "super_kmer.hpp"
 
 namespace cdgb {
@@ -331,17 +332,22 @@ inline void process_bucket(std::string const& path, uint32_t k,
 
 // Parallel driver. Each worker processes one bucket at a time. After
 // each bucket the worker takes `global_mu` and merges that bucket's
-// local color_set_dict into the shared `global_dict`, building a
-// local->global cid table and remapping the bucket's unitigs in-place.
+// local color_set_dict into the shared streaming `global_dict`, building
+// a local->global cid table and remapping the bucket's unitigs in-place.
 // This folds what used to be a separate single-threaded "intern color
-// sets" pass over every emitted unitig (O(num_unitigs) ~6M)
-// into the parallel bucket-process phase, paying it on the
+// sets" pass over every emitted unitig (O(num_unitigs) ~6M) into the
+// parallel bucket-process phase, paying it on the
 // O(unique-color-sets-per-bucket) ~few thousand granularity instead.
+//
+// The streaming dict encodes each new color set into its bit_vector
+// builder *during* intern() rather than holding the uncompressed
+// vector; this keeps peak RAM proportional to the *compressed*
+// .colors output rather than to the sum of class sizes.
 //
 // `out_mu` still serializes the final append into the shared `out`.
 inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t num_threads,
                             std::vector<stitchable_unitig>& out, std::mutex& out_mu,
-                            color_set_dict& global_dict, std::mutex& global_mu,
+                            streaming_color_set_dict& global_dict, std::mutex& global_mu,
                             std::atomic<uint64_t>* done = nullptr) {
     if (num_threads == 0) num_threads = 1;
     const uint32_t B = writer.num_buckets();

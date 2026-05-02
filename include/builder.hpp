@@ -55,6 +55,7 @@
 #include "hybrid_color_sets.hpp"
 #include "minimizer.hpp"
 #include "stitch.hpp"
+#include "streaming_color_set_dict.hpp"
 #include "util.hpp"
 
 namespace cdgb {
@@ -110,7 +111,13 @@ struct builder {
         // exit this block, every fragment already carries a global cid.
         std::vector<stitchable_unitig> frag_unitigs;
         std::mutex out_mu;
-        color_set_dict global_dict;
+        // Streaming dict: encodes each new color set into its bvb at
+        // intern() time, holding only metadata (32 B/class) plus the
+        // compressed bits. Compared to the previous in-RAM-vectors
+        // dict, this caps peak RAM during the dominant bucket-process
+        // phase by the *compressed* color-set size, not the sum of
+        // class sizes.
+        streaming_color_set_dict global_dict(m_num_colors);
         std::mutex global_mu;
         {
             timer _("bucket-process");
@@ -277,12 +284,15 @@ private:
         std::fclose(fa);
     }
 
-    void emit_colors(color_set_dict const& global_dict) const {
+    void emit_colors(streaming_color_set_dict& global_dict) const {
         timer _("emit colors");
-        hybrid_builder hb(m_num_colors);
-        hb.encode_parallel(global_dict, m_cfg.num_threads);
+        // Encoding already happened during bucket-process via
+        // global_dict.intern(); finalize() just builds the hybrid
+        // wrapper (moves the bit_vector out of the bvb, builds an
+        // elias_fano of the per-class bit_offsets) so we can
+        // essentials::save it.
         hybrid h;
-        hb.build(h);
+        global_dict.finalize(h);
         essentials::save(h, (m_cfg.out_basename + ".colors").c_str());
     }
 
