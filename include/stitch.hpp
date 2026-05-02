@@ -59,13 +59,13 @@ namespace cdgb {
 
 namespace detail {
 
-inline kmer_int_t encode_kminus1(const char* s, uint32_t n) {
+inline kmer_int_t encode_kminus1(char const* s, uint32_t n) {
     kmer_int_t x = 0;
     for (uint32_t i = 0; i < n; ++i) { x = (x << 2) | (kmer_int_t)nuc_to_2bit(s[i]); }
     return x;
 }
 
-inline std::string revcomp_string(const std::string& s) {
+inline std::string revcomp_string(std::string const& s) {
     std::string out(s.size(), 'N');
     for (size_t i = 0; i < s.size(); ++i) {
         char c = s[s.size() - 1 - i];
@@ -112,9 +112,9 @@ struct junction_ends {
     uint8_t count = 0;  // 0, 1, 2, or 3 (overflow: more than 2 ends)
 };
 
-inline kmer_int_t side_junction_canonical(const stitchable_unitig& u, uint32_t k, uint8_t side,
+inline kmer_int_t side_junction_canonical(stitchable_unitig const& u, uint32_t k, uint8_t side,
                                           bool& is_canonical_fwd) {
-    const char* p = (side == SIDE_LEFT) ? u.seq.data() : u.seq.data() + (u.seq.size() - (k - 1));
+    char const* p = (side == SIDE_LEFT) ? u.seq.data() : u.seq.data() + (u.seq.size() - (k - 1));
     kmer_int_t fwd = encode_kminus1(p, k - 1);
     kmer_int_t rc = reverse_complement(fwd, k - 1);
     if (fwd <= rc) {
@@ -162,7 +162,7 @@ inline void stitch_unitigs(std::vector<stitchable_unitig>& frag, uint32_t k,
         if (je.count < 3) ++je.count;
     };
     for (uint32_t i = 0; i < frag.size(); ++i) {
-        const auto& u = frag[i];
+        auto const& u = frag[i];
         if (u.seq.size() < k) continue;
         if (u.open_flags & UNITIG_OPEN_LEFT) {
             bool is_fwd;
@@ -181,7 +181,7 @@ inline void stitch_unitigs(std::vector<stitchable_unitig>& frag, uint32_t k,
     std::cerr << "[stitch] building adjacency over " << by_junction.size() << " junctions...\n";
     std::vector<std::array<link, 2>> adj(frag.size());
 
-    auto pair_compatible = [](const end_ref& a, const end_ref& b) {
+    auto pair_compatible = [](end_ref const& a, end_ref const& b) {
         // (R,L) or (L,R) with same is_canonical_fwd, OR same side with
         // different is_canonical_fwd.
         if (a.side != b.side) return a.is_canonical_fwd == b.is_canonical_fwd;
@@ -189,10 +189,10 @@ inline void stitch_unitigs(std::vector<stitchable_unitig>& frag, uint32_t k,
     };
 
     for (auto& kv : by_junction) {
-        const auto& je = kv.second;
+        auto const& je = kv.second;
         if (je.count != 2) continue;  // skip empty / singleton / overflow
-        const end_ref& e1 = je.a;
-        const end_ref& e2 = je.b;
+        end_ref const& e1 = je.a;
+        end_ref const& e2 = je.b;
         // O(1) color-class comparison (cid was assigned by main before stitch).
         if (frag[e1.unitig_idx].cid != frag[e2.unitig_idx].cid) continue;
         if (!pair_compatible(e1, e2)) continue;
@@ -236,7 +236,7 @@ inline void stitch_unitigs(std::vector<stitchable_unitig>& frag, uint32_t k,
         for (;;) {
             // The own-frame side of cur exposed at merged-RIGHT.
             uint8_t exit_side_own = f_cur ? SIDE_LEFT : SIDE_RIGHT;
-            const link& lnk = adj[cur][exit_side_own];
+            link const& lnk = adj[cur][exit_side_own];
             if (lnk.other == UINT32_MAX) {
                 if (open_at_side(cur, exit_side_own)) merged.open_flags |= UNITIG_OPEN_RIGHT;
                 break;

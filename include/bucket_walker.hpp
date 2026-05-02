@@ -81,7 +81,7 @@ struct bucket_kmer_info {
 using bucket_kmer_map = ankerl::unordered_dense::map<kmer_int_t, bucket_kmer_info, kmer_hasher>;
 
 // Build the per-canonical-k-mer info from a bucket's super-k-mer stream.
-inline void load_bucket(const std::string& path, uint32_t k, bucket_kmer_map& out) {
+inline void load_bucket(std::string const& path, uint32_t k, bucket_kmer_map& out) {
     bucket_reader reader(path);
     uint8_t flags = 0;
     std::vector<uint32_t> colors;
@@ -141,7 +141,7 @@ inline void load_bucket(const std::string& path, uint32_t k, bucket_kmer_map& ou
 
 // 8-bit local extension mask, bits 0..3 = forward-side successors of `can`,
 // bits 4..7 = back-side predecessors (= forward-side successors of rc(can)).
-inline uint8_t local_ext_mask(kmer_int_t can, uint32_t k, const bucket_kmer_map& m) {
+inline uint8_t local_ext_mask(kmer_int_t can, uint32_t k, bucket_kmer_map const& m) {
     uint8_t out = 0;
     kmer_int_t fwd = can;
     kmer_int_t rev = reverse_complement(can, k);
@@ -196,8 +196,8 @@ struct left_end_check {
     bool back_is_phantom_only;  // true => unitig will be open-left
 };
 inline left_end_check classify_left_end(
-    kmer_int_t can, bool rc, uint32_t cid, uint32_t k, const bucket_kmer_map& m,
-    const ankerl::unordered_dense::map<kmer_int_t, uint32_t, kmer_hasher>& cid_of) {
+    kmer_int_t can, bool rc, uint32_t cid, uint32_t k, bucket_kmer_map const& m,
+    ankerl::unordered_dense::map<kmer_int_t, uint32_t, kmer_hasher> const& cid_of) {
     auto it = m.find(can);
     uint8_t phantom = it->second.phantom;
     uint8_t mask = local_ext_mask(can, k, m);
@@ -228,7 +228,7 @@ inline left_end_check classify_left_end(
     return {false, false};
 }
 
-inline void process_bucket(const std::string& path, uint32_t k,
+inline void process_bucket(std::string const& path, uint32_t k,
                            std::vector<stitchable_unitig>& out_local,
                            color_set_dict& out_local_dict) {
     bucket_kmer_map kmer_info;
@@ -339,7 +339,7 @@ inline void process_bucket(const std::string& path, uint32_t k,
 // O(unique-color-sets-per-bucket) ~few thousand granularity instead.
 //
 // `out_mu` still serializes the final append into the shared `out`.
-inline void process_buckets(const bucket_writer& writer, uint32_t k, uint32_t num_threads,
+inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t num_threads,
                             std::vector<stitchable_unitig>& out, std::mutex& out_mu,
                             color_set_dict& global_dict, std::mutex& global_mu,
                             std::atomic<uint64_t>* done = nullptr) {

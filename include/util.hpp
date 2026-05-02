@@ -56,8 +56,8 @@ public:
 
     ~progress() { stop(); }
 
-    progress(const progress&) = delete;
-    progress& operator=(const progress&) = delete;
+    progress(progress const&) = delete;
+    progress& operator=(progress const&) = delete;
 
     void stop() {
         bool was = m_stopped.exchange(true);
@@ -161,11 +161,11 @@ struct bucket_write_prof {
     }
 
     void print(uint32_t num_threads) const {
-        auto load = [](const std::atomic<uint64_t>& a) {
+        auto load = [](std::atomic<uint64_t> const& a) {
             return a.load(std::memory_order_relaxed);
         };
         double per_thread = num_threads > 0 ? (double)num_threads : 1.0;
-        auto s = [&](const std::atomic<uint64_t>& a) { return (double)load(a) / 1e9 / per_thread; };
+        auto s = [&](std::atomic<uint64_t> const& a) { return (double)load(a) / 1e9 / per_thread; };
         uint64_t loop_body = load(ns_loop_body);
         uint64_t flush = load(ns_flush);
         double s_compute =

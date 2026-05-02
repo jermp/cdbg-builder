@@ -19,10 +19,10 @@ struct color_set_dict {
     struct hash {
         // FNV-1a output is high-quality enough; skip ankerl's extra mix.
         using is_avalanching = void;
-        size_t operator()(const std::vector<uint32_t>& v) const noexcept {
+        size_t operator()(std::vector<uint32_t> const& v) const noexcept {
             // FNV-1a over the bytes, fast and decent for small vectors.
             uint64_t h = 1469598103934665603ULL;
-            const unsigned char* p = (const unsigned char*)v.data();
+            unsigned char const* p = (unsigned char const*)v.data();
             size_t n = v.size() * sizeof(uint32_t);
             for (size_t i = 0; i < n; ++i) {
                 h ^= p[i];
@@ -42,8 +42,8 @@ struct color_set_dict {
     }
 
     uint32_t size() const { return (uint32_t)m_classes.size(); }
-    const std::vector<uint32_t>& at(uint32_t id) const { return m_classes[id]; }
-    const std::vector<std::vector<uint32_t>>& classes() const { return m_classes; }
+    std::vector<uint32_t> const& at(uint32_t id) const { return m_classes[id]; }
+    std::vector<std::vector<uint32_t>> const& classes() const { return m_classes; }
 
     // Move-out of the i-th color list; the dict entry is left empty.
     // Used by the per-bucket merge in process_buckets to avoid copying

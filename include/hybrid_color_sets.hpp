@@ -104,7 +104,7 @@ struct hybrid_builder {
     //
     // Caller can still alternate this with sequential encode_color_set
     // calls if needed -- merge_part is the same primitive used here.
-    void encode_parallel(const color_set_dict& dict, uint32_t num_threads) {
+    void encode_parallel(color_set_dict const& dict, uint32_t num_threads) {
         if (num_threads == 0) num_threads = 1;
         const size_t num_classes = dict.size();
         if (num_classes == 0) return;
@@ -129,7 +129,7 @@ struct hybrid_builder {
                 size_t lo = (size_t)t * num_classes / num_threads;
                 size_t hi = (size_t)(t + 1) * num_classes / num_threads;
                 for (size_t cid = lo; cid < hi; ++cid) {
-                    const auto& cs = dict.at((uint32_t)cid);
+                    auto const& cs = dict.at((uint32_t)cid);
                     encode_one(p.bvb, cs.data(), cs.size(), num_colors, sparse_thresh,
                                dense_thresh);
                     p.offsets.push_back(p.bvb.num_bits());
@@ -201,7 +201,7 @@ struct hybrid_builder {
     // back = part_bvb.num_bits(); one entry per encoded set + the
     // sentinel. Used by the parallel emit-colors path to merge per-thread
     // partials into a single hybrid_builder before build().
-    void merge_part(bits::bit_vector::builder& part_bvb, const std::vector<uint64_t>& part_offsets,
+    void merge_part(bits::bit_vector::builder& part_bvb, std::vector<uint64_t> const& part_offsets,
                     uint64_t part_num_integers) {
         if (part_offsets.empty()) return;
         uint64_t base = m_bvb.num_bits();

@@ -32,7 +32,7 @@
 namespace {
 class timer {
 public:
-    timer(const char* label) : m_label(label), m_t0(std::chrono::steady_clock::now()) {}
+    timer(char const* label) : m_label(label), m_t0(std::chrono::steady_clock::now()) {}
     ~timer() {
         auto t1 = std::chrono::steady_clock::now();
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - m_t0).count();
@@ -40,7 +40,7 @@ public:
     }
 
 private:
-    const char* m_label;
+    char const* m_label;
     std::chrono::steady_clock::time_point m_t0;
 };
 
@@ -78,7 +78,7 @@ bool parse_args(int argc, char** argv, cdgb::build_config& cfg) {
     return true;
 }
 
-std::vector<std::string> read_filenames(const std::string& path) {
+std::vector<std::string> read_filenames(std::string const& path) {
     std::ifstream in(path);
     if (!in) throw std::runtime_error("cannot open filenames list: " + path);
     std::vector<std::string> v;
@@ -241,7 +241,7 @@ int main(int argc, char** argv) {
             };
             for (uint32_t cid = 0; cid < global_dict.size(); ++cid) {
                 for (size_t idx : by_class[cid]) {
-                    const std::string& seq = all_unitigs[idx].seq;
+                    std::string const& seq = all_unitigs[idx].seq;
                     // Header: '>' + decimal cid + '\n' is at most 12 chars
                     // for any uint32_t. The sequence write below handles
                     // arbitrary lengths via chunking.

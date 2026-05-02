@@ -87,7 +87,7 @@ inline std::string kmer_to_string(kmer_int_t x, uint32_t k) {
     return s;
 }
 
-inline bool string_to_kmer(const char* s, uint32_t k, kmer_int_t& out) {
+inline bool string_to_kmer(char const* s, uint32_t k, kmer_int_t& out) {
     kmer_int_t x = 0;
     for (uint32_t i = 0; i < k; ++i) {
         uint8_t v = nuc_to_2bit(s[i]);
