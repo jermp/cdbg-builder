@@ -36,7 +36,10 @@
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
 #include <vector>
+
+#include "color_set_dict.hpp"
 
 namespace cdgb {
 
@@ -90,10 +93,60 @@ struct hybrid_builder {
         ++m_num_color_sets;
     }
 
+    // Encode every color set in `dict` into this builder using up to
+    // `num_threads` worker threads. Each worker takes a contiguous range
+    // of class ids, encodes its range into a private bit_vector::builder
+    // + relative-offsets array, then a single-thread sequential merge
+    // appends the partials into this builder's m_bvb / m_offsets. The
+    // encode is the heavy work (write_delta over the union of all color
+    // sets); the merge is just one bit_vector::append per partial plus a
+    // base-offset translation, and runs in negligible time.
+    //
+    // Caller can still alternate this with sequential encode_color_set
+    // calls if needed -- merge_part is the same primitive used here.
+    void encode_parallel(const color_set_dict& dict, uint32_t num_threads) {
+        if (num_threads == 0) num_threads = 1;
+        const size_t num_classes = dict.size();
+        if (num_classes == 0) return;
+
+        struct part {
+            bits::bit_vector::builder bvb;
+            std::vector<uint64_t> offsets;
+            uint64_t total_ints = 0;
+        };
+        std::vector<part> parts(num_threads);
+
+        const uint64_t num_colors = m_num_colors;
+        const uint64_t sparse_thresh = m_sparse_set_threshold_size;
+        const uint64_t dense_thresh = m_very_dense_set_threshold_size;
+
+        std::vector<std::thread> workers;
+        workers.reserve(num_threads);
+        for (uint32_t t = 0; t < num_threads; ++t) {
+            workers.emplace_back([&, t] {
+                auto& p = parts[t];
+                p.offsets.push_back(0);
+                size_t lo = (size_t)t * num_classes / num_threads;
+                size_t hi = (size_t)(t + 1) * num_classes / num_threads;
+                for (size_t cid = lo; cid < hi; ++cid) {
+                    const auto& cs = dict.at((uint32_t)cid);
+                    encode_one(p.bvb, cs.data(), cs.size(), num_colors, sparse_thresh,
+                               dense_thresh);
+                    p.offsets.push_back(p.bvb.num_bits());
+                    p.total_ints += cs.size();
+                }
+            });
+        }
+        for (auto& w : workers) w.join();
+        for (auto& p : parts) merge_part(p.bvb, p.offsets, p.total_ints);
+    }
+
     // Pure encoder: appends one color set's bits to `out_bvb` using the
     // same sparse / dense / complementary-dense rules as encode_color_set.
     // No shared state; safe to call from many threads each with its own
-    // bit_vector::builder. Used by main's parallel emit-colors path.
+    // bit_vector::builder. The thresholds are passed in (vs. read from a
+    // member) so this can be called without a builder instance, e.g. from
+    // the parallel encoders inside encode_parallel.
     static void encode_one(bits::bit_vector::builder& out_bvb, uint32_t const* color_set,
                            uint64_t size, uint64_t num_colors, uint64_t sparse_threshold,
                            uint64_t dense_threshold) {
