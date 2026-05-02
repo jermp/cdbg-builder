@@ -83,21 +83,37 @@ struct hybrid_builder {
     }
 
     void encode_color_set(uint32_t const* color_set, const uint64_t size) {
-        bits::util::write_delta(m_bvb, size);  // size first
-        if (size < m_sparse_set_threshold_size) {
+        encode_one(m_bvb, color_set, size, m_num_colors, m_sparse_set_threshold_size,
+                   m_very_dense_set_threshold_size);
+        m_offsets.push_back(m_bvb.num_bits());
+        m_num_total_integers += size;
+        ++m_num_color_sets;
+    }
+
+    // Pure encoder: appends one color set's bits to `out_bvb` using the
+    // same sparse / dense / complementary-dense rules as encode_color_set.
+    // No shared state; safe to call from many threads each with its own
+    // bit_vector::builder. Used by main's parallel emit-colors path.
+    static void encode_one(bits::bit_vector::builder& out_bvb,
+                           uint32_t const* color_set, uint64_t size,
+                           uint64_t num_colors,
+                           uint64_t sparse_threshold,
+                           uint64_t dense_threshold) {
+        bits::util::write_delta(out_bvb, size);
+        if (size < sparse_threshold) {
             uint32_t prev = color_set[0];
-            bits::util::write_delta(m_bvb, prev);
+            bits::util::write_delta(out_bvb, prev);
             for (uint64_t i = 1; i < size; ++i) {
                 uint32_t v = color_set[i];
                 assert(v >= prev + 1);
-                bits::util::write_delta(m_bvb, v - (prev + 1));
+                bits::util::write_delta(out_bvb, v - (prev + 1));
                 prev = v;
             }
-        } else if (size < m_very_dense_set_threshold_size) {
+        } else if (size < dense_threshold) {
             bits::bit_vector::builder bvb;
-            bvb.resize(m_num_colors);
+            bvb.resize(num_colors);
             for (uint64_t i = 0; i < size; ++i) bvb.set(color_set[i]);
-            m_bvb.append(bvb);
+            out_bvb.append(bvb);
         } else {
             bool first = true;
             uint32_t val = 0;
@@ -107,10 +123,10 @@ struct hybrid_builder {
                 uint32_t x = color_set[i];
                 while (val < x) {
                     if (first) {
-                        bits::util::write_delta(m_bvb, val);
+                        bits::util::write_delta(out_bvb, val);
                         first = false;
                     } else {
-                        bits::util::write_delta(m_bvb, val - (prev + 1));
+                        bits::util::write_delta(out_bvb, val - (prev + 1));
                     }
                     prev = val;
                     ++val;
@@ -118,18 +134,34 @@ struct hybrid_builder {
                 }
                 ++val;
             }
-            while (val < m_num_colors) {
-                bits::util::write_delta(m_bvb, val - (prev + 1));
+            while (val < num_colors) {
+                bits::util::write_delta(out_bvb, val - (prev + 1));
                 prev = val;
                 ++val;
                 ++written;
             }
-            assert(written == m_num_colors - size);
+            assert(written == num_colors - size);
             (void)written;
         }
-        m_offsets.push_back(m_bvb.num_bits());
-        m_num_total_integers += size;
-        ++m_num_color_sets;
+    }
+
+    // Append one thread's worth of pre-encoded color sets into this
+    // builder. `part_offsets` must be relative bit positions: front = 0,
+    // back = part_bvb.num_bits(); one entry per encoded set + the
+    // sentinel. Used by the parallel emit-colors path to merge per-thread
+    // partials into a single hybrid_builder before build().
+    void merge_part(bits::bit_vector::builder& part_bvb,
+                    const std::vector<uint64_t>& part_offsets,
+                    uint64_t part_num_integers) {
+        if (part_offsets.empty()) return;
+        uint64_t base = m_bvb.num_bits();
+        m_bvb.append(part_bvb);
+        // Skip the leading 0; m_offsets already has its base entry.
+        for (size_t i = 1; i < part_offsets.size(); ++i) {
+            m_offsets.push_back(base + part_offsets[i]);
+        }
+        m_num_total_integers += part_num_integers;
+        m_num_color_sets += part_offsets.size() - 1;
     }
 
     void build(hybrid& h) {

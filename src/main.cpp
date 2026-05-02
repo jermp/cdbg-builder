@@ -270,11 +270,47 @@ int main(int argc, char** argv) {
 
         {
             timer _("emit colors");
-            cdgb::hybrid_builder hb((uint32_t)files.size());
-            for (uint32_t cid = 0; cid < global_dict.size(); ++cid) {
-                const auto& cs = global_dict.at(cid);
-                hb.encode_color_set(cs.data(), cs.size());
+            const uint32_t num_colors = (uint32_t)files.size();
+            const uint64_t sparse_thresh = (uint64_t)(0.25 * num_colors);
+            const uint64_t dense_thresh = (uint64_t)(0.75 * num_colors);
+            const size_t num_classes = global_dict.size();
+            const uint32_t T = cfg.num_threads == 0 ? 1 : cfg.num_threads;
+
+            // Each thread encodes a contiguous range of color classes
+            // into its own bit_vector::builder + relative-offset array,
+            // then we serially append the partials to a single
+            // hybrid_builder. The encode itself is the heavy work
+            // (write_delta over ~2.14B integers in total) and is
+            // perfectly parallelizable; the merge is just an append per
+            // partial plus a single offset translation.
+            struct part {
+                bits::bit_vector::builder bvb;
+                std::vector<uint64_t> offsets;
+                uint64_t total_ints = 0;
+            };
+            std::vector<part> parts(T);
+
+            std::vector<std::thread> workers;
+            workers.reserve(T);
+            for (uint32_t t = 0; t < T; ++t) {
+                workers.emplace_back([&, t] {
+                    auto& p = parts[t];
+                    p.offsets.push_back(0);
+                    size_t lo = (size_t)t * num_classes / T;
+                    size_t hi = (size_t)(t + 1) * num_classes / T;
+                    for (size_t cid = lo; cid < hi; ++cid) {
+                        const auto& cs = global_dict.at((uint32_t)cid);
+                        cdgb::hybrid_builder::encode_one(p.bvb, cs.data(), cs.size(), num_colors,
+                                                         sparse_thresh, dense_thresh);
+                        p.offsets.push_back(p.bvb.num_bits());
+                        p.total_ints += cs.size();
+                    }
+                });
             }
+            for (auto& w : workers) w.join();
+
+            cdgb::hybrid_builder hb(num_colors);
+            for (auto& p : parts) hb.merge_part(p.bvb, p.offsets, p.total_ints);
             cdgb::hybrid h;
             hb.build(h);
             essentials::save(h, (cfg.out_basename + ".colors").c_str());
