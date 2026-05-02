@@ -269,7 +269,7 @@ int main(int argc, char** argv) {
 
         {
             timer _("emit colors");
-            cdgb::hybrid_builder hb((uint32_t)files.size());
+            cdgb::hybrid_builder hb(files.size());
             hb.encode_parallel(global_dict, cfg.num_threads);
             cdgb::hybrid h;
             hb.build(h);
