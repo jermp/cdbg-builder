@@ -8,6 +8,8 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -48,6 +50,51 @@ private:
     char const* m_label;
     std::chrono::steady_clock::time_point m_t0;
 };
+
+// ---- process-memory query ---------------------------------------------------
+//
+// Read /proc/self/status to get peak / current resident set size in bytes.
+// Returns 0 on any I/O error (e.g. on a non-Linux host). The peak is
+// maintained by the kernel itself (VmHWM); reading it at end of build()
+// gives a true high-water mark across the run with zero hot-path
+// overhead.
+
+inline uint64_t proc_status_kb_(char const* prefix) {
+    std::ifstream st("/proc/self/status");
+    if (!st) return 0;
+    size_t plen = std::strlen(prefix);
+    std::string line;
+    while (std::getline(st, line)) {
+        if (line.size() < plen || line.compare(0, plen, prefix) != 0) continue;
+        size_t pos = line.find_first_of("0123456789", plen);
+        if (pos == std::string::npos) return 0;
+        try {
+            return std::stoull(line.substr(pos));
+        } catch (...) { return 0; }
+    }
+    return 0;
+}
+
+inline uint64_t process_peak_rss_bytes() { return proc_status_kb_("VmHWM:") * 1024ULL; }
+inline uint64_t process_current_rss_bytes() { return proc_status_kb_("VmRSS:") * 1024ULL; }
+
+// Pretty-printer: 3.42 GiB / 728 MiB / 12 KiB, picking the largest
+// unit at which the number is >= 1.
+inline std::string format_bytes(uint64_t b) {
+    static char const* units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+    double v = (double)b;
+    int u = 0;
+    while (v >= 1024.0 && u + 1 < (int)(sizeof(units) / sizeof(units[0]))) {
+        v /= 1024.0;
+        ++u;
+    }
+    char buf[64];
+    if (u == 0)
+        std::snprintf(buf, sizeof(buf), "%llu B", (unsigned long long)b);
+    else
+        std::snprintf(buf, sizeof(buf), "%.2f %s", v, units[u]);
+    return buf;
+}
 
 // ---- progress reporter ------------------------------------------------------
 
