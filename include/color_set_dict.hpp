@@ -27,8 +27,7 @@ namespace cdgb {
 // so even if the outer vector reallocates during push_back, the data
 // pointer of any inner vector stays put.
 struct color_set_dict {
-    color_set_dict()
-        : m_index(0, hasher{&m_classes}, key_eq{&m_classes}) {}
+    color_set_dict() : m_index(0, hasher{&m_classes}, key_eq{&m_classes}) {}
 
     color_set_dict(color_set_dict const&) = delete;
     color_set_dict& operator=(color_set_dict const&) = delete;
