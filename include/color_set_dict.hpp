@@ -45,6 +45,19 @@ struct color_set_dict {
         return id;
     }
 
+    // Const-ref overload: copies on insert, never on a hit. Useful when
+    // the caller wants to keep the source vector around (e.g. a per-bucket
+    // record-set arena that may be looked up many times after the first
+    // intern).
+    uint32_t intern(std::vector<uint32_t> const& key) {
+        auto it = m_index.find(key);
+        if (it != m_index.end()) return *it;
+        uint32_t id = (uint32_t)m_classes.size();
+        m_classes.push_back(key);
+        m_index.insert(id);
+        return id;
+    }
+
     uint32_t size() const { return (uint32_t)m_classes.size(); }
     std::vector<uint32_t> const& at(uint32_t id) const { return m_classes[id]; }
     std::vector<std::vector<uint32_t>> const& classes() const { return m_classes; }

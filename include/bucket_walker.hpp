@@ -35,21 +35,34 @@
 
 namespace cdgb {
 
-// Per-k-mer color accumulator. Colors are appended without inline dedup;
-// callers always finish with `to_sorted()` which sorts and uniques in one
-// pass. With many colors per popular k-mer (thousands of genomes) the
-// previous O(N) linear-scan dedup on each insert was the dominant cost
-// of bucket processing; deferring dedup to a single sort+unique brings
-// it down to O(N log N) per k-mer total.
+// Per-k-mer color accumulator. We don't store raw colors here. Instead,
+// each bucket maintains a `record_sets` color_set_dict that interns the
+// (already sorted+deduped) color list of every super-k-mer record read
+// from the bucket file. A k-mer entry holds only the *ids* of the records
+// that contributed to it.
+//
+// In practice almost every k-mer is contributed by a single record (the
+// super-k-mer it lives inside), so `first_rsid` covers the common case
+// and `rest` stays empty -- no heap allocation per k-mer. The exceptions
+// are (a) hot super-k-mers spilled multiple times during bucket-write,
+// which appear as several records sharing the same bases, and (b) k-mers
+// at super-k-mer boundaries within the same bucket. Both add only a few
+// extra rsids per affected k-mer.
+//
+// Memory win: where we used to store `records_per_kmer * colors_per_record
+// * 4 B` per k-mer (e.g. 18 KB for a popular k-mer in 4546 colors), we
+// now store ~4 B per k-mer plus one shared interned copy of each distinct
+// record-color list per bucket.
 struct kmer_entry {
-    std::vector<uint32_t> colors;
+    static constexpr uint32_t NO_RSID = UINT32_MAX;
+    uint32_t first_rsid = NO_RSID;
+    std::vector<uint32_t> rest;  // empty in the common case
 
-    void add_color(uint32_t c) { colors.push_back(c); }
-
-    std::vector<uint32_t> to_sorted() {
-        std::sort(colors.begin(), colors.end());
-        colors.erase(std::unique(colors.begin(), colors.end()), colors.end());
-        return std::move(colors);
+    void add(uint32_t rsid) {
+        if (first_rsid == NO_RSID)
+            first_rsid = rsid;
+        else
+            rest.push_back(rsid);
     }
 };
 
@@ -82,13 +95,24 @@ struct bucket_kmer_info {
 using bucket_kmer_map = ankerl::unordered_dense::map<kmer_int_t, bucket_kmer_info, kmer_hasher>;
 
 // Build the per-canonical-k-mer info from a bucket's super-k-mer stream.
-inline void load_bucket(std::string const& path, uint32_t k, bucket_kmer_map& out) {
+// Each record's color list is interned into `record_sets` once; the per
+// k-mer storage is just the rsid (or short list of rsids), not the colors
+// themselves. See the kmer_entry comment for the memory rationale.
+inline void load_bucket(std::string const& path, uint32_t k, bucket_kmer_map& out,
+                        color_set_dict& record_sets) {
     bucket_reader reader(path);
     uint8_t flags = 0;
     std::vector<uint32_t> colors;
     std::vector<uint8_t> bases;
     while (reader.next(flags, colors, bases)) {
         if (bases.size() < k) continue;
+
+        // Intern the record's already-sorted-deduped color list. Move
+        // into the dict on a miss; on a hit it's just a heterogeneous
+        // find, no copy. `colors` is repopulated by reader.next() on
+        // the next iteration via resize() + assignment, so a moved-from
+        // state is safe.
+        uint32_t rsid = record_sets.intern(std::move(colors));
 
         const kmer_int_t mask = kmer_mask(k);
         const uint32_t k_minus_1_x2 = 2 * (k - 1);
@@ -110,8 +134,7 @@ inline void load_bucket(std::string const& path, uint32_t k, bucket_kmer_map& ou
             rc = (rc >> 2) | ((kmer_int_t)(v ^ 3) << k_minus_1_x2);
             bool is_fwd = (fwd <= rc);
             kmer_int_t can = is_fwd ? fwd : rc;
-            auto& entry = out[can];
-            for (uint32_t c : colors) entry.colors.add_color(c);
+            out[can].colors.add(rsid);
             if (!have_first) {
                 first_can = can;
                 first_is_fwd = is_fwd;
@@ -233,18 +256,69 @@ inline void process_bucket(std::string const& path, uint32_t k,
                            std::vector<stitchable_unitig>& out_local,
                            color_set_dict& out_local_dict) {
     bucket_kmer_map kmer_info;
-    load_bucket(path, k, kmer_info);
-
-    // Build local color-set dict and a parallel map cid_of[can] for quick lookups.
     ankerl::unordered_dense::map<kmer_int_t, uint32_t, kmer_hasher> cid_of;
-    cid_of.reserve(kmer_info.size());
-    for (auto& kv : kmer_info) {
-        std::vector<uint32_t> sorted = kv.second.colors.to_sorted();
-        uint32_t cid = out_local_dict.intern(std::move(sorted));
-        cid_of.emplace(kv.first, cid);
+    {
+        // record_sets and the per-k-mer rsid storage are only needed
+        // while we're building cid_of. Scoping them here releases the
+        // record-set arena and the inner rsid vectors (via the
+        // kmer_entry{} reset below) before the walk phase, so the walk
+        // sees only kmer_info's phantom bits + cid_of.
+        color_set_dict record_sets;
+        load_bucket(path, k, kmer_info, record_sets);
+
+        // Common case: a k-mer is contributed by a single record, so its
+        // eventual color set is identical to that record's color list.
+        // Cache rsid -> local cid so the second, third, ... single-rsid
+        // k-mers with the same rsid skip the intern entirely. Boundary or
+        // spill-duplicate k-mers (rest non-empty) sort+unique their
+        // rsids; if a single distinct rsid remains we use the same cache,
+        // otherwise we k-way-merge the referenced color lists into a
+        // fresh sorted set and intern that.
+        std::vector<uint32_t> rsid_to_cid(record_sets.size(), UINT32_MAX);
+        cid_of.reserve(kmer_info.size());
+
+        auto cid_for_single_rsid = [&](uint32_t rsid) -> uint32_t {
+            if (rsid_to_cid[rsid] == UINT32_MAX) {
+                rsid_to_cid[rsid] = out_local_dict.intern(record_sets.at(rsid));
+            }
+            return rsid_to_cid[rsid];
+        };
+
+        std::vector<uint32_t> rsids_scratch;
+        std::vector<uint32_t> merged_scratch;
+        for (auto& kv : kmer_info) {
+            kmer_entry& e = kv.second.colors;
+            uint32_t cid;
+            if (e.rest.empty()) {
+                cid = cid_for_single_rsid(e.first_rsid);
+            } else {
+                rsids_scratch.clear();
+                rsids_scratch.reserve(1 + e.rest.size());
+                rsids_scratch.push_back(e.first_rsid);
+                rsids_scratch.insert(rsids_scratch.end(), e.rest.begin(), e.rest.end());
+                std::sort(rsids_scratch.begin(), rsids_scratch.end());
+                rsids_scratch.erase(std::unique(rsids_scratch.begin(), rsids_scratch.end()),
+                                    rsids_scratch.end());
+                if (rsids_scratch.size() == 1) {
+                    cid = cid_for_single_rsid(rsids_scratch[0]);
+                } else {
+                    merged_scratch.clear();
+                    for (uint32_t r : rsids_scratch) {
+                        auto const& v = record_sets.at(r);
+                        merged_scratch.insert(merged_scratch.end(), v.begin(), v.end());
+                    }
+                    std::sort(merged_scratch.begin(), merged_scratch.end());
+                    merged_scratch.erase(
+                        std::unique(merged_scratch.begin(), merged_scratch.end()),
+                        merged_scratch.end());
+                    cid = out_local_dict.intern(merged_scratch);
+                }
+            }
+            cid_of.emplace(kv.first, cid);
+            // Drop per-k-mer rsid storage immediately; phantom bits stay.
+            e = kmer_entry{};
+        }
     }
-    // Free per-k-mer color storage; we keep phantom flags in kmer_info.
-    for (auto& kv : kmer_info) kv.second.colors = kmer_entry{};
 
     ankerl::unordered_dense::map<kmer_int_t, uint8_t, kmer_hasher> visited;
     visited.reserve(kmer_info.size());
