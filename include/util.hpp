@@ -28,6 +28,27 @@ struct build_config {
     bool verbose = false;
 };
 
+// ---- timer ------------------------------------------------------------------
+
+// RAII phase timer: prints "[label] X.XX s" on destruction. Used to bracket
+// individual stages inside cdbg_builder::build().
+class timer {
+public:
+    timer(char const* label) : m_label(label), m_t0(std::chrono::steady_clock::now()) {}
+    ~timer() {
+        auto t1 = std::chrono::steady_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - m_t0).count();
+        std::cout << "[" << m_label << "] " << (ms / 1000.0) << " s\n";
+    }
+
+    timer(timer const&) = delete;
+    timer& operator=(timer const&) = delete;
+
+private:
+    char const* m_label;
+    std::chrono::steady_clock::time_point m_t0;
+};
+
 // ---- progress reporter ------------------------------------------------------
 
 // Lightweight progress printer for long-running phases.
