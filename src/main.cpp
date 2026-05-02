@@ -224,8 +224,7 @@ int main(int argc, char** argv) {
         {
             timer _("emit fasta");
             FILE* fa = std::fopen((cfg.out_basename + ".fa").c_str(), "wb");
-            if (!fa)
-                throw std::runtime_error("cannot open " + cfg.out_basename + ".fa");
+            if (!fa) throw std::runtime_error("cannot open " + cfg.out_basename + ".fa");
             constexpr size_t BUF_BYTES = 1 << 20;
             std::vector<char> buf(BUF_BYTES);
             size_t pos = 0;
@@ -321,6 +320,7 @@ int main(int argc, char** argv) {
     // own its contents (either we mkdtemp'd it, or the user passed an
     // empty directory), so a single recursive remove is safe.
     {
+        timer _("removing tmp files");
         std::error_code ec;
         std::filesystem::remove_all(tmp_dir, ec);
     }

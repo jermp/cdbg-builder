@@ -94,10 +94,8 @@ struct hybrid_builder {
     // same sparse / dense / complementary-dense rules as encode_color_set.
     // No shared state; safe to call from many threads each with its own
     // bit_vector::builder. Used by main's parallel emit-colors path.
-    static void encode_one(bits::bit_vector::builder& out_bvb,
-                           uint32_t const* color_set, uint64_t size,
-                           uint64_t num_colors,
-                           uint64_t sparse_threshold,
+    static void encode_one(bits::bit_vector::builder& out_bvb, uint32_t const* color_set,
+                           uint64_t size, uint64_t num_colors, uint64_t sparse_threshold,
                            uint64_t dense_threshold) {
         bits::util::write_delta(out_bvb, size);
         if (size < sparse_threshold) {
@@ -150,8 +148,7 @@ struct hybrid_builder {
     // back = part_bvb.num_bits(); one entry per encoded set + the
     // sentinel. Used by the parallel emit-colors path to merge per-thread
     // partials into a single hybrid_builder before build().
-    void merge_part(bits::bit_vector::builder& part_bvb,
-                    const std::vector<uint64_t>& part_offsets,
+    void merge_part(bits::bit_vector::builder& part_bvb, const std::vector<uint64_t>& part_offsets,
                     uint64_t part_num_integers) {
         if (part_offsets.empty()) return;
         uint64_t base = m_bvb.num_bits();
