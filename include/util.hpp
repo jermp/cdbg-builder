@@ -98,6 +98,89 @@ inline std::string format_bytes(uint64_t b) {
     return buf;
 }
 
+// ---- per-phase RSS sampler --------------------------------------------------
+//
+// process_peak_rss_bytes() above is a *lifetime* high-water mark via
+// getrusage; it can't tell us *where* the peak lives. For that we sample
+// the current resident set size periodically inside each phase and track
+// the max. On stop(), prints "  [<phase> peak RSS] X (end Y)" so the
+// per-phase line lands right under the timer line.
+//
+// The sampler reads /proc/self/status (Linux) or task_info (macOS) once
+// every ~100 ms — negligible cost relative to phases that take seconds
+// to minutes. On platforms where current RSS isn't readable, the sampler
+// is a silent no-op (the lifetime peak via getrusage at end-of-build
+// still prints).
+
+inline uint64_t current_rss_bytes() {
+#if defined(__linux__)
+    std::FILE* f = std::fopen("/proc/self/status", "r");
+    if (!f) return 0;
+    char line[256];
+    uint64_t kb = 0;
+    while (std::fgets(line, sizeof(line), f)) {
+        if (std::strncmp(line, "VmRSS:", 6) == 0) {
+            unsigned long long v = 0;
+            std::sscanf(line + 6, " %llu", &v);
+            kb = (uint64_t)v;
+            break;
+        }
+    }
+    std::fclose(f);
+    return kb * 1024ULL;
+#else
+    // macOS could query mach task_info; not wired up. Returning 0 makes
+    // rss_phase_tracker degrade to a no-op without affecting the
+    // lifetime peak from getrusage.
+    return 0;
+#endif
+}
+
+class rss_phase_tracker {
+public:
+    explicit rss_phase_tracker(std::string label,
+                               std::chrono::milliseconds interval = std::chrono::milliseconds(100))
+        : m_label(std::move(label)), m_interval(interval) {
+        uint64_t cur = current_rss_bytes();
+        if (cur == 0) return;  // unsupported platform; stop() prints nothing
+        m_peak.store(cur, std::memory_order_relaxed);
+        m_running.store(true, std::memory_order_relaxed);
+        m_thread = std::thread([this] { run(); });
+    }
+    ~rss_phase_tracker() { stop(); }
+
+    rss_phase_tracker(rss_phase_tracker const&) = delete;
+    rss_phase_tracker& operator=(rss_phase_tracker const&) = delete;
+
+    void stop() {
+        if (!m_running.exchange(false)) return;
+        if (m_thread.joinable()) m_thread.join();
+        // One last sample to catch a peak between the final tick and stop().
+        update(current_rss_bytes());
+        std::cout << "  [" << m_label << " peak RSS] " << format_bytes(m_peak.load())
+                  << " (end " << format_bytes(current_rss_bytes()) << ")\n";
+    }
+
+private:
+    void update(uint64_t cur) {
+        uint64_t prev = m_peak.load(std::memory_order_relaxed);
+        while (cur > prev &&
+               !m_peak.compare_exchange_weak(prev, cur, std::memory_order_relaxed)) {}
+    }
+    void run() {
+        while (m_running.load(std::memory_order_relaxed)) {
+            update(current_rss_bytes());
+            std::this_thread::sleep_for(m_interval);
+        }
+    }
+
+    std::string m_label;
+    std::chrono::milliseconds m_interval;
+    std::atomic<uint64_t> m_peak{0};
+    std::atomic<bool> m_running{false};
+    std::thread m_thread;
+};
+
 // ---- progress reporter ------------------------------------------------------
 
 // Lightweight progress printer for long-running phases.

@@ -94,12 +94,19 @@ struct builder {
 
         bucket_writer writer(tmp_dir, num_buckets);
         {
-            timer _("bucket-write");
-            std::atomic<uint64_t> done{0};
-            progress prog("bucket-write", done, files.size());
-            ingest_bucketed(files, m_cfg.k, m_cfg.m, m_cfg.bucket_log2, writer, m_cfg.num_threads,
-                            &done);
-            prog.stop();
+            rss_phase_tracker rss("bucket-write");
+            {
+                timer _("bucket-write");
+                std::atomic<uint64_t> done{0};
+                progress prog("bucket-write", done, files.size());
+                ingest_bucketed(files, m_cfg.k, m_cfg.m, m_cfg.bucket_log2, writer,
+                                m_cfg.num_threads, &done);
+                prog.stop();
+            }
+            // Sample the RSS while compactor hashmaps are still alive
+            // (they get freed by writer.close() below). The peak should
+            // already have been captured by the sampler during ingest.
+            rss.stop();
         }
         writer.close();
         std::cout << "  bucket bytes written: " << writer.total_bytes() << " (compressed; "
@@ -123,31 +130,43 @@ struct builder {
         }
         std::mutex global_mu;
         {
-            timer _("bucket-process");
-            std::atomic<uint64_t> done{0};
-            progress prog("bucket-process", done, num_buckets);
-            process_buckets(writer, m_cfg.k, m_cfg.num_threads, frag_unitigs, out_mu, global_dict,
-                            global_mu, &done);
-            prog.stop();
-            std::cout << "  bucket fragments: " << frag_unitigs.size() << "\n";
-            std::cout << "  distinct color classes: " << global_dict.size() << "\n";
+            rss_phase_tracker rss("bucket-process");
+            {
+                timer _("bucket-process");
+                std::atomic<uint64_t> done{0};
+                progress prog("bucket-process", done, num_buckets);
+                process_buckets(writer, m_cfg.k, m_cfg.num_threads, frag_unitigs, out_mu,
+                                global_dict, global_mu, &done);
+                prog.stop();
+                std::cout << "  bucket fragments: " << frag_unitigs.size() << "\n";
+                std::cout << "  distinct color classes: " << global_dict.size() << "\n";
+            }
+            rss.stop();
         }
         m_num_color_classes = global_dict.size();
 
         std::vector<stitchable_unitig> all_unitigs;
         {
-            timer _("stitch");
-            std::atomic<uint64_t> done{0};
-            progress prog("stitch", done, frag_unitigs.size());
-            stitch_unitigs(frag_unitigs, m_cfg.k, all_unitigs, &done);
-            prog.stop();
-            frag_unitigs = {};
-            std::cout << "  unitigs after stitching: " << all_unitigs.size() << "\n";
+            rss_phase_tracker rss("stitch");
+            {
+                timer _("stitch");
+                std::atomic<uint64_t> done{0};
+                progress prog("stitch", done, frag_unitigs.size());
+                stitch_unitigs(frag_unitigs, m_cfg.k, all_unitigs, &done);
+                prog.stop();
+                frag_unitigs = {};
+                std::cout << "  unitigs after stitching: " << all_unitigs.size() << "\n";
+            }
+            rss.stop();
         }
         m_num_unitigs = all_unitigs.size();
 
-        emit_fasta(all_unitigs, global_dict.size());
-        emit_colors(global_dict);
+        {
+            rss_phase_tracker rss("emit");
+            emit_fasta(all_unitigs, global_dict.size());
+            emit_colors(global_dict);
+            rss.stop();
+        }
 
         cleanup_tmp_dir(tmp_dir);
 
