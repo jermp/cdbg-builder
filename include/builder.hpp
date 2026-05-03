@@ -46,8 +46,8 @@
 
 #include <unistd.h>
 
-#include <essentials.hpp>
 #include <bit_vector.hpp>
+#include <essentials.hpp>
 
 #include "bucket_io.hpp"
 #include "bucket_ingester.hpp"
@@ -565,6 +565,16 @@ private:
     // make the .fa output strictly cid-ascending. Per-bucket peak
     // in RAM is one bucket's seqs (~few MB on the 4546-genome
     // workload) plus the per-record vector.
+    //
+    // While we already have the unitigs in their final cid-ascending
+    // emission order, also build the unitig-to-color-set "u2c"
+    // bit_vector and serialize it to <basename>.u2c. Bit i is set
+    // iff unitig i (in .fa emission order) is the last unitig of a
+    // color-set run. Length = num_unitigs, popcount =
+    // num_color_classes. Downstream consumers (Fulgor) recover the
+    // per-unitig color-set id via rank1(unitig_id) using a rank9
+    // index built at load time. Matches the bit_vector layout in
+    // https://github.com/jermp/fulgor/blob/main/include/index.hpp .
     void emit_fasta(unitig_bucket_writer& uwriter) const {
         timer _("emit fasta");
 
@@ -585,6 +595,10 @@ private:
             if (pos + n > BUF_BYTES) flush_buf();
         };
 
+        bits::bit_vector::builder u2c_bvb((uint64_t)m_num_unitigs, /*init=*/false);
+        size_t emitted = 0;
+        uint32_t prev_cid = 0;
+
         std::vector<unitig_bucket_writer::record> records;
         for (uint32_t b = 0; b < uwriter.num_buckets(); ++b) {
             uwriter.read_bucket(b, records);
@@ -592,6 +606,16 @@ private:
                       [](unitig_bucket_writer::record const& x,
                          unitig_bucket_writer::record const& y) { return x.cid < y.cid; });
             for (auto const& r : records) {
+                // Mark the final unitig of the previous run. emitted > 0
+                // guards the first unitig overall; cid != prev_cid is
+                // true on every group boundary because we iterate
+                // buckets in ascending cid range and sort within each.
+                if (emitted > 0 && r.cid != prev_cid) {
+                    u2c_bvb.set(emitted - 1, 1);
+                }
+                prev_cid = r.cid;
+                ++emitted;
+
                 reserve(12);
                 buf[pos++] = '>';
                 auto rr = std::to_chars(buf.data() + pos, buf.data() + pos + 11, r.cid);
@@ -611,6 +635,12 @@ private:
         }
         flush_buf();
         std::fclose(fa);
+
+        // Close out the very last run.
+        if (emitted > 0) u2c_bvb.set(emitted - 1, 1);
+        bits::bit_vector u2c;
+        u2c_bvb.build(u2c);
+        essentials::save(u2c, (m_cfg.out_basename + ".u2c").c_str());
 
         uwriter.close_and_unlink();
     }
