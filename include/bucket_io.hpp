@@ -44,16 +44,20 @@ namespace cdgb {
 // Default per-bucket hashmap memory budget (estimated). With 1024 buckets
 // at this budget the global ingest peak from the compactors is ~256 MiB.
 inline constexpr size_t DEFAULT_COMPACTOR_SPILL_BYTES = 256 * 1024;
+// Default zlib output buffer per bucket. Each gzFile also carries an
+// internal deflate state of similar size, so the per-bucket zlib RAM
+// footprint is roughly 2 * gzbuffer.
+inline constexpr size_t DEFAULT_COMPACTOR_GZBUFFER_BYTES = 256 * 1024;
 
 class bucket_compactor {
 public:
-    bucket_compactor(std::string path, size_t spill_bytes)
+    bucket_compactor(std::string path, size_t spill_bytes, size_t gzbuffer_bytes)
         : m_path(std::move(path)), m_spill_bytes(spill_bytes) {
         m_file = gzopen(m_path.c_str(), "wb1");
         if (!m_file)
             throw std::runtime_error("cannot open bucket file: " + m_path + ": " +
                                      std::strerror(errno));
-        gzbuffer(m_file, 256 * 1024);
+        gzbuffer(m_file, (unsigned)gzbuffer_bytes);
     }
 
     ~bucket_compactor() { close(); }
@@ -193,13 +197,14 @@ private:
 class bucket_writer {
 public:
     bucket_writer(std::string const& dir, uint32_t num_buckets, size_t flush_bases = 64 * 1024,
-                  size_t spill_bytes = DEFAULT_COMPACTOR_SPILL_BYTES)
+                  size_t spill_bytes = DEFAULT_COMPACTOR_SPILL_BYTES,
+                  size_t gzbuffer_bytes = DEFAULT_COMPACTOR_GZBUFFER_BYTES)
         : m_dir(dir), m_num_buckets(num_buckets), m_flush_bases(flush_bases) {
         std::filesystem::create_directories(m_dir);
         m_compactors.reserve(num_buckets);
         for (uint32_t b = 0; b < num_buckets; ++b) {
             m_compactors.emplace_back(
-                std::make_unique<bucket_compactor>(bucket_path(b), spill_bytes));
+                std::make_unique<bucket_compactor>(bucket_path(b), spill_bytes, gzbuffer_bytes));
         }
     }
 

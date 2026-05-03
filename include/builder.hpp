@@ -80,6 +80,9 @@ struct builder {
         std::cout << "k = " << m_cfg.k << ", m = " << m_cfg.m << ", num_colors = " << m_num_colors
                   << ", num_threads = " << m_cfg.num_threads << ", num_buckets = " << num_buckets
                   << "\n";
+        std::cout << "  bucket-write tuning: flush_bases=" << format_bytes(m_flush_bases)
+                  << ", spill_bytes=" << format_bytes(m_spill_bytes)
+                  << ", gzbuffer=" << format_bytes(m_gzbuffer_bytes) << "\n";
 
         auto const t_start = std::chrono::steady_clock::now();
         auto print_total = [&] {
@@ -92,7 +95,8 @@ struct builder {
         std::string const tmp_dir = resolve_tmp_dir();
         std::cout << "  tmp_dir = " << tmp_dir << "\n";
 
-        bucket_writer writer(tmp_dir, num_buckets);
+        bucket_writer writer(tmp_dir, num_buckets, m_flush_bases, m_spill_bytes,
+                             m_gzbuffer_bytes);
         {
             phase_rss_marker rss("bucket-write");
             {
@@ -235,6 +239,7 @@ private:
         // isn't enough.
         m_cfg.bucket_log2 = ensure_fd_capacity_for_buckets_(m_cfg.bucket_log2);
         m_color_bvb_spill_bytes = auto_color_bvb_spill_bytes();
+        auto_tune_bucket_write_params();
     }
 
     // Try to raise RLIMIT_NOFILE so we can open `1 << log2` bucket
@@ -285,6 +290,85 @@ private:
         double bytes = m_cfg.max_ram_gb * (1024.0 * 1024.0 * 1024.0) * 0.25;
         if (bytes < (double)(64 * 1024 * 1024)) bytes = 64 * 1024 * 1024;  // floor at 64 MiB
         return (uint64_t)bytes;
+    }
+
+    // Joint auto-tune of (flush_bases, spill_bytes, gzbuffer) against a
+    // fixed share of --max-ram, given (num_threads, num_buckets).
+    //
+    // Bucket-write peak comes from three terms that we model as:
+    //
+    //   per-thread buffers ≈ num_threads × num_buckets × flush_bases
+    //   compactor footprint ≈ num_buckets × spill_bytes × overhead
+    //   zlib state         ≈ num_buckets × (gzbuffer + ~256 KiB internal)
+    //
+    // overhead ~= 2.5x covers the unordered_dense map node overhead +
+    // std::string keys (heap-allocated past SSO) + per-vector headers.
+    // The internal zlib state per gzFile is ~256 KiB at level-1
+    // compression and we can't tune it; only gzbuffer is exposed.
+    //
+    // Strategy: reserve a target share (default 50%) of --max-ram for
+    // bucket-write. Subtract the un-tunable zlib state. Split what
+    // remains evenly between per-thread buffers and compactor data,
+    // then solve for flush_bases and spill_bytes. Floor each at a
+    // sensible minimum so we don't spill on every record.
+    //
+    // No --max-ram set -> keep historical defaults (this keeps the
+    // small-input dev path identical and avoids surprising regressions
+    // for users who don't care about a budget).
+    void auto_tune_bucket_write_params() {
+        if (m_cfg.max_ram_gb <= 0) {
+            m_flush_bases = 64 * 1024;
+            m_spill_bytes = DEFAULT_COMPACTOR_SPILL_BYTES;     // 256 KiB
+            m_gzbuffer_bytes = DEFAULT_COMPACTOR_GZBUFFER_BYTES;  // 256 KiB
+            return;
+        }
+        constexpr double SHARE = 0.50;            // half the budget for bucket-write
+        constexpr double OVERHEAD = 2.5;          // compactor map structure + key allocs
+        constexpr size_t ZLIB_STATE_PER_BUCKET = 256 * 1024;  // un-tunable
+        constexpr size_t MIN_FLUSH_BASES = 4 * 1024;
+        constexpr size_t MIN_SPILL_BYTES = 16 * 1024;
+        constexpr size_t MIN_GZBUFFER_BYTES = 16 * 1024;
+        constexpr size_t MAX_FLUSH_BASES = 64 * 1024;     // historical default
+        constexpr size_t MAX_SPILL_BYTES = 256 * 1024;    // historical default
+        constexpr size_t MAX_GZBUFFER_BYTES = 256 * 1024; // historical default
+
+        const uint64_t budget_bytes =
+            (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0 * SHARE);
+        const uint64_t B = 1ull << m_cfg.bucket_log2;
+        const uint64_t T = std::max<uint64_t>(1, m_cfg.num_threads);
+
+        // Pick gzbuffer first: small fixed cost per bucket, biggest savings
+        // come from going 256 KiB -> 64 KiB on tight budgets.
+        size_t gzbuffer = MAX_GZBUFFER_BYTES;
+        if (m_cfg.max_ram_gb < 16.0) gzbuffer = 128 * 1024;
+        if (m_cfg.max_ram_gb < 8.0) gzbuffer = 64 * 1024;
+        if (m_cfg.max_ram_gb < 2.0) gzbuffer = 32 * 1024;
+        if (gzbuffer < MIN_GZBUFFER_BYTES) gzbuffer = MIN_GZBUFFER_BYTES;
+
+        // Fixed per-bucket overhead we can't tune.
+        const uint64_t zlib_total = B * (uint64_t)(gzbuffer + ZLIB_STATE_PER_BUCKET);
+
+        // Whatever remains is split between per-thread buffers and the
+        // compactor footprint. If zlib alone overruns the share, both
+        // tunables drop to their floors and the remainder becomes
+        // unavoidable headroom -- the run will print over-budget.
+        uint64_t remainder = budget_bytes > zlib_total ? budget_bytes - zlib_total : 0;
+        uint64_t half = remainder / 2;
+
+        // flush_bases per (thread, bucket); cap at the historical default.
+        size_t flush = (size_t)(T * B == 0 ? MAX_FLUSH_BASES : half / (T * B));
+        if (flush < MIN_FLUSH_BASES) flush = MIN_FLUSH_BASES;
+        if (flush > MAX_FLUSH_BASES) flush = MAX_FLUSH_BASES;
+
+        // spill_bytes per bucket (with overhead factor).
+        double spill_d = B == 0 ? (double)MAX_SPILL_BYTES : (double)half / (B * OVERHEAD);
+        size_t spill = (size_t)spill_d;
+        if (spill < MIN_SPILL_BYTES) spill = MIN_SPILL_BYTES;
+        if (spill > MAX_SPILL_BYTES) spill = MAX_SPILL_BYTES;
+
+        m_flush_bases = flush;
+        m_spill_bytes = spill;
+        m_gzbuffer_bytes = gzbuffer;
     }
 
     static std::vector<std::string> read_filenames(std::string const& path) {
@@ -406,6 +490,10 @@ private:
     uint64_t m_num_color_classes = 0;
     uint64_t m_peak_rss_bytes = 0;
     uint64_t m_color_bvb_spill_bytes = 0;  // 0 = never spill
+    // bucket-write knobs picked by auto_tune_bucket_write_params().
+    size_t m_flush_bases = 0;
+    size_t m_spill_bytes = 0;
+    size_t m_gzbuffer_bytes = 0;
 };
 
 }  // namespace cdgb
