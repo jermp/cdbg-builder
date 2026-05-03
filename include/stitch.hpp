@@ -132,9 +132,15 @@ struct link {
 
 }  // namespace detail
 
-inline void stitch_unitigs(std::vector<stitchable_unitig>& frag, uint32_t k,
-                           std::vector<stitchable_unitig>& out,
-                           std::atomic<uint64_t>* done = nullptr) {
+// Streaming variant: emits each finished unitig via the sink callback
+// (`sink(stitchable_unitig&&)`) instead of accumulating into an output
+// vector. Use this when the caller spills unitigs to disk so the
+// stitched seq strings don't all coexist in RAM. The vector-returning
+// stitch_unitigs() is a thin adapter around this.
+template <typename Sink>
+inline void stitch_unitigs_streaming(std::vector<stitchable_unitig>& frag, uint32_t k,
+                                     Sink&& sink,
+                                     std::atomic<uint64_t>* done = nullptr) {
     using detail::SIDE_LEFT;
     using detail::SIDE_RIGHT;
     using detail::end_ref;
@@ -142,8 +148,10 @@ inline void stitch_unitigs(std::vector<stitchable_unitig>& frag, uint32_t k,
     using detail::link;
 
     if (k < 2) {
-        out = std::move(frag);
-        if (done) done->fetch_add(out.size(), std::memory_order_relaxed);
+        for (auto& u : frag) {
+            if (done) done->fetch_add(1, std::memory_order_relaxed);
+            sink(std::move(u));
+        }
         return;
     }
 
@@ -205,7 +213,6 @@ inline void stitch_unitigs(std::vector<stitchable_unitig>& frag, uint32_t k,
     by_junction = {};  // free now; we only need adj from here on
     std::cerr << "[stitch] walking chains...\n";
     std::vector<uint8_t> visited(frag.size(), 0);
-    out.reserve(frag.size());
 
     auto take_seq = [&](uint32_t idx, bool flipped) -> std::string {
         return flipped ? detail::revcomp_string(frag[idx].seq) : std::move(frag[idx].seq);
@@ -261,7 +268,7 @@ inline void stitch_unitigs(std::vector<stitchable_unitig>& frag, uint32_t k,
             f_cur = f_nxt;
         }
 
-        out.emplace_back(std::move(merged));
+        sink(std::move(merged));
     };
 
     // Pass A: start at unitigs with a free own-LEFT side.
@@ -281,6 +288,18 @@ inline void stitch_unitigs(std::vector<stitchable_unitig>& frag, uint32_t k,
         if (visited[i]) continue;
         walk_chain(i, /*start_flipped=*/false);
     }
+}
+
+// Backwards-compatible vector-returning adapter around the streaming
+// variant. Useful for unit tests; the production builder pipeline now
+// passes its own disk-backed sink directly to stitch_unitigs_streaming.
+inline void stitch_unitigs(std::vector<stitchable_unitig>& frag, uint32_t k,
+                           std::vector<stitchable_unitig>& out,
+                           std::atomic<uint64_t>* done = nullptr) {
+    out.clear();
+    out.reserve(frag.size());
+    auto sink = [&](stitchable_unitig&& u) { out.emplace_back(std::move(u)); };
+    stitch_unitigs_streaming(frag, k, sink, done);
 }
 
 }  // namespace cdgb

@@ -56,6 +56,7 @@
 #include "minimizer.hpp"
 #include "stitch.hpp"
 #include "streaming_color_set_dict.hpp"
+#include "unitig_spill.hpp"
 #include "util.hpp"
 
 namespace cdgb {
@@ -184,25 +185,32 @@ struct builder {
         }
         m_num_color_classes = global_dict.size();
 
-        std::vector<stitchable_unitig> all_unitigs;
+        // Stitch streams each finished unitig directly into a disk-
+        // backed bucket sink: bucket b holds cids in
+        // [b * S, (b+1) * S) where S = ceil(num_color_classes / K).
+        // This keeps the in-memory peak during stitch bounded by the
+        // walker's adjacency + visited bitmaps + the trailing partial
+        // chain -- the merged seq strings are not retained.
+        const uint32_t unitig_bucket_count = pick_unitig_bucket_count_(m_num_color_classes);
+        unitig_bucket_writer uwriter(tmp_dir, m_num_color_classes, unitig_bucket_count);
         {
             phase_rss_marker rss("stitch");
             {
                 timer _("stitch");
                 std::atomic<uint64_t> done{0};
                 progress prog("stitch", done, frag_unitigs.size());
-                stitch_unitigs(frag_unitigs, m_cfg.k, all_unitigs, &done);
+                stitch_unitigs_streaming(frag_unitigs, m_cfg.k, std::ref(uwriter), &done);
                 prog.stop();
                 frag_unitigs = {};
-                std::cout << "  unitigs after stitching: " << all_unitigs.size() << "\n";
+                std::cout << "  unitigs after stitching: " << uwriter.total_unitigs() << "\n";
             }
             rss.stop();
         }
-        m_num_unitigs = all_unitigs.size();
+        m_num_unitigs = uwriter.total_unitigs();
 
         {
             phase_rss_marker rss("emit");
-            emit_fasta(all_unitigs, global_dict.size());
+            emit_fasta(uwriter);
             emit_colors(global_dict);
             rss.stop();
         }
@@ -533,27 +541,32 @@ private:
         std::filesystem::remove_all(tmp_dir, ec);
     }
 
-    // FASTA emit. Hand-rolled 1 MiB buffer + std::to_chars for the integer
-    // header + memcpy for the sequence body. Significantly faster than
-    // std::ofstream's default 8 KiB buffer + stream operators on millions
-    // of small records.
+    // Pick the cid-range bucket count for the unitig spill. We want
+    // each bucket's seq payload to fit comfortably in RAM during
+    // emit. For the salmonella-4546 reference (~190 MB total seq /
+    // 1.88 M unitigs across 972 K cids), 64 buckets gives ~3 MB / 30 K
+    // unitigs per bucket -- comfortably bounded regardless of
+    // --max-ram. We don't need the bucket count to scale with the
+    // budget: emit reads one bucket at a time.
+    static uint32_t pick_unitig_bucket_count_(uint64_t num_color_classes) {
+        if (num_color_classes == 0) return 1;
+        constexpr uint32_t TARGET = 64;
+        return (uint32_t)std::min<uint64_t>(num_color_classes, TARGET);
+    }
+
+    // FASTA emit. Hand-rolled 1 MiB buffer + std::to_chars for the
+    // integer header + memcpy for the sequence body. Significantly
+    // faster than std::ofstream's default 8 KiB buffer + stream
+    // operators on millions of small records.
     //
-    // While we're already iterating unitigs in their final emission order
-    // (grouped by ascending cid), build the unitig-to-color-set "u2c"
-    // bit_vector and serialize it to <basename>.u2c. Bit i is set iff
-    // unitig i (in the .fa emission order) is the last unitig of a
-    // color-set run. Length = num_unitigs, popcount = num_color_classes.
-    // The downstream consumer (Fulgor) recovers the per-unitig color-set
-    // id via rank1(unitig_id) using a rank9 index it builds at load
-    // time. Matches the bit_vector layout in
-    // https://github.com/jermp/fulgor/blob/main/include/index.hpp .
-    void emit_fasta(std::vector<stitchable_unitig> const& all_unitigs,
-                    uint32_t num_color_classes) const {
+    // Reads unitigs from the disk-backed bucket spill in bucket order
+    // (bucket 0 = lowest cids, ..., bucket K-1 = highest). Within a
+    // bucket records arrive in stitch order, so we sort by cid to
+    // make the .fa output strictly cid-ascending. Per-bucket peak
+    // in RAM is one bucket's seqs (~few MB on the 4546-genome
+    // workload) plus the per-record vector.
+    void emit_fasta(unitig_bucket_writer& uwriter) const {
         timer _("emit fasta");
-        std::vector<std::vector<size_t>> by_class(num_color_classes);
-        for (size_t i = 0; i < all_unitigs.size(); ++i) {
-            by_class[all_unitigs[i].cid].push_back(i);
-        }
 
         FILE* fa = std::fopen((m_cfg.out_basename + ".fa").c_str(), "wb");
         if (!fa) throw std::runtime_error("cannot open " + m_cfg.out_basename + ".fa");
@@ -572,34 +585,23 @@ private:
             if (pos + n > BUF_BYTES) flush_buf();
         };
 
-        bits::bit_vector::builder u2c_bvb(all_unitigs.size(), /*init=*/false);
-        size_t emitted = 0;
-        uint32_t prev_cid = 0;
-        for (uint32_t cid = 0; cid < num_color_classes; ++cid) {
-            for (size_t idx : by_class[cid]) {
-                // Mark the final unitig of the previous run. emitted > 0
-                // guards the very first unitig (no predecessor); cid !=
-                // prev_cid is true on every group boundary because by_class
-                // is iterated in ascending cid order and we only enter
-                // this loop on non-empty groups.
-                if (emitted > 0 && cid != prev_cid) {
-                    u2c_bvb.set(emitted - 1, 1);
-                }
-                prev_cid = cid;
-                ++emitted;
-
-                std::string const& seq = all_unitigs[idx].seq;
-                // Header: '>' + decimal cid + '\n' fits in 12 chars for any uint32_t.
+        std::vector<unitig_bucket_writer::record> records;
+        for (uint32_t b = 0; b < uwriter.num_buckets(); ++b) {
+            uwriter.read_bucket(b, records);
+            std::sort(records.begin(), records.end(),
+                      [](unitig_bucket_writer::record const& x,
+                         unitig_bucket_writer::record const& y) { return x.cid < y.cid; });
+            for (auto const& r : records) {
                 reserve(12);
                 buf[pos++] = '>';
-                auto r = std::to_chars(buf.data() + pos, buf.data() + pos + 11, cid);
-                pos = (size_t)(r.ptr - buf.data());
+                auto rr = std::to_chars(buf.data() + pos, buf.data() + pos + 11, r.cid);
+                pos = (size_t)(rr.ptr - buf.data());
                 buf[pos++] = '\n';
                 size_t s_pos = 0;
-                while (s_pos < seq.size()) {
+                while (s_pos < r.seq.size()) {
                     if (pos == BUF_BYTES) flush_buf();
-                    size_t take = std::min(BUF_BYTES - pos, seq.size() - s_pos);
-                    std::memcpy(buf.data() + pos, seq.data() + s_pos, take);
+                    size_t take = std::min(BUF_BYTES - pos, r.seq.size() - s_pos);
+                    std::memcpy(buf.data() + pos, r.seq.data() + s_pos, take);
                     pos += take;
                     s_pos += take;
                 }
@@ -610,11 +612,7 @@ private:
         flush_buf();
         std::fclose(fa);
 
-        // Close out the very last run.
-        if (emitted > 0) u2c_bvb.set(emitted - 1, 1);
-        bits::bit_vector u2c;
-        u2c_bvb.build(u2c);
-        essentials::save(u2c, (m_cfg.out_basename + ".u2c").c_str());
+        uwriter.close_and_unlink();
     }
 
     void emit_colors(streaming_color_set_dict& global_dict) const {
