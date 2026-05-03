@@ -126,18 +126,17 @@ public:
         }
         prof.ns_hashmap.fetch_add(bucket_write_prof::since(t_map), std::memory_order_relaxed);
         prof.n_records.fetch_add(recs.size(), std::memory_order_relaxed);
-        // Under pressure, drop the spill threshold to a quarter of the
-        // configured value (floored at 8 KiB) instead of "spill on every
-        // batch". Spilling on every batch shreds dedup state across
-        // 100-byte chunks: on the 4546-genome workload that produced
-        // 4.7M spills and 8.6 GB of bucket files (vs 314K spills /
-        // 2.4 GB at the configured threshold). The lower threshold
-        // still provides backpressure (compactors spill ~4x more
-        // often) but each spill carries enough data that the dedup-
-        // state cost is bounded.
-        bool pressure = m_under_pressure && m_under_pressure->load(std::memory_order_relaxed);
-        size_t threshold = pressure ? std::max<size_t>(m_spill_bytes / 4, 8 * 1024) : m_spill_bytes;
-        if (m_bytes >= threshold) {
+        // Spill at the configured threshold only -- don't shred dedup
+        // state by spilling on every batch under pressure. The
+        // bucket_writer's RSS watcher provides backpressure
+        // independently by sweeping all compactors whenever live RSS
+        // crosses the budget threshold; per-batch backpressure on top
+        // of that just produces tiny spills (worse dedup, more disk
+        // records, more rsids per k-mer in bucket-process). On the
+        // 4546-genome workload this kept spill count at the natural
+        // ~500K-700K range instead of the 4M+ explosion seen with
+        // per-batch pressure spilling.
+        if (m_bytes >= m_spill_bytes) {
             auto t_sp = bucket_write_prof::clock::now();
             spill_locked();
             prof.ns_spill.fetch_add(bucket_write_prof::since(t_sp), std::memory_order_relaxed);
@@ -354,8 +353,10 @@ private:
             if (!m_watcher_running.load(std::memory_order_relaxed)) break;
             uint64_t rss = current_rss_bytes();
             if (rss == 0) {
-                // /proc unavailable: fall back to lifetime peak. No
-                // release possible; pressure becomes sticky.
+                // /proc unavailable: fall back to lifetime peak. Sweep
+                // semantics still work with peak (it's monotonic, so
+                // once we're over we keep sweeping every poll), just
+                // less precise.
                 rss = process_peak_rss_bytes();
                 if (rss == 0) continue;  // can't enforce on this platform
             }
@@ -363,17 +364,21 @@ private:
             while (rss > prev_high &&
                    !m_observed_rss_high.compare_exchange_weak(prev_high, rss,
                                                               std::memory_order_relaxed)) {}
-            bool currently_under = m_under_pressure.load(std::memory_order_relaxed);
-            if (!currently_under && rss >= m_high_threshold_bytes) {
+            // Hysteresis on the pressure flag (informational; useful for
+            // the post-phase log line). Sweep semantics are independent:
+            // we sweep whenever RSS is at/above HIGH, regardless of the
+            // flag's current state, because if pressure is already ON
+            // and RSS climbs *back* to HIGH between sweeps we still
+            // need to spill. Otherwise pressure could stay ON, RSS
+            // climbs unchecked past HIGH, and the cap is lost.
+            if (rss >= m_high_threshold_bytes) {
                 m_under_pressure.store(true, std::memory_order_relaxed);
                 m_pressure_was_engaged.store(true, std::memory_order_relaxed);
-                // One-shot sweep on transition: drain quiet buckets too.
-                // Ingest threads will keep things drained until release.
                 for (auto& c : m_compactors) {
                     if (!m_watcher_running.load(std::memory_order_relaxed)) break;
                     c->try_spill();
                 }
-            } else if (currently_under && rss <= m_low_threshold_bytes) {
+            } else if (rss <= m_low_threshold_bytes) {
                 m_under_pressure.store(false, std::memory_order_relaxed);
             }
         }
