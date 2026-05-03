@@ -12,7 +12,7 @@ Given the same filenames list and k used for the build, this script:
        - unitigs sharing a color_set_id all carry the same color set,
        - the number of distinct color_set_ids equals the number of distinct
          color sets in the inputs,
-       - <out>.colors exists and is non-empty.
+       - <out>.color_sets exists and is non-empty.
 
 K-mers are 2-bit packed into Python ints (A=0, C=1, G=2, T=3) and reduced to
 their canonical form (min of forward / reverse complement) so the verifier
@@ -103,7 +103,7 @@ def verify(filenames_list: str, out_basename: str, k: int) -> int:
           f"{len(expected_classes)} distinct color set(s)", flush=True)
 
     fa_path = out_basename + ".fa"
-    colors_path = out_basename + ".colors"
+    colors_path = out_basename + ".color_sets"
 
     if not os.path.exists(fa_path):
         print(f"FAIL: {fa_path} not found")

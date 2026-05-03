@@ -1,35 +1,51 @@
 #pragma once
 
-// Streaming color-set dict.
+// Streaming color-set dict that writes its output incrementally to the
+// final on-disk artifact, never holding the whole compressed bit_vector
+// or the EF offsets in memory at once.
 //
 // On intern() we (a) compute a 128-bit content hash of the candidate
 // color list, (b) look it up in m_index, and either return the existing
-// id or (c) encode the candidate's bits *immediately* into an
-// in-memory bits::bit_vector::builder using the same sparse / dense /
-// complementary-dense rules as hybrid_builder. We never keep the
-// uncompressed std::vector<uint32_t> alive past the call.
+// id or (c) encode the candidate's bits into an in-memory
+// bits::bit_vector::builder (m_bvb) using the hybrid sparse / dense /
+// complementary-dense rules, then immediately flush every COMPLETE 64-
+// bit word from m_bvb into the output file. We never keep more than
+// the trailing partial word + the bits being actively encoded for the
+// current candidate in memory.
 //
-// When `spill_threshold_bytes` is set (> 0) and the in-memory bvb
-// crosses that threshold, the dict flushes its complete 64-bit words
-// to a sidecar file and keeps the trailing partial word in memory.
-// Bit-offset tracking is `m_flushed_words * 64 + m_bvb.num_bits()`,
-// which stays consistent across spills.
+// When finalize() is called, we
+//   - flush the trailing partial word (zero-padded to a full 64-bit word),
+//   - build a bits::elias_fano over the per-class bit_offsets we tracked
+//     during interning,
+//   - serialize the EF onto the file's tail,
+//   - fseek back to file start and overwrite the placeholder header
+//     with the now-known totals (bit_vector_num_bits / num_words /
+//     num_color_sets / etc.).
+//
+// On-disk layout of the resulting file (matches what the user's
+// downstream consumer expects: header -> color_sets -> EF offsets):
+//
+//   [u32 num_colors]
+//   [u32 sparse_threshold]
+//   [u32 dense_threshold]
+//   [u64 num_color_sets]
+//   [u64 bit_vector_num_bits]
+//   [u64 bit_vector_num_words]   == ceil(bit_vector_num_bits / 64)
+//   [bit_vector_num_words * u64] color-set bit_vector words (LE host order)
+//   [serialized bits::elias_fano<false,false>]   per-class offsets
 //
 // Memory per class: 32 bytes of metadata (bit_offset, bit_length,
-// primary_hash, secondary_hash) plus the per-class bits inside the
-// bvb (capped by spill_threshold_bytes once spilling is enabled).
+// primary_hash, secondary_hash). Memory across classes: just
+// num_classes * 32 bytes + the dedup hashtable + the trailing partial
+// word in m_bvb. The compressed color-set bits themselves are NOT held
+// in memory beyond the flush threshold.
 //
 // Dedup uses 128 bits of hash:
 //   primary   = wyhash(bytes)   (from ankerl::unordered_dense::detail)
 //   secondary = FNV-1a(bytes)
-// Two independent hash families -> birthday collision over the run
-// is ~2^-64 per pair. We rely on this to skip the byte-level equality
-// check (we don't have the original colors any more).
-//
-// finalize() builds the full hybrid struct in `out`: bit_vector is
-// loaded from sidecar (if any) + the remaining bvb; offsets are
-// turned into an elias_fano from the per-class bit_offsets we
-// tracked along the way.
+// Two independent hash families -> birthday collision over the run is
+// ~2^-64 per pair. We rely on this to skip the byte-level equality
+// check (we don't have the original colors any more after encoding).
 
 #include <cassert>
 #include <cstdint>
@@ -37,6 +53,7 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -44,6 +61,7 @@
 
 #include <bit_vector.hpp>
 #include <elias_fano.hpp>
+#include <essentials.hpp>
 #include <integer_codes.hpp>
 #include <util.hpp>
 #include <unordered_dense/unordered_dense.h>
@@ -54,29 +72,32 @@
 namespace cdgb {
 
 struct streaming_color_set_dict {
-    streaming_color_set_dict(uint32_t num_colors)
+    streaming_color_set_dict(uint32_t num_colors, std::string output_path)
         : m_num_colors(num_colors)
         , m_sparse_threshold((uint32_t)(0.25 * num_colors))
         , m_dense_threshold((uint32_t)(0.75 * num_colors))
-        , m_index(0, hasher{&m_classes}, key_eq{&m_classes}) {}
+        , m_index(0, hasher{&m_classes}, key_eq{&m_classes})
+        , m_output_path(std::move(output_path)) {
+        m_file = std::fopen(m_output_path.c_str(), "wb+");
+        if (!m_file)
+            throw std::runtime_error("cannot open color-set output: " + m_output_path);
+        // Reserve space for the fixed-size header. We don't know the
+        // final values (num_color_sets, bit_vector_num_bits, num_words)
+        // until finalize(), so write zeros for now and overwrite at the
+        // end via fseek.
+        char hdr[HEADER_BYTES] = {};
+        if (std::fwrite(hdr, 1, HEADER_BYTES, m_file) != HEADER_BYTES)
+            throw std::runtime_error("short write of header to " + m_output_path);
+    }
 
     ~streaming_color_set_dict() {
-        if (m_sidecar) std::fclose(m_sidecar);
+        if (m_file) std::fclose(m_file);
     }
 
     streaming_color_set_dict(streaming_color_set_dict const&) = delete;
     streaming_color_set_dict& operator=(streaming_color_set_dict const&) = delete;
     streaming_color_set_dict(streaming_color_set_dict&&) = delete;
     streaming_color_set_dict& operator=(streaming_color_set_dict&&) = delete;
-
-    // Optional: enable disk spilling. If `spill_threshold_bytes == 0`,
-    // never spill (keep everything in memory). The sidecar file at
-    // `path` is created on the first spill and deleted by finalize()
-    // after we read it back.
-    void enable_spill(std::string path, uint64_t spill_threshold_bytes) {
-        m_sidecar_path = std::move(path);
-        m_spill_threshold_bytes = spill_threshold_bytes;
-    }
 
     uint32_t intern(std::vector<uint32_t>&& candidate) {
         uint64_t primary = wyhash_(candidate);
@@ -95,13 +116,11 @@ struct streaming_color_set_dict {
         m_index.insert(id);
         m_total_integers += candidate.size();
 
-        // Spill complete words if over threshold. We always retain the
-        // trailing partial word in memory so the next encode can
-        // continue at the same bit position.
-        if (m_spill_threshold_bytes != 0 &&
-            m_bvb.data().size() * sizeof(uint64_t) >= m_spill_threshold_bytes) {
-            spill_();
-        }
+        // Flush every COMPLETE 64-bit word to the output file. The
+        // trailing partial word stays in m_bvb so the next encode can
+        // continue at the same bit position. With this flushed every
+        // intern() call, in-memory bit storage is bounded by one word.
+        spill_complete_words_();
 
         return id;
     }
@@ -109,65 +128,94 @@ struct streaming_color_set_dict {
     uint32_t size() const { return (uint32_t)m_classes.size(); }
     uint64_t total_integers() const { return m_total_integers; }
     uint64_t total_bits() const { return m_flushed_words * 64 + m_bvb.num_bits(); }
-    bool spilled() const { return m_flushed_words > 0; }
 
-    // Build the full hybrid struct from the encoded bits + per-class
-    // offsets. If we spilled to a sidecar during intern(), that file
-    // is read back here, combined with any in-memory bits, and the
-    // sidecar is removed.
-    void finalize(hybrid& out) {
-        out.m_num_colors = m_num_colors;
-        out.m_sparse_set_threshold_size = m_sparse_threshold;
-        out.m_very_dense_set_threshold_size = m_dense_threshold;
+    // Finalize the on-disk file: flush the trailing partial word,
+    // build & serialize the EF over per-class bit-offsets, then
+    // fseek back to overwrite the placeholder header.
+    void finalize() {
+        if (m_finalized)
+            throw std::runtime_error("streaming_color_set_dict::finalize called twice");
+        m_finalized = true;
 
-        uint64_t total_bit_count = total_bits();
+        const uint64_t total_bit_count = total_bits();
+        const uint64_t total_word_count = (total_bit_count + 63) / 64;
 
-        if (m_flushed_words == 0) {
-            // Never spilled -- bvb already has everything.
-            m_bvb.build(out.m_color_sets);
-        } else {
-            // Append remaining bvb words to sidecar, then read the
-            // whole file back into a fresh bit_vector::builder of the
-            // correct bit count.
-            flush_remaining_to_sidecar_();
-
-            uint64_t total_words = (total_bit_count + 63) / 64;
-            std::fflush(m_sidecar);
-            std::rewind(m_sidecar);
-
-            bits::bit_vector::builder b;
-            b.resize(total_bit_count);
-            auto& dst = b.data();
-            if (total_words > 0) {
-                size_t got = std::fread(dst.data(), sizeof(uint64_t), total_words, m_sidecar);
-                if (got != total_words)
-                    throw std::runtime_error("sidecar short read at finalize");
+        // 1) Flush any trailing partial word (zero-padded to 64 bits)
+        //    so the file's bit_vector words section has exactly
+        //    total_word_count u64s.
+        if (m_bvb.num_bits() > 0) {
+            auto const& words = m_bvb.data();
+            // bit_vector::builder always keeps at least
+            // ceil(num_bits/64) words; we want exactly that many.
+            size_t want = (m_bvb.num_bits() + 63) / 64;
+            if (want > words.size()) want = words.size();
+            if (want > 0) {
+                size_t bytes = want * sizeof(uint64_t);
+                if (std::fwrite(words.data(), 1, bytes, m_file) != bytes)
+                    throw std::runtime_error("short write of trailing words to " + m_output_path);
             }
-            b.build(out.m_color_sets);
-
-            std::fclose(m_sidecar);
-            m_sidecar = nullptr;
-            std::error_code ec;
-            std::filesystem::remove(m_sidecar_path, ec);
+            m_bvb.clear();
         }
 
+        // 2) Build per-class offsets array (last entry = sentinel
+        //    total_bit_count) and encode it as elias_fano. The EF
+        //    itself is small relative to the bit_vector (typically a
+        //    few bytes per class), so we hold it in memory and
+        //    serialize via essentials onto the file tail.
         std::vector<uint64_t> offsets;
         offsets.reserve(m_classes.size() + 1);
         for (auto const& e : m_classes) offsets.push_back(e.bit_offset);
-        offsets.push_back(out.m_color_sets.num_bits());  // sentinel
-        out.m_offsets.encode(offsets.begin(), offsets.size(), offsets.back());
+        offsets.push_back(total_bit_count);  // sentinel
+
+        bits::elias_fano<false, false> ef;
+        ef.encode(offsets.begin(), offsets.size(), offsets.back());
+
+        // 3) Serialize EF to bytes via essentials (it walks ef.visit
+        //    and writes pods + vec sizes), then fwrite the bytes onto
+        //    the file's tail. essentials::generic_saver wants a
+        //    std::ostream so we round-trip through a stringstream.
+        std::ostringstream oss(std::ios::binary);
+        {
+            essentials::generic_saver gs(oss);
+            gs.visit(ef);
+        }
+        std::string ef_bytes = oss.str();
+        if (!ef_bytes.empty()) {
+            if (std::fwrite(ef_bytes.data(), 1, ef_bytes.size(), m_file) != ef_bytes.size())
+                throw std::runtime_error("short write of EF to " + m_output_path);
+        }
+
+        // 4) Update the placeholder header with the now-known totals.
+        std::fflush(m_file);
+        if (std::fseek(m_file, 0, SEEK_SET) != 0)
+            throw std::runtime_error("fseek to header failed on " + m_output_path);
+        write_pod_(m_num_colors);
+        write_pod_(m_sparse_threshold);
+        write_pod_(m_dense_threshold);
+        write_pod_((uint64_t)m_classes.size());
+        write_pod_(total_bit_count);
+        write_pod_(total_word_count);
+
+        std::fflush(m_file);
+        std::fclose(m_file);
+        m_file = nullptr;
 
         std::cout << "  num_color_sets = " << m_classes.size() << "\n";
         std::cout << "  num_total_integers = " << m_total_integers << "\n";
-        std::cout << "  total bits for ints  = " << 8 * out.m_color_sets.num_bytes() << "\n";
-        std::cout << "  total bits for offs  = " << 8 * out.m_offsets.num_bytes() << "\n";
-        if (m_flushed_words > 0) {
-            std::cout << "  color-set bits spilled to disk: yes ("
-                      << format_bytes(m_flushed_words * sizeof(uint64_t)) << ")\n";
-        }
+        std::cout << "  total bits for ints  = " << total_bit_count << "\n";
+        std::cout << "  total bits for offs  = " << 8 * ef_bytes.size() << "\n";
     }
 
 private:
+    // Header layout: see top-of-file comment.
+    //   u32 num_colors
+    //   u32 sparse_threshold
+    //   u32 dense_threshold
+    //   u64 num_color_sets
+    //   u64 bit_vector_num_bits
+    //   u64 bit_vector_num_words
+    static constexpr size_t HEADER_BYTES = 4 + 4 + 4 + 8 + 8 + 8;
+
     struct class_entry {
         uint64_t bit_offset;
         uint64_t bit_length;
@@ -218,29 +266,25 @@ private:
         return h;
     }
 
-    void open_sidecar_if_needed_() {
-        if (m_sidecar) return;
-        if (m_sidecar_path.empty())
-            throw std::runtime_error(
-                "streaming_color_set_dict: spill triggered but no sidecar path set");
-        m_sidecar = std::fopen(m_sidecar_path.c_str(), "wb+");
-        if (!m_sidecar)
-            throw std::runtime_error("cannot open sidecar: " + m_sidecar_path);
+    template <typename T>
+    void write_pod_(T const& v) {
+        static_assert(std::is_trivially_copyable<T>::value, "POD only");
+        if (std::fwrite(&v, sizeof(T), 1, m_file) != 1)
+            throw std::runtime_error("short header write to " + m_output_path);
     }
 
-    // Flush every COMPLETE 64-bit word to the sidecar; keep the
-    // trailing partial word (if any) in memory so the next encode
+    // Flush every COMPLETE 64-bit word to the output file; keep the
+    // trailing partial word (if any) in m_bvb so the next encode
     // continues exactly where this one left off.
-    void spill_() {
+    void spill_complete_words_() {
         uint64_t bits = m_bvb.num_bits();
         uint64_t complete_words = bits / 64;
         if (complete_words == 0) return;
 
-        open_sidecar_if_needed_();
         auto& words = m_bvb.data();
         size_t bytes = complete_words * sizeof(uint64_t);
-        if (std::fwrite(words.data(), 1, bytes, m_sidecar) != bytes)
-            throw std::runtime_error("sidecar short write");
+        if (std::fwrite(words.data(), 1, bytes, m_file) != bytes)
+            throw std::runtime_error("short write of color-set words to " + m_output_path);
         m_flushed_words += complete_words;
 
         uint64_t trailing_bits = bits - complete_words * 64;
@@ -249,37 +293,19 @@ private:
         if (trailing_bits) m_bvb.append_bits(partial_word, trailing_bits);
     }
 
-    // At finalize time, write the remainder of the bvb (whole words,
-    // including the trailing partial word as a final word with the
-    // unused upper bits zero) to the sidecar.
-    void flush_remaining_to_sidecar_() {
-        if (m_bvb.num_bits() == 0) return;
-        open_sidecar_if_needed_();
-        auto const& words = m_bvb.data();
-        size_t n_words = words.size();
-        if (n_words == 0) return;
-        size_t bytes = n_words * sizeof(uint64_t);
-        if (std::fwrite(words.data(), 1, bytes, m_sidecar) != bytes)
-            throw std::runtime_error("sidecar short write at finalize");
-        m_flushed_words += n_words;  // (note: we've now over-counted by trailing zeros, but
-                                     // the bit count is tracked separately via total_bit_count
-                                     // computed *before* this call.)
-        m_bvb.clear();
-    }
-
     uint32_t m_num_colors;
     uint32_t m_sparse_threshold;
     uint32_t m_dense_threshold;
 
     bits::bit_vector::builder m_bvb;
-    uint64_t m_flushed_words = 0;  // 64-bit words already on the sidecar
+    uint64_t m_flushed_words = 0;
     std::vector<class_entry> m_classes;
     ankerl::unordered_dense::set<uint32_t, hasher, key_eq> m_index;
     uint64_t m_total_integers = 0;
 
-    std::string m_sidecar_path;
-    FILE* m_sidecar = nullptr;
-    uint64_t m_spill_threshold_bytes = 0;  // 0 = never spill
+    std::FILE* m_file = nullptr;
+    std::string m_output_path;
+    bool m_finalized = false;
 };
 
 }  // namespace cdgb

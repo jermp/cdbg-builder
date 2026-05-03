@@ -15,7 +15,15 @@ Given `N` input files (each treated as one *color*), the tool produces:
   color sets and the last bit is always set. Downstream consumers (e.g.
   Fulgor) recover the per-unitig color-set id via `rank1(unitig_id)` after
   building a rank index over this bit_vector.
-- `<out>.colors` — the color sets, serialized in Fulgor's `hybrid` format.
+- `<out>.color_sets` — the color sets, written incrementally during
+  bucket-process so the compressed bit_vector never sits whole in RAM.
+  Layout: a small fixed header (`num_colors`, sparse / dense thresholds,
+  `num_color_sets`, `bit_vector_num_bits`, `bit_vector_num_words`) followed
+  by the `num_color_sets` distinct sets encoded with the same hybrid
+  sparse / dense / complementary-dense rules as Fulgor's hybrid codec,
+  followed by an `elias_fano` of per-class bit-offsets appended at the
+  end. (Different on-disk layout from Fulgor's existing `hybrid`
+  serialization; the consumer must be updated to match.)
 
 Inputs may be FASTA, FASTQ, or gzipped variants of either; the file at line
 *i* of the filenames list is assigned color *i*.
@@ -49,7 +57,7 @@ Options:
 |----------------------|-------------------------------------------------------------------|---------|
 | `-i PATH`            | Text file with one input path per line (one color each)           | —       |
 | `-k INT`             | k-mer length (≤ 63)                                               | —       |
-| `-o NAME`            | Output basename; writes `NAME.fa`, `NAME.u2c`, and `NAME.colors`  | —       |
+| `-o NAME`            | Output basename; writes `NAME.fa`, `NAME.u2c`, and `NAME.color_sets` | —       |
 | `-t INT`             | Number of worker threads                                          | 1       |
 | `-m INT`             | Minimizer length used for bucketing                               | auto    |
 | `--buckets-log2 INT` | `2^N` minimizer-derived bucket files on disk                      | 10      |
@@ -96,7 +104,7 @@ This produces:
 - `~/Salmonella_enterica/salmonella_4546.fa` — colored unitigs in FASTA form
 - `~/Salmonella_enterica/salmonella_4546.u2c` — unitig-to-color-set
   bit_vector
-- `~/Salmonella_enterica/salmonella_4546.colors` — Fulgor-compatible hybrid
+- `~/Salmonella_enterica/salmonella_4546.color_sets` — Fulgor-compatible hybrid
   color sets
 
 The three files can then be consumed by downstream tools that accept Fulgor's
