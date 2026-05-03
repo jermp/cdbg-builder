@@ -3,7 +3,7 @@
 // Public API for building a colored compacted dBG.
 //
 // Wraps the full pipeline (minimizer-bucketed ingest -> per-bucket dBG
-// build + global color interning -> stitch -> emit FASTA + .colors) so
+// build + global color interning -> stitch -> emit FASTA + .color_sets) so
 // that downstream tools can construct a `build_config`, instantiate a
 // `builder`, and call `build()`. Mirrors the call shape used by
 // Fulgor's `index<ColorSets>::builder` for its ccdBG dependency
@@ -22,10 +22,10 @@
 //   // After build():
 //   //   b.num_colors()         -- one per input file
 //   //   b.num_unitigs()        -- count of stitched unitigs in <basename>.fa
-//   //   b.num_color_classes()  -- count of distinct color sets in <basename>.colors
+//   //   b.num_color_classes()  -- count of distinct color sets in <basename>.color_sets
 //
 // build() throws std::runtime_error on configuration errors or I/O
-// failures. On success, <basename>.fa and <basename>.colors are written
+// failures. On success, <basename>.fa and <basename>.color_sets are written
 // and the scratch directory (cfg.tmp_dir or an mkdtemp'd one) is removed.
 
 #include <atomic>
@@ -53,7 +53,6 @@
 #include "bucket_ingester.hpp"
 #include "bucket_walker.hpp"
 #include "color_set_dict.hpp"
-#include "hybrid_color_sets.hpp"
 #include "minimizer.hpp"
 #include "stitch.hpp"
 #include "streaming_color_set_dict.hpp"
@@ -66,7 +65,7 @@ struct builder {
     explicit builder(build_config const& cfg) : m_cfg(cfg) {}
 
     // Run the full pipeline. Throws std::runtime_error on bad config or
-    // I/O error. On success, writes m_cfg.out_basename + {".fa", ".colors"}
+    // I/O error. On success, writes m_cfg.out_basename + {".fa", ".color_sets"}
     // and removes the scratch directory.
     void build() {
         validate_and_resolve_config();
@@ -160,10 +159,14 @@ struct builder {
         // dict, this caps peak RAM during the dominant bucket-process
         // phase by the *compressed* color-set size, not the sum of
         // class sizes.
-        streaming_color_set_dict global_dict(m_num_colors);
-        if (m_color_bvb_spill_bytes > 0) {
-            global_dict.enable_spill(tmp_dir + "/colors.bits", m_color_bvb_spill_bytes);
-        }
+        // Streaming dict: encodes each new color set into its bvb at
+        // intern() time and immediately flushes complete 64-bit words
+        // to the final <basename>.color_sets file. Per-class memory
+        // is just 32 bytes of metadata; the compressed bit_vector
+        // never sits in RAM. EF offsets are appended to the file at
+        // finalize().
+        streaming_color_set_dict global_dict(m_num_colors,
+                                             m_cfg.out_basename + ".color_sets");
         std::mutex global_mu;
         {
             phase_rss_marker rss("bucket-process");
@@ -225,7 +228,7 @@ struct builder {
         }
 
         std::cout << "done. wrote " << m_cfg.out_basename << ".fa, " << m_cfg.out_basename
-                  << ".u2c, and " << m_cfg.out_basename << ".colors\n";
+                  << ".u2c, and " << m_cfg.out_basename << ".color_sets\n";
         print_total();
     }
 
@@ -271,7 +274,6 @@ private:
         // limit if needed; clamp bucket_log2 if even the hard limit
         // isn't enough.
         m_cfg.bucket_log2 = ensure_fd_capacity_for_buckets_(m_cfg.bucket_log2);
-        m_color_bvb_spill_bytes = auto_color_bvb_spill_bytes();
         auto_tune_bucket_write_params();
     }
 
@@ -399,15 +401,6 @@ private:
             --log2;
         }
         return log2;
-    }
-
-    // Heuristic. Cap the streaming-color bvb at ~1/4 of the budget, so
-    // it spills before crowding out the rest.
-    uint64_t auto_color_bvb_spill_bytes() const {
-        if (m_cfg.max_ram_gb <= 0) return 0;  // never spill
-        double bytes = m_cfg.max_ram_gb * (1024.0 * 1024.0 * 1024.0) * 0.25;
-        if (bytes < (double)(64 * 1024 * 1024)) bytes = 64 * 1024 * 1024;  // floor at 64 MiB
-        return (uint64_t)bytes;
     }
 
     // Joint auto-tune of (flush_bases, spill_bytes) against a fixed
@@ -625,15 +618,14 @@ private:
     }
 
     void emit_colors(streaming_color_set_dict& global_dict) const {
-        timer _("emit colors");
+        timer _("emit color_sets");
         // Encoding already happened during bucket-process via
-        // global_dict.intern(); finalize() just builds the hybrid
-        // wrapper (moves the bit_vector out of the bvb, builds an
-        // elias_fano of the per-class bit_offsets) so we can
-        // essentials::save it.
-        hybrid h;
-        global_dict.finalize(h);
-        essentials::save(h, (m_cfg.out_basename + ".colors").c_str());
+        // global_dict.intern(); each intern flushed complete 64-bit
+        // words to the final file. finalize() flushes the trailing
+        // partial word, builds + appends the elias_fano over per-
+        // class bit-offsets, then fseeks back to write the now-known
+        // header totals.
+        global_dict.finalize();
     }
 
     build_config m_cfg;
@@ -641,7 +633,6 @@ private:
     uint64_t m_num_unitigs = 0;
     uint64_t m_num_color_classes = 0;
     uint64_t m_peak_rss_bytes = 0;
-    uint64_t m_color_bvb_spill_bytes = 0;  // 0 = never spill
     // bucket-write knobs picked by auto_tune_bucket_write_params().
     size_t m_flush_bases = 0;
     size_t m_spill_bytes = 0;
