@@ -81,8 +81,7 @@ struct builder {
                   << ", num_threads = " << m_cfg.num_threads << ", num_buckets = " << num_buckets
                   << "\n";
         std::cout << "  bucket-write tuning: flush_bases=" << format_bytes(m_flush_bases)
-                  << ", spill_bytes=" << format_bytes(m_spill_bytes)
-                  << ", gzbuffer=" << format_bytes(m_gzbuffer_bytes);
+                  << ", spill_bytes=" << format_bytes(m_spill_bytes);
         if (m_cfg.max_ram_gb > 0 && PLATFORM_RAM_OVERHEAD > 1.0) {
             std::cout << " (platform RAM overhead " << PLATFORM_RAM_OVERHEAD << "x)";
         }
@@ -99,8 +98,7 @@ struct builder {
         std::string const tmp_dir = resolve_tmp_dir();
         std::cout << "  tmp_dir = " << tmp_dir << "\n";
 
-        bucket_writer writer(tmp_dir, num_buckets, m_flush_bases, m_spill_bytes,
-                             m_gzbuffer_bytes);
+        bucket_writer writer(tmp_dir, num_buckets, m_flush_bases, m_spill_bytes);
         // When --max-ram is set, arm a background RSS watcher with
         // hysteresis. Bucket-write must leave room for what comes
         // after: bucket-process adds ~1 GiB on top on multi-thousand-
@@ -342,20 +340,61 @@ private:
         1.0;
 #endif
 
+    // Fraction of --max-ram the bucket-write auto-tune is allowed to
+    // plan for (per-thread buffers + compactor + compressor). The
+    // remainder absorbs the bucket-process working set, which on Mac
+    // expands by ~1.75 GiB on the 4546-genome workload (k-mer rsids
+    // map + per-bucket color_set_dict + libsystem_malloc bookkeeping).
+    // We hand bucket-write a smaller slice on Mac so the cap holds
+    // once bucket-process expands on top.
+    static constexpr double BUCKET_WRITE_SHARE =
+#if defined(__APPLE__)
+        0.40;
+#else
+        0.50;
+#endif
+
     double effective_max_ram_gb() const {
         return m_cfg.max_ram_gb / PLATFORM_RAM_OVERHEAD;
     }
 
+    // Pick num_buckets so that the auto-tune can give us spill_bytes
+    // at least TARGET_SPILL_BYTES. Otherwise the bucket files explode
+    // with redundant records:
+    //
+    //   spill_bytes ≈ (SHARE × effective_ram / 2) / (B × COMPACTOR_OVERHEAD)
+    //
+    // is the value the compactor-half of the bucket-write share lets
+    // us afford. Each spill clears the per-bucket dedup state, so a
+    // popular super-k-mer that's hit again after a spill is emitted
+    // as a *separate* on-disk record. The smaller spill_bytes is, the
+    // more often this happens, and on the 4546-genome workload
+    // pushing spill_bytes to its 16 KiB floor produced 1.96 M spills
+    // and 10.6 GB of uncompressed bucket bytes -- vs ~313 K spills
+    // and ~3 GB at "reasonable" spill_bytes. The 3.5x bloat then
+    // overwhelmed any savings from the new compression.
+    //
+    // Strategy: solve for the largest B in [MIN, MAX] such that
+    // B × TARGET_SPILL_BYTES × COMPACTOR_OVERHEAD ≤ (SHARE × eff)/2.
+    // Bigger budgets get more buckets (which helps bucket-process
+    // parallelism); tighter budgets get fewer buckets (so spill_bytes
+    // can stay at the target and each spill carries enough data that
+    // dedup pays off).
+    //
+    // No --max-ram set -> historical 1024 buckets.
     uint32_t auto_bucket_log2() const {
         if (m_cfg.max_ram_gb <= 0) return MIN_BUCKETS_LOG2;
-        constexpr double ZLIB_FLOOR_SHARE = 0.30;
-        constexpr uint64_t ZLIB_BYTES_PER_BUCKET = 448ull * 1024ull;  // gzbuffer + internal state
-        double budget_for_zlib =
-            effective_max_ram_gb() * 1024.0 * 1024.0 * 1024.0 * ZLIB_FLOOR_SHARE;
-        // Largest log2 in [MIN, MAX] such that (1 << log2) * ZLIB_BYTES <= budget_for_zlib.
+        constexpr double SHARE = BUCKET_WRITE_SHARE;
+        constexpr double COMPACTOR_OVERHEAD = 7.0;
+        constexpr size_t TARGET_SPILL_BYTES = 64 * 1024;  // good for LZ4 dedup
+
+        const double compactor_share_bytes =
+            effective_max_ram_gb() * 1024.0 * 1024.0 * 1024.0 * (SHARE / 2.0);
+        const double max_b =
+            compactor_share_bytes / ((double)TARGET_SPILL_BYTES * COMPACTOR_OVERHEAD);
+
         uint32_t log2 = MAX_BUCKETS_LOG2;
-        while (log2 > MIN_BUCKETS_LOG2 &&
-               (double)((uint64_t)1 << log2) * (double)ZLIB_BYTES_PER_BUCKET > budget_for_zlib) {
+        while (log2 > MIN_BUCKETS_LOG2 && (double)((uint64_t)1 << log2) > max_b) {
             --log2;
         }
         return log2;
@@ -370,14 +409,14 @@ private:
         return (uint64_t)bytes;
     }
 
-    // Joint auto-tune of (flush_bases, spill_bytes, gzbuffer) against a
-    // fixed share of --max-ram, given (num_threads, num_buckets).
+    // Joint auto-tune of (flush_bases, spill_bytes) against a fixed
+    // share of --max-ram, given (num_threads, num_buckets).
     //
     // Bucket-write peak comes from three terms that we model as:
     //
-    //   per-thread buffers ≈ num_threads × num_buckets × flush_bases × BUFFER_OVERHEAD
-    //   compactor footprint ≈ num_buckets × spill_bytes × COMPACTOR_OVERHEAD
-    //   zlib state         ≈ num_buckets × (gzbuffer + ZLIB_STATE_PER_BUCKET)
+    //   per-thread buffers   ≈ num_threads × num_buckets × flush_bases × BUFFER_OVERHEAD
+    //   compactor footprint  ≈ num_buckets × spill_bytes × COMPACTOR_OVERHEAD
+    //   compressor state     ≈ num_buckets × COMPRESSOR_BYTES_PER_BUCKET
     //
     // The overhead factors are empirical: nominal storage substantially
     // undercounts what the process actually resident-pages because of
@@ -385,23 +424,23 @@ private:
     //       high-water capacity for the whole phase),
     //   (b) std::string heap allocations for compactor keys (each ~80 B
     //       header + bytes + malloc header beyond the 15 B SSO),
-    //   (c) glibc malloc fragmentation across millions of small allocs
-    //       churned by repeated spill cycles,
+    //   (c) glibc/libsystem_malloc fragmentation across millions of
+    //       small allocs churned by repeated spill cycles,
     //   (d) ankerl::unordered_dense map structure overhead per entry.
     //
-    // Calibrated against a 4546-genome, 8-thread, 4 GiB-budget run where
-    // the unscaled model predicted ~2 GiB but real bucket-write peak was
-    // ~4.7 GiB. The 2.3x gap is split as ~2x for per-thread (capacity
-    // slack + recs vector) and ~5x / 2.5x = 2x for compactor (frag + key
-    // string allocs). Internal zlib state at level 1 with default
-    // memLevel is ~128 K hash + 32 K window + small slack ≈ 384 K, plus
-    // the gzbuffer.
+    // The compressor term used to dominate (zlib level-1 at ~256-448
+    // KiB per gzFile). With LZ4's block API (LZ4_compress_default is
+    // stateless from the caller's view) there is no persistent
+    // compressor state per bucket -- only the m_batch_buf and
+    // m_out_buf scratch buffers, which are accounted for inside
+    // COMPACTOR_OVERHEAD (raised to 7x). COMPRESSOR_BYTES_PER_BUCKET
+    // here is just a small constant for unmodelled per-bucket
+    // bookkeeping.
     //
     // Strategy: reserve a target share (default 50%) of --max-ram for
-    // bucket-write. Subtract the un-tunable zlib state. Split what
+    // bucket-write. Subtract the (small) compressor floor. Split what
     // remains evenly between per-thread buffers and compactor data,
-    // then solve for flush_bases and spill_bytes. Floor each at a
-    // sensible minimum so we don't spill on every record.
+    // then solve for flush_bases and spill_bytes.
     //
     // No --max-ram set -> keep historical defaults (this keeps the
     // small-input dev path identical and avoids surprising regressions
@@ -409,56 +448,39 @@ private:
     void auto_tune_bucket_write_params() {
         if (m_cfg.max_ram_gb <= 0) {
             m_flush_bases = 64 * 1024;
-            m_spill_bytes = DEFAULT_COMPACTOR_SPILL_BYTES;     // 256 KiB
-            m_gzbuffer_bytes = DEFAULT_COMPACTOR_GZBUFFER_BYTES;  // 256 KiB
+            m_spill_bytes = DEFAULT_COMPACTOR_SPILL_BYTES;  // 256 KiB
             return;
         }
-        constexpr double SHARE = 0.50;            // half the budget for bucket-write
-        constexpr double COMPACTOR_OVERHEAD = 5.0;  // compactor: structure + key allocs + frag
+        constexpr double SHARE = BUCKET_WRITE_SHARE;  // share of budget for bucket-write
+        constexpr double COMPACTOR_OVERHEAD = 7.0;    // compactor: structure + key allocs + frag
         constexpr double BUFFER_OVERHEAD = 2.0;     // per-thread: capacity slack + recs vec
-        constexpr size_t ZLIB_STATE_PER_BUCKET = 384 * 1024;  // un-tunable
+        // LZ4 block API has no persistent compressor state -- the
+        // batch and out buffers we hold between spills are accounted
+        // for by COMPACTOR_OVERHEAD (raised from 5x to 7x to cover
+        // them). Keep a small constant here for unmodelled per-bucket
+        // bookkeeping (FILE handle, mutex padding, etc.).
+        constexpr size_t COMPRESSOR_BYTES_PER_BUCKET = 4 * 1024;
         constexpr size_t MIN_FLUSH_BASES = 4 * 1024;
         constexpr size_t MIN_SPILL_BYTES = 16 * 1024;
-        constexpr size_t MIN_GZBUFFER_BYTES = 16 * 1024;
-        constexpr size_t MAX_FLUSH_BASES = 64 * 1024;     // historical default
-        constexpr size_t MAX_SPILL_BYTES = 256 * 1024;    // historical default
-        constexpr size_t MAX_GZBUFFER_BYTES = 256 * 1024; // historical default
+        constexpr size_t MAX_FLUSH_BASES = 64 * 1024;   // historical default
+        constexpr size_t MAX_SPILL_BYTES = 256 * 1024;  // historical default
 
-        // Use the platform-derated budget for tuning so the chosen
-        // values produce a real-RSS footprint that fits the user's
-        // --max-ram on this OS. See PLATFORM_RAM_OVERHEAD doc.
         double const effective_ram_gb = effective_max_ram_gb();
         const uint64_t budget_bytes =
             (uint64_t)(effective_ram_gb * 1024.0 * 1024.0 * 1024.0 * SHARE);
         const uint64_t B = 1ull << m_cfg.bucket_log2;
         const uint64_t T = std::max<uint64_t>(1, m_cfg.num_threads);
 
-        // Pick gzbuffer first: small fixed cost per bucket, biggest savings
-        // come from going 256 KiB -> 64 KiB on tight budgets.
-        size_t gzbuffer = MAX_GZBUFFER_BYTES;
-        if (effective_ram_gb < 16.0) gzbuffer = 128 * 1024;
-        if (effective_ram_gb < 8.0) gzbuffer = 64 * 1024;
-        if (effective_ram_gb < 2.0) gzbuffer = 32 * 1024;
-        if (gzbuffer < MIN_GZBUFFER_BYTES) gzbuffer = MIN_GZBUFFER_BYTES;
-
-        // Fixed per-bucket overhead we can't tune.
-        const uint64_t zlib_total = B * (uint64_t)(gzbuffer + ZLIB_STATE_PER_BUCKET);
-
-        // Whatever remains is split between per-thread buffers and the
-        // compactor footprint. If zlib alone overruns the share, both
-        // tunables drop to their floors and the remainder becomes
-        // unavoidable headroom -- the run will print over-budget.
-        uint64_t remainder = budget_bytes > zlib_total ? budget_bytes - zlib_total : 0;
+        const uint64_t compressor_total = B * (uint64_t)COMPRESSOR_BYTES_PER_BUCKET;
+        uint64_t remainder = budget_bytes > compressor_total ? budget_bytes - compressor_total : 0;
         uint64_t half = remainder / 2;
 
-        // flush_bases per (thread, bucket); cap at the historical default.
         double flush_d =
             T * B == 0 ? (double)MAX_FLUSH_BASES : (double)half / (T * B * BUFFER_OVERHEAD);
         size_t flush = (size_t)flush_d;
         if (flush < MIN_FLUSH_BASES) flush = MIN_FLUSH_BASES;
         if (flush > MAX_FLUSH_BASES) flush = MAX_FLUSH_BASES;
 
-        // spill_bytes per bucket (with overhead factor).
         double spill_d =
             B == 0 ? (double)MAX_SPILL_BYTES : (double)half / (B * COMPACTOR_OVERHEAD);
         size_t spill = (size_t)spill_d;
@@ -467,7 +489,6 @@ private:
 
         m_flush_bases = flush;
         m_spill_bytes = spill;
-        m_gzbuffer_bytes = gzbuffer;
     }
 
     static std::vector<std::string> read_filenames(std::string const& path) {
@@ -592,7 +613,6 @@ private:
     // bucket-write knobs picked by auto_tune_bucket_write_params().
     size_t m_flush_bases = 0;
     size_t m_spill_bytes = 0;
-    size_t m_gzbuffer_bytes = 0;
 };
 
 }  // namespace cdgb
