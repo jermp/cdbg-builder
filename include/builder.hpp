@@ -82,7 +82,11 @@ struct builder {
                   << "\n";
         std::cout << "  bucket-write tuning: flush_bases=" << format_bytes(m_flush_bases)
                   << ", spill_bytes=" << format_bytes(m_spill_bytes)
-                  << ", gzbuffer=" << format_bytes(m_gzbuffer_bytes) << "\n";
+                  << ", gzbuffer=" << format_bytes(m_gzbuffer_bytes);
+        if (m_cfg.max_ram_gb > 0 && PLATFORM_RAM_OVERHEAD > 1.0) {
+            std::cout << " (platform RAM overhead " << PLATFORM_RAM_OVERHEAD << "x)";
+        }
+        std::cout << "\n";
 
         auto const t_start = std::chrono::steady_clock::now();
         auto print_total = [&] {
@@ -312,12 +316,42 @@ private:
     // the bucket-process working set.
     //
     // No --max-ram set -> historical 1024 buckets.
+    // Per-platform RAM-overhead multiplier. The auto-tune below models
+    // bucket-write peak using overhead constants calibrated on macOS,
+    // where libsystem_malloc has heavier per-allocation bookkeeping and
+    // RSS accounting includes pages glibc would reclaim. On Linux the
+    // same workload typically sits ~50% lower in RSS for the same
+    // logical state, so we'd over-tighten the auto-tune if we used the
+    // macOS calibration there.
+    //
+    // We compensate by dividing the effective budget that the auto-tune
+    // sees by this constant. A value of 2.0 on macOS means the auto-
+    // tune behaves as if the user passed half their --max-ram (smaller
+    // flush_bases / spill_bytes / fewer buckets) so the resulting
+    // structural footprint actually fits under the original cap once
+    // platform overhead is added back. On Linux the constant is 1.0
+    // (no derating) because the existing constants already match.
+    //
+    // The watcher's HIGH/LOW thresholds are NOT divided by this
+    // multiplier -- the watcher measures real RSS, which is what we
+    // want to cap.
+    static constexpr double PLATFORM_RAM_OVERHEAD =
+#if defined(__APPLE__)
+        2.0;
+#else
+        1.0;
+#endif
+
+    double effective_max_ram_gb() const {
+        return m_cfg.max_ram_gb / PLATFORM_RAM_OVERHEAD;
+    }
+
     uint32_t auto_bucket_log2() const {
         if (m_cfg.max_ram_gb <= 0) return MIN_BUCKETS_LOG2;
         constexpr double ZLIB_FLOOR_SHARE = 0.30;
         constexpr uint64_t ZLIB_BYTES_PER_BUCKET = 448ull * 1024ull;  // gzbuffer + internal state
         double budget_for_zlib =
-            m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0 * ZLIB_FLOOR_SHARE;
+            effective_max_ram_gb() * 1024.0 * 1024.0 * 1024.0 * ZLIB_FLOOR_SHARE;
         // Largest log2 in [MIN, MAX] such that (1 << log2) * ZLIB_BYTES <= budget_for_zlib.
         uint32_t log2 = MAX_BUCKETS_LOG2;
         while (log2 > MIN_BUCKETS_LOG2 &&
@@ -390,17 +424,21 @@ private:
         constexpr size_t MAX_SPILL_BYTES = 256 * 1024;    // historical default
         constexpr size_t MAX_GZBUFFER_BYTES = 256 * 1024; // historical default
 
+        // Use the platform-derated budget for tuning so the chosen
+        // values produce a real-RSS footprint that fits the user's
+        // --max-ram on this OS. See PLATFORM_RAM_OVERHEAD doc.
+        double const effective_ram_gb = effective_max_ram_gb();
         const uint64_t budget_bytes =
-            (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0 * SHARE);
+            (uint64_t)(effective_ram_gb * 1024.0 * 1024.0 * 1024.0 * SHARE);
         const uint64_t B = 1ull << m_cfg.bucket_log2;
         const uint64_t T = std::max<uint64_t>(1, m_cfg.num_threads);
 
         // Pick gzbuffer first: small fixed cost per bucket, biggest savings
         // come from going 256 KiB -> 64 KiB on tight budgets.
         size_t gzbuffer = MAX_GZBUFFER_BYTES;
-        if (m_cfg.max_ram_gb < 16.0) gzbuffer = 128 * 1024;
-        if (m_cfg.max_ram_gb < 8.0) gzbuffer = 64 * 1024;
-        if (m_cfg.max_ram_gb < 2.0) gzbuffer = 32 * 1024;
+        if (effective_ram_gb < 16.0) gzbuffer = 128 * 1024;
+        if (effective_ram_gb < 8.0) gzbuffer = 64 * 1024;
+        if (effective_ram_gb < 2.0) gzbuffer = 32 * 1024;
         if (gzbuffer < MIN_GZBUFFER_BYTES) gzbuffer = MIN_GZBUFFER_BYTES;
 
         // Fixed per-bucket overhead we can't tune.
