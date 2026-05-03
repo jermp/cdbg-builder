@@ -47,6 +47,7 @@
 #include <unistd.h>
 
 #include <essentials.hpp>
+#include <bit_vector.hpp>
 
 #include "bucket_io.hpp"
 #include "bucket_ingester.hpp"
@@ -223,8 +224,8 @@ struct builder {
             std::cout << "\n";
         }
 
-        std::cout << "done. wrote " << m_cfg.out_basename << ".fa and " << m_cfg.out_basename
-                  << ".colors\n";
+        std::cout << "done. wrote " << m_cfg.out_basename << ".fa, " << m_cfg.out_basename
+                  << ".u2c, and " << m_cfg.out_basename << ".colors\n";
         print_total();
     }
 
@@ -543,6 +544,16 @@ private:
     // header + memcpy for the sequence body. Significantly faster than
     // std::ofstream's default 8 KiB buffer + stream operators on millions
     // of small records.
+    //
+    // While we're already iterating unitigs in their final emission order
+    // (grouped by ascending cid), build the unitig-to-color-set "u2c"
+    // bit_vector and serialize it to <basename>.u2c. Bit i is set iff
+    // unitig i (in the .fa emission order) is the last unitig of a
+    // color-set run. Length = num_unitigs, popcount = num_color_classes.
+    // The downstream consumer (Fulgor) recovers the per-unitig color-set
+    // id via rank1(unitig_id) using a rank9 index it builds at load
+    // time. Matches the bit_vector layout in
+    // https://github.com/jermp/fulgor/blob/main/include/index.hpp .
     void emit_fasta(std::vector<stitchable_unitig> const& all_unitigs,
                     uint32_t num_color_classes) const {
         timer _("emit fasta");
@@ -567,8 +578,23 @@ private:
         auto reserve = [&](size_t n) {
             if (pos + n > BUF_BYTES) flush_buf();
         };
+
+        bits::bit_vector::builder u2c_bvb(all_unitigs.size(), /*init=*/false);
+        size_t emitted = 0;
+        uint32_t prev_cid = 0;
         for (uint32_t cid = 0; cid < num_color_classes; ++cid) {
             for (size_t idx : by_class[cid]) {
+                // Mark the final unitig of the previous run. emitted > 0
+                // guards the very first unitig (no predecessor); cid !=
+                // prev_cid is true on every group boundary because by_class
+                // is iterated in ascending cid order and we only enter
+                // this loop on non-empty groups.
+                if (emitted > 0 && cid != prev_cid) {
+                    u2c_bvb.set(emitted - 1, 1);
+                }
+                prev_cid = cid;
+                ++emitted;
+
                 std::string const& seq = all_unitigs[idx].seq;
                 // Header: '>' + decimal cid + '\n' fits in 12 chars for any uint32_t.
                 reserve(12);
@@ -590,6 +616,12 @@ private:
         }
         flush_buf();
         std::fclose(fa);
+
+        // Close out the very last run.
+        if (emitted > 0) u2c_bvb.set(emitted - 1, 1);
+        bits::bit_vector u2c;
+        u2c_bvb.build(u2c);
+        essentials::save(u2c, (m_cfg.out_basename + ".u2c").c_str());
     }
 
     void emit_colors(streaming_color_set_dict& global_dict) const {
