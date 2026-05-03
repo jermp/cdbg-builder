@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <fcntl.h>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -96,6 +98,44 @@ inline std::string format_bytes(uint64_t b) {
     else
         std::snprintf(buf, sizeof(buf), "%.2f %s", v, units[u]);
     return buf;
+}
+
+// Current resident set size in bytes (live RSS, not the lifetime peak).
+// Linux: parses VmRSS from /proc/self/status using a single read()
+// syscall to be robust against environments where stdio fopen() is
+// flaky. Returns 0 if unavailable -- callers should fall back to
+// process_peak_rss_bytes() (lifetime monotonic peak) in that case.
+//
+// Used by the bucket-write RSS watcher for hysteresis: trip pressure
+// at a high threshold, release at a low threshold once the spills
+// have actually brought live RSS back down. process_peak_rss_bytes()
+// is monotonic so it can't observe the release.
+inline uint64_t current_rss_bytes() {
+#if defined(__linux__)
+    int fd = ::open("/proc/self/status", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    char buf[4096];
+    ssize_t total = 0;
+    for (;;) {
+        ssize_t n = ::read(fd, buf + total, sizeof(buf) - 1 - (size_t)total);
+        if (n <= 0) break;
+        total += n;
+        if ((size_t)total >= sizeof(buf) - 1) break;
+    }
+    ::close(fd);
+    if (total <= 0) return 0;
+    buf[total] = 0;
+    char const* p = std::strstr(buf, "VmRSS:");
+    if (!p) return 0;
+    p += 6;
+    while (*p == ' ' || *p == '\t') ++p;
+    char* end = nullptr;
+    unsigned long kb = std::strtoul(p, &end, 10);
+    if (end == p) return 0;
+    return (uint64_t)kb * 1024ULL;
+#else
+    return 0;
+#endif
 }
 
 // ---- per-phase RSS marker --------------------------------------------------

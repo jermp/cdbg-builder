@@ -286,31 +286,38 @@ public:
 
     // ---- RSS pressure watcher --------------------------------------------
     //
-    // Spawn a background thread that polls process_peak_rss_bytes() (the
-    // kernel's lifetime high-water mark from getrusage). When the peak
-    // crosses `high_threshold_bytes`, set m_under_pressure: every
-    // bucket_compactor::insert_batch will then spill at end of batch
-    // regardless of its m_bytes threshold, and the watcher itself will
-    // sweep all compactors and force-spill any with pending state. Once
-    // tripped, pressure stays on for the rest of the phase (the kernel's
-    // peak RSS is monotonic, so we can't observe it dropping back).
+    // Background thread that polls live RSS (via /proc/self/status:VmRSS
+    // when available, else getrusage's monotonic peak as fallback). On
+    // OFF -> ON transition (RSS crosses high_threshold_bytes), the
+    // watcher sets m_under_pressure and sweeps all compactors once,
+    // force-spilling any with pending state. On ON -> OFF transition
+    // (RSS drops below low_threshold_bytes), the watcher clears the
+    // flag and ingest threads return to their normal m_bytes-based
+    // spill cadence.
     //
-    // The compactors' spill-to-disk semantics already make this safe:
-    // bucket_walker correctly merges duplicate records across spills, so
-    // the only cost of aggressive spilling is more disk records and a
-    // larger uncompressed bucket-write footprint.
+    // Hysteresis prevents the death-spiral seen with sticky pressure:
+    // without a release condition, every ingest call would spill for
+    // the rest of the phase, exploding spill counts and bucket file
+    // sizes (3.4M spills / 6.8 GB written observed on the 4546-genome
+    // workload). With hysteresis the steady state is "spill enough to
+    // stay under the cap, then resume normal cadence."
     //
-    // Per-thread bucket buffers and zlib state are NOT spillable -- they
-    // form a structural floor of approximately
+    // Fallback path: if current_rss_bytes() returns 0 (no /proc), the
+    // watcher uses process_peak_rss_bytes(). That is monotonic so
+    // there's no release; pressure stays sticky once tripped. Less
+    // efficient but still correct.
+    //
+    // Per-thread bucket buffers and zlib state are NOT spillable --
+    // they form a structural floor of approximately
     //   T*B*flush_bases*overhead + B*(gzbuffer + ~384 KiB)
     // bytes that no amount of pressure response can reduce. The auto-
-    // tune in builder picks flush_bases / gzbuffer to keep that floor
-    // under the budget; pressure response handles whatever the
-    // compactors add on top.
-    void start_rss_watcher(uint64_t high_threshold_bytes,
-                           std::chrono::milliseconds interval = std::chrono::milliseconds(50)) {
+    // tune in builder picks flush_bases / gzbuffer / num_buckets to
+    // keep that floor under the budget share for bucket-write.
+    void start_rss_watcher(uint64_t high_threshold_bytes, uint64_t low_threshold_bytes,
+                           std::chrono::milliseconds interval = std::chrono::milliseconds(100)) {
         if (m_watcher_running.exchange(true)) return;  // already started
         m_high_threshold_bytes = high_threshold_bytes;
+        m_low_threshold_bytes = low_threshold_bytes;
         m_watcher_thread = std::thread([this, interval] { watcher_run(interval); });
     }
 
@@ -323,24 +330,45 @@ public:
         return m_under_pressure.load(std::memory_order_relaxed);
     }
 
+    // Highest live RSS observed by the watcher during bucket-write.
+    // Useful for verifying that the cap actually held (vs the lifetime
+    // peak from getrusage, which can include earlier spikes).
+    uint64_t observed_rss_high() const {
+        return m_observed_rss_high.load(std::memory_order_relaxed);
+    }
+
+    bool pressure_was_engaged() const {
+        return m_pressure_was_engaged.load(std::memory_order_relaxed);
+    }
+
 private:
     void watcher_run(std::chrono::milliseconds interval) {
         while (m_watcher_running.load(std::memory_order_relaxed)) {
             std::this_thread::sleep_for(interval);
             if (!m_watcher_running.load(std::memory_order_relaxed)) break;
-            uint64_t peak = process_peak_rss_bytes();
-            if (peak == 0) continue;  // unsupported platform; can't enforce
-            if (peak >= m_high_threshold_bytes) {
-                bool was_under = m_under_pressure.exchange(true, std::memory_order_relaxed);
-                (void)was_under;
-                // Walk all compactors; force-spill any with pending state.
-                // Each compactor takes its own per-bucket lock, so this
-                // serialises only against ingest threads touching the
-                // same bucket -- the rest of the system stays parallel.
+            uint64_t rss = current_rss_bytes();
+            if (rss == 0) {
+                // /proc unavailable: fall back to lifetime peak. No
+                // release possible; pressure becomes sticky.
+                rss = process_peak_rss_bytes();
+                if (rss == 0) continue;  // can't enforce on this platform
+            }
+            uint64_t prev_high = m_observed_rss_high.load(std::memory_order_relaxed);
+            while (rss > prev_high &&
+                   !m_observed_rss_high.compare_exchange_weak(prev_high, rss,
+                                                              std::memory_order_relaxed)) {}
+            bool currently_under = m_under_pressure.load(std::memory_order_relaxed);
+            if (!currently_under && rss >= m_high_threshold_bytes) {
+                m_under_pressure.store(true, std::memory_order_relaxed);
+                m_pressure_was_engaged.store(true, std::memory_order_relaxed);
+                // One-shot sweep on transition: drain quiet buckets too.
+                // Ingest threads will keep things drained until release.
                 for (auto& c : m_compactors) {
                     if (!m_watcher_running.load(std::memory_order_relaxed)) break;
                     c->try_spill();
                 }
+            } else if (currently_under && rss <= m_low_threshold_bytes) {
+                m_under_pressure.store(false, std::memory_order_relaxed);
             }
         }
     }
@@ -356,9 +384,12 @@ private:
     // bucket_compactor::insert_batch via the pointer we hand them at
     // construction.
     std::atomic<bool> m_under_pressure{false};
+    std::atomic<bool> m_pressure_was_engaged{false};
+    std::atomic<uint64_t> m_observed_rss_high{0};
     std::atomic<bool> m_watcher_running{false};
     std::thread m_watcher_thread;
     uint64_t m_high_threshold_bytes = 0;
+    uint64_t m_low_threshold_bytes = 0;
 };
 
 // ---- Per-thread batching sidecar -------------------------------------------

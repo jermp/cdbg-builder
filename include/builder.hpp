@@ -97,19 +97,28 @@ struct builder {
 
         bucket_writer writer(tmp_dir, num_buckets, m_flush_bases, m_spill_bytes,
                              m_gzbuffer_bytes);
-        // When --max-ram is set, arm a background RSS watcher: once the
-        // process peak crosses ~85% of the budget, the watcher trips a
-        // pressure flag that makes every bucket_compactor::insert_batch
-        // spill at end-of-batch (and the watcher itself sweeps and
-        // force-spills quiet buckets). This gives bucket-write a hard
-        // cap on the only spillable structure (compactor maps), at the
-        // cost of more disk records under pressure. Per-thread buffers
-        // and zlib state are still bounded by the auto-tune above.
+        // When --max-ram is set, arm a background RSS watcher with
+        // hysteresis. Bucket-write must leave room for what comes
+        // after: bucket-process adds ~1 GiB on top on multi-thousand-
+        // genome inputs, stitch adds ~300 MiB. We reserve those by
+        // budgeting bucket-write at 60% of --max-ram (HIGH) with a
+        // release point at 45% (LOW). Once live RSS crosses HIGH, the
+        // watcher trips pressure and sweeps all compactors once;
+        // ingest threads then spill every batch until live RSS falls
+        // below LOW, at which point pressure clears and normal
+        // m_bytes-based spilling resumes. The hysteresis avoids the
+        // death-spiral of a sticky flag (every batch spills forever).
+        //
+        // If /proc/self/status isn't readable we fall back to the
+        // monotonic getrusage peak; in that case there's no release,
+        // pressure is sticky, and we do over-spill -- that's the
+        // safer-but-slower path on platforms without VmRSS.
         if (m_cfg.max_ram_gb > 0) {
             uint64_t budget_bytes =
                 (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0);
-            uint64_t high_threshold_bytes = (uint64_t)(0.85 * (double)budget_bytes);
-            writer.start_rss_watcher(high_threshold_bytes);
+            uint64_t high_threshold_bytes = (uint64_t)(0.60 * (double)budget_bytes);
+            uint64_t low_threshold_bytes = (uint64_t)(0.45 * (double)budget_bytes);
+            writer.start_rss_watcher(high_threshold_bytes, low_threshold_bytes);
         }
         {
             phase_rss_marker rss("bucket-write");
@@ -128,8 +137,9 @@ struct builder {
         // Stop the RSS watcher before close(): we don't want a stray
         // try_spill firing during close()'s final spill+gzclose loop.
         writer.stop_rss_watcher();
-        if (writer.under_pressure()) {
-            std::cout << "  bucket-write: hit RSS pressure threshold; spilled compactors aggressively\n";
+        if (writer.pressure_was_engaged()) {
+            std::cout << "  bucket-write: RSS pressure engaged; observed live-RSS high "
+                      << format_bytes(writer.observed_rss_high()) << "\n";
         }
         writer.close();
         std::cout << "  bucket bytes written: " << writer.total_bytes() << " (compressed; "
@@ -289,18 +299,32 @@ private:
         return fitted;
     }
 
-    // Heuristic. Tighter --max-ram -> more buckets so each per-thread
-    // bucket_kmer_map is smaller. Without --max-ram, default to the
-    // historical 1024 buckets.
+    // Heuristic, balancing two competing pressures:
+    //   - bucket-process per-bucket data shrinks with more buckets.
+    //   - bucket-write zlib state grows ~448 KiB per bucket (un-tunable
+    //     internal state + gzbuffer), which becomes the dominant peak
+    //     contributor on tight budgets.
+    //
+    // Strategy: pick the largest bucket_log2 such that the zlib floor
+    // num_buckets * ~448 KiB stays under ~30% of --max-ram. That keeps
+    // bucket-write's unspillable structural floor bounded; the
+    // remaining 70% absorbs per-thread buffers, compactor data, and
+    // the bucket-process working set.
+    //
+    // No --max-ram set -> historical 1024 buckets.
     uint32_t auto_bucket_log2() const {
         if (m_cfg.max_ram_gb <= 0) return MIN_BUCKETS_LOG2;
-        // Rule of thumb from the 4546-genome / 8-thread / 6.79 GiB
-        // measurement: each doubling of bucket_log2 roughly halves
-        // peak. So budget < 8 GiB -> 11, < 4 GiB -> 12, < 2 GiB -> 13.
-        if (m_cfg.max_ram_gb >= 8.0) return MIN_BUCKETS_LOG2;       // 1024
-        if (m_cfg.max_ram_gb >= 4.0) return MIN_BUCKETS_LOG2 + 1;   // 2048
-        if (m_cfg.max_ram_gb >= 2.0) return MIN_BUCKETS_LOG2 + 2;   // 4096
-        return MAX_BUCKETS_LOG2;                                    // 8192
+        constexpr double ZLIB_FLOOR_SHARE = 0.30;
+        constexpr uint64_t ZLIB_BYTES_PER_BUCKET = 448ull * 1024ull;  // gzbuffer + internal state
+        double budget_for_zlib =
+            m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0 * ZLIB_FLOOR_SHARE;
+        // Largest log2 in [MIN, MAX] such that (1 << log2) * ZLIB_BYTES <= budget_for_zlib.
+        uint32_t log2 = MAX_BUCKETS_LOG2;
+        while (log2 > MIN_BUCKETS_LOG2 &&
+               (double)((uint64_t)1 << log2) * (double)ZLIB_BYTES_PER_BUCKET > budget_for_zlib) {
+            --log2;
+        }
+        return log2;
     }
 
     // Heuristic. Cap the streaming-color bvb at ~1/4 of the budget, so
