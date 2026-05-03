@@ -2,7 +2,7 @@
 
 // Streaming color-set dict that writes its output incrementally to the
 // final on-disk artifact, never holding the whole compressed bit_vector
-// or the EF offsets in memory at once.
+// or the EF offsets array in memory at once.
 //
 // On intern() we (a) compute a 128-bit content hash of the candidate
 // color list, (b) look it up in m_index, and either return the existing
@@ -13,17 +13,20 @@
 // the trailing partial word + the bits being actively encoded for the
 // current candidate in memory.
 //
-// When finalize() is called, we
+// When a new class is interned, its bit_offset is appended (as a
+// uint64_t) to a sidecar offsets file at <output_path>.tmp_offsets.
+// At finalize() we
 //   - flush the trailing partial word (zero-padded to a full 64-bit word),
-//   - build a bits::elias_fano over the per-class bit_offsets we tracked
-//     during interning,
+//   - append the sentinel total_bit_count to the offsets sidecar,
+//   - rewind the sidecar and feed it through bits::elias_fano::encode
+//     via a single-pass file-backed iterator (so the offsets array
+//     never sits in RAM as a vector),
 //   - serialize the EF onto the file's tail,
 //   - fseek back to file start and overwrite the placeholder header
-//     with the now-known totals (bit_vector_num_bits / num_words /
-//     num_color_sets / etc.).
+//     with the now-known totals,
+//   - delete the offsets sidecar.
 //
-// On-disk layout of the resulting file (matches what the user's
-// downstream consumer expects: header -> color_sets -> EF offsets):
+// On-disk layout of the resulting file:
 //
 //   [u32 num_colors]
 //   [u32 sparse_threshold]
@@ -34,11 +37,16 @@
 //   [bit_vector_num_words * u64] color-set bit_vector words (LE host order)
 //   [serialized bits::elias_fano<false,false>]   per-class offsets
 //
-// Memory per class: 32 bytes of metadata (bit_offset, bit_length,
-// primary_hash, secondary_hash). Memory across classes: just
-// num_classes * 32 bytes + the dedup hashtable + the trailing partial
-// word in m_bvb. The compressed color-set bits themselves are NOT held
-// in memory beyond the flush threshold.
+// Memory per class: 16 bytes of metadata (primary + secondary hash for
+// dedup). Memory across classes: num_classes * 16 bytes + the dedup
+// hashtable + the trailing partial word in m_bvb. The compressed
+// color-set bits and the EF offsets array are NOT held in RAM. The EF
+// internal structures (compact_vector for low bits + bit_vector for
+// high bits) are still built in memory at finalize, sized
+// approximately num_classes * ceil(log2(universe / num_classes)) bits
+// for the low part and ~num_classes + universe/2^l bits for the high
+// part -- both compact, and dominated by the universe / num_classes
+// ratio rather than by num_classes itself.
 //
 // Dedup uses 128 bits of hash:
 //   primary   = wyhash(bytes)   (from ankerl::unordered_dense::detail)
@@ -53,6 +61,7 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <iterator>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -77,21 +86,28 @@ struct streaming_color_set_dict {
         , m_sparse_threshold((uint32_t)(0.25 * num_colors))
         , m_dense_threshold((uint32_t)(0.75 * num_colors))
         , m_index(0, hasher{&m_classes}, key_eq{&m_classes})
-        , m_output_path(std::move(output_path)) {
+        , m_output_path(std::move(output_path))
+        , m_offsets_path(m_output_path + ".tmp_offsets") {
         m_file = std::fopen(m_output_path.c_str(), "wb+");
         if (!m_file)
             throw std::runtime_error("cannot open color-set output: " + m_output_path);
-        // Reserve space for the fixed-size header. We don't know the
-        // final values (num_color_sets, bit_vector_num_bits, num_words)
-        // until finalize(), so write zeros for now and overwrite at the
-        // end via fseek.
         char hdr[HEADER_BYTES] = {};
         if (std::fwrite(hdr, 1, HEADER_BYTES, m_file) != HEADER_BYTES)
             throw std::runtime_error("short write of header to " + m_output_path);
+
+        m_offsets_file = std::fopen(m_offsets_path.c_str(), "wb+");
+        if (!m_offsets_file)
+            throw std::runtime_error("cannot open color-set offsets sidecar: " +
+                                     m_offsets_path);
     }
 
     ~streaming_color_set_dict() {
         if (m_file) std::fclose(m_file);
+        if (m_offsets_file) std::fclose(m_offsets_file);
+        if (!m_offsets_path.empty()) {
+            std::error_code ec;
+            std::filesystem::remove(m_offsets_path, ec);
+        }
     }
 
     streaming_color_set_dict(streaming_color_set_dict const&) = delete;
@@ -109,17 +125,18 @@ struct streaming_color_set_dict {
         uint64_t bit_offset = m_flushed_words * 64 + m_bvb.num_bits();
         hybrid_builder::encode_one(m_bvb, candidate.data(), candidate.size(), m_num_colors,
                                    m_sparse_threshold, m_dense_threshold);
-        uint64_t bit_length = (m_flushed_words * 64 + m_bvb.num_bits()) - bit_offset;
+
+        // Spill the per-class bit_offset to the sidecar (8 B per
+        // intern). Read back at finalize via a single-pass iterator;
+        // never lives in RAM as a vector.
+        if (std::fwrite(&bit_offset, sizeof(bit_offset), 1, m_offsets_file) != 1)
+            throw std::runtime_error("short write of class offset to " + m_offsets_path);
 
         uint32_t id = (uint32_t)m_classes.size();
-        m_classes.push_back({bit_offset, bit_length, primary, secondary});
+        m_classes.push_back({primary, secondary});
         m_index.insert(id);
         m_total_integers += candidate.size();
 
-        // Flush every COMPLETE 64-bit word to the output file. The
-        // trailing partial word stays in m_bvb so the next encode can
-        // continue at the same bit position. With this flushed every
-        // intern() call, in-memory bit storage is bounded by one word.
         spill_complete_words_();
 
         return id;
@@ -129,9 +146,9 @@ struct streaming_color_set_dict {
     uint64_t total_integers() const { return m_total_integers; }
     uint64_t total_bits() const { return m_flushed_words * 64 + m_bvb.num_bits(); }
 
-    // Finalize the on-disk file: flush the trailing partial word,
-    // build & serialize the EF over per-class bit-offsets, then
-    // fseek back to overwrite the placeholder header.
+    // Finalize the on-disk file: flush trailing partial word, build &
+    // serialize the EF over per-class bit-offsets streamed back from
+    // the sidecar, then fseek back to overwrite the placeholder header.
     void finalize() {
         if (m_finalized)
             throw std::runtime_error("streaming_color_set_dict::finalize called twice");
@@ -140,13 +157,9 @@ struct streaming_color_set_dict {
         const uint64_t total_bit_count = total_bits();
         const uint64_t total_word_count = (total_bit_count + 63) / 64;
 
-        // 1) Flush any trailing partial word (zero-padded to 64 bits)
-        //    so the file's bit_vector words section has exactly
-        //    total_word_count u64s.
+        // 1) Flush the trailing partial word (zero-padded to 64 bits).
         if (m_bvb.num_bits() > 0) {
             auto const& words = m_bvb.data();
-            // bit_vector::builder always keeps at least
-            // ceil(num_bits/64) words; we want exactly that many.
             size_t want = (m_bvb.num_bits() + 63) / 64;
             if (want > words.size()) want = words.size();
             if (want > 0) {
@@ -157,23 +170,29 @@ struct streaming_color_set_dict {
             m_bvb.clear();
         }
 
-        // 2) Build per-class offsets array (last entry = sentinel
-        //    total_bit_count) and encode it as elias_fano. The EF
-        //    itself is small relative to the bit_vector (typically a
-        //    few bytes per class), so we hold it in memory and
-        //    serialize via essentials onto the file tail.
-        std::vector<uint64_t> offsets;
-        offsets.reserve(m_classes.size() + 1);
-        for (auto const& e : m_classes) offsets.push_back(e.bit_offset);
-        offsets.push_back(total_bit_count);  // sentinel
+        // 2) Append the sentinel total_bit_count to the offsets
+        //    sidecar so EF::encode reads num_classes + 1 values.
+        if (std::fwrite(&total_bit_count, sizeof(total_bit_count), 1, m_offsets_file) != 1)
+            throw std::runtime_error("short write of EF sentinel to " + m_offsets_path);
+        std::fflush(m_offsets_file);
+        std::rewind(m_offsets_file);
 
+        // 3) Build EF via a file-backed input iterator. EF::encode
+        //    walks the sequence exactly once when universe is given,
+        //    so a single-pass iterator suffices.
+        const uint64_t n = (uint64_t)m_classes.size() + 1;
         bits::elias_fano<false, false> ef;
-        ef.encode(offsets.begin(), offsets.size(), offsets.back());
+        offset_file_iterator begin(m_offsets_file);
+        ++begin;  // load the first value into operator*
+        ef.encode(begin, n, total_bit_count);
 
-        // 3) Serialize EF to bytes via essentials (it walks ef.visit
-        //    and writes pods + vec sizes), then fwrite the bytes onto
-        //    the file's tail. essentials::generic_saver wants a
-        //    std::ostream so we round-trip through a stringstream.
+        std::fclose(m_offsets_file);
+        m_offsets_file = nullptr;
+        std::error_code ec;
+        std::filesystem::remove(m_offsets_path, ec);
+        m_offsets_path.clear();
+
+        // 4) Serialize EF to the file's tail via essentials.
         std::ostringstream oss(std::ios::binary);
         {
             essentials::generic_saver gs(oss);
@@ -185,7 +204,7 @@ struct streaming_color_set_dict {
                 throw std::runtime_error("short write of EF to " + m_output_path);
         }
 
-        // 4) Update the placeholder header with the now-known totals.
+        // 5) Update the placeholder header with the now-known totals.
         std::fflush(m_file);
         if (std::fseek(m_file, 0, SEEK_SET) != 0)
             throw std::runtime_error("fseek to header failed on " + m_output_path);
@@ -207,21 +226,7 @@ struct streaming_color_set_dict {
     }
 
 private:
-    // Header layout: see top-of-file comment.
-    //   u32 num_colors
-    //   u32 sparse_threshold
-    //   u32 dense_threshold
-    //   u64 num_color_sets
-    //   u64 bit_vector_num_bits
-    //   u64 bit_vector_num_words
     static constexpr size_t HEADER_BYTES = 4 + 4 + 4 + 8 + 8 + 8;
-
-    struct class_entry {
-        uint64_t bit_offset;
-        uint64_t bit_length;
-        uint64_t primary_hash;
-        uint64_t secondary_hash;
-    };
 
     struct hash_pair {
         uint64_t primary;
@@ -229,26 +234,56 @@ private:
     };
 
     struct hasher {
-        std::vector<class_entry> const* classes;
+        std::vector<hash_pair> const* classes;
         using is_transparent = void;
         using is_avalanching = void;
-        size_t operator()(uint32_t id) const noexcept { return (*classes)[id].primary_hash; }
+        size_t operator()(uint32_t id) const noexcept { return (*classes)[id].primary; }
         size_t operator()(hash_pair const& h) const noexcept { return h.primary; }
     };
 
     struct key_eq {
-        std::vector<class_entry> const* classes;
+        std::vector<hash_pair> const* classes;
         using is_transparent = void;
         bool operator()(uint32_t a, uint32_t b) const noexcept {
             auto const& ea = (*classes)[a];
             auto const& eb = (*classes)[b];
-            return ea.primary_hash == eb.primary_hash && ea.secondary_hash == eb.secondary_hash;
+            return ea.primary == eb.primary && ea.secondary == eb.secondary;
         }
         bool operator()(uint32_t a, hash_pair const& h) const noexcept {
             auto const& ea = (*classes)[a];
-            return ea.primary_hash == h.primary && ea.secondary_hash == h.secondary;
+            return ea.primary == h.primary && ea.secondary == h.secondary;
         }
         bool operator()(hash_pair const& h, uint32_t a) const noexcept { return (*this)(a, h); }
+    };
+
+    // Forward-input iterator over a sequence of u64s on disk. Used at
+    // finalize to feed bits::elias_fano::encode without ever
+    // materialising the offsets array in RAM. Single-pass: ++ reads
+    // the next u64 from the file; * returns the most recently read
+    // value. No equality / sentinel needed -- EF::encode iterates a
+    // known number of items.
+    struct offset_file_iterator {
+        using iterator_category = std::input_iterator_tag;
+        using value_type = uint64_t;
+        using difference_type = std::ptrdiff_t;
+        using pointer = uint64_t const*;
+        using reference = uint64_t const&;
+
+        std::FILE* f;
+        uint64_t cur = 0;
+
+        explicit offset_file_iterator(std::FILE* file) : f(file) {}
+
+        uint64_t operator*() const { return cur; }
+        offset_file_iterator& operator++() {
+            if (std::fread(&cur, sizeof(cur), 1, f) != 1) cur = 0;
+            return *this;
+        }
+        offset_file_iterator operator++(int) {
+            offset_file_iterator prev = *this;
+            ++(*this);
+            return prev;
+        }
     };
 
     static uint64_t wyhash_(std::vector<uint32_t> const& v) noexcept {
@@ -273,9 +308,6 @@ private:
             throw std::runtime_error("short header write to " + m_output_path);
     }
 
-    // Flush every COMPLETE 64-bit word to the output file; keep the
-    // trailing partial word (if any) in m_bvb so the next encode
-    // continues exactly where this one left off.
     void spill_complete_words_() {
         uint64_t bits = m_bvb.num_bits();
         uint64_t complete_words = bits / 64;
@@ -299,12 +331,14 @@ private:
 
     bits::bit_vector::builder m_bvb;
     uint64_t m_flushed_words = 0;
-    std::vector<class_entry> m_classes;
+    std::vector<hash_pair> m_classes;  // 16 B per class (dedup hashes only)
     ankerl::unordered_dense::set<uint32_t, hasher, key_eq> m_index;
     uint64_t m_total_integers = 0;
 
     std::FILE* m_file = nullptr;
     std::string m_output_path;
+    std::FILE* m_offsets_file = nullptr;
+    std::string m_offsets_path;
     bool m_finalized = false;
 };
 
