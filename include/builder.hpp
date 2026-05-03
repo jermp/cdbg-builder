@@ -185,13 +185,21 @@ struct builder {
         }
         m_num_color_classes = global_dict.size();
 
+        // Estimate total seq bytes that stitch will write to the
+        // unitig spill, used to size K below. Stitch can only shrink
+        // the total (each merge drops k-1 bases of overlap), so the
+        // sum over fragments is a safe upper bound. One pass over
+        // frag_unitigs, no copies.
+        uint64_t total_frag_seq_bytes = 0;
+        for (auto const& f : frag_unitigs) total_frag_seq_bytes += f.seq.size();
+
         // Stitch streams each finished unitig directly into a disk-
         // backed bucket sink: bucket b holds cids in
         // [b * S, (b+1) * S) where S = ceil(num_color_classes / K).
-        // This keeps the in-memory peak during stitch bounded by the
-        // walker's adjacency + visited bitmaps + the trailing partial
-        // chain -- the merged seq strings are not retained.
-        const uint32_t unitig_bucket_count = pick_unitig_bucket_count_(m_num_color_classes);
+        // K auto-scales so per-bucket peak stays under ~10% of
+        // --max-ram, regardless of how big the index gets.
+        const uint32_t unitig_bucket_count = pick_unitig_bucket_count_(
+            m_num_color_classes, total_frag_seq_bytes, m_cfg.max_ram_gb);
         unitig_bucket_writer uwriter(tmp_dir, m_num_color_classes, unitig_bucket_count);
         {
             phase_rss_marker rss("stitch");
@@ -541,17 +549,45 @@ private:
         std::filesystem::remove_all(tmp_dir, ec);
     }
 
-    // Pick the cid-range bucket count for the unitig spill. We want
-    // each bucket's seq payload to fit comfortably in RAM during
-    // emit. For the salmonella-4546 reference (~190 MB total seq /
-    // 1.88 M unitigs across 972 K cids), 64 buckets gives ~3 MB / 30 K
-    // unitigs per bucket -- comfortably bounded regardless of
-    // --max-ram. We don't need the bucket count to scale with the
-    // budget: emit reads one bucket at a time.
-    static uint32_t pick_unitig_bucket_count_(uint64_t num_color_classes) {
+    // Pick the cid-range bucket count for the unitig spill, so the
+    // peak in-RAM seq footprint at emit time -- one bucket loaded
+    // and sorted -- stays under a target fraction of --max-ram.
+    //
+    // Each bucket's records: roughly total_seq_bytes / K plus
+    // ~2x overhead (std::string capacity slack + per-record book-
+    // keeping in the sort vector). We size K so that target
+    // per-bucket footprint is <= 10% of --max-ram, leaving the
+    // remaining 90% for whatever else is resident at emit time
+    // (the streaming color-set dict's metadata, the FILE buffer,
+    // the u2c bit_vector, etc.). Floor at MIN_K so we don't end
+    // up with one giant bucket when --max-ram is unset or huge,
+    // ceiling at MAX_K to stay within RLIMIT_NOFILE headroom
+    // (bucket-write's FDs are already closed when stitch starts,
+    // so we have ~1024 FDs available).
+    static uint32_t pick_unitig_bucket_count_(uint64_t num_color_classes,
+                                              uint64_t total_seq_bytes_estimate,
+                                              double max_ram_gb) {
         if (num_color_classes == 0) return 1;
-        constexpr uint32_t TARGET = 64;
-        return (uint32_t)std::min<uint64_t>(num_color_classes, TARGET);
+        constexpr uint32_t MIN_K = 16;
+        constexpr uint32_t MAX_K = 1024;
+        constexpr uint32_t DEFAULT_K = 64;
+        constexpr double OVERHEAD = 2.0;
+        constexpr double SHARE = 0.10;
+
+        if (max_ram_gb <= 0 || total_seq_bytes_estimate == 0) {
+            return (uint32_t)std::min<uint64_t>(num_color_classes, DEFAULT_K);
+        }
+        const uint64_t budget_bytes =
+            (uint64_t)(max_ram_gb * 1024.0 * 1024.0 * 1024.0 * SHARE);
+        if (budget_bytes == 0) {
+            return (uint32_t)std::min<uint64_t>(num_color_classes, DEFAULT_K);
+        }
+        const uint64_t needed = (uint64_t)((double)total_seq_bytes_estimate * OVERHEAD);
+        uint64_t k = (needed + budget_bytes - 1) / budget_bytes;
+        if (k < MIN_K) k = MIN_K;
+        if (k > MAX_K) k = MAX_K;
+        if (k > num_color_classes) k = num_color_classes;
+        return (uint32_t)k;
     }
 
     // FASTA emit. Hand-rolled 1 MiB buffer + std::to_chars for the
