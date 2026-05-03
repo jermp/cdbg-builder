@@ -53,14 +53,14 @@ inline constexpr size_t DEFAULT_COMPACTOR_GZBUFFER_BYTES = 256 * 1024;
 
 class bucket_compactor {
 public:
-    // `under_pressure` (optional) is a writer-owned atomic flag set by the
-    // RSS watcher when the process approaches the --max-ram budget. When
-    // set, insert_batch spills at the end of every batch (ignoring the
-    // m_spill_bytes threshold), and try_spill() lets the watcher itself
-    // force-flush quiet buckets.
-    bucket_compactor(std::string path, size_t spill_bytes, size_t gzbuffer_bytes,
-                     std::atomic<bool> const* under_pressure = nullptr)
-        : m_path(std::move(path)), m_spill_bytes(spill_bytes), m_under_pressure(under_pressure) {
+    // try_spill() is the writer's RSS-watcher entry point: when the
+    // process is over the --max-ram budget the watcher walks every
+    // compactor and force-spills any with pending data. Per-batch
+    // ingest itself is unaware of pressure; spill cadence stays at
+    // m_bytes >= m_spill_bytes so dedup state per spill remains
+    // worthwhile.
+    bucket_compactor(std::string path, size_t spill_bytes, size_t gzbuffer_bytes)
+        : m_path(std::move(path)), m_spill_bytes(spill_bytes) {
         m_file = gzopen(m_path.c_str(), "wb1");
         if (!m_file)
             throw std::runtime_error("cannot open bucket file: " + m_path + ": " +
@@ -216,7 +216,6 @@ private:
 
     std::string m_path;
     size_t m_spill_bytes;
-    std::atomic<bool> const* m_under_pressure = nullptr;
     std::mutex m_mu;
     gzFile m_file = nullptr;
     ankerl::unordered_dense::map<std::string, entry, string_hash, string_eq> m_dedup;
@@ -235,8 +234,8 @@ public:
         std::filesystem::create_directories(m_dir);
         m_compactors.reserve(num_buckets);
         for (uint32_t b = 0; b < num_buckets; ++b) {
-            m_compactors.emplace_back(std::make_unique<bucket_compactor>(
-                bucket_path(b), spill_bytes, gzbuffer_bytes, &m_under_pressure));
+            m_compactors.emplace_back(
+                std::make_unique<bucket_compactor>(bucket_path(b), spill_bytes, gzbuffer_bytes));
         }
     }
 
