@@ -94,7 +94,7 @@ struct builder {
 
         bucket_writer writer(tmp_dir, num_buckets);
         {
-            rss_phase_tracker rss("bucket-write");
+            phase_rss_marker rss("bucket-write");
             {
                 timer _("bucket-write");
                 std::atomic<uint64_t> done{0};
@@ -103,9 +103,8 @@ struct builder {
                                 m_cfg.num_threads, &done);
                 prog.stop();
             }
-            // Sample the RSS while compactor hashmaps are still alive
-            // (they get freed by writer.close() below). The peak should
-            // already have been captured by the sampler during ingest.
+            // Snapshot before writer.close() frees the compactor
+            // hashmaps -- their memory is part of the bucket-write peak.
             rss.stop();
         }
         writer.close();
@@ -130,7 +129,7 @@ struct builder {
         }
         std::mutex global_mu;
         {
-            rss_phase_tracker rss("bucket-process");
+            phase_rss_marker rss("bucket-process");
             {
                 timer _("bucket-process");
                 std::atomic<uint64_t> done{0};
@@ -147,7 +146,7 @@ struct builder {
 
         std::vector<stitchable_unitig> all_unitigs;
         {
-            rss_phase_tracker rss("stitch");
+            phase_rss_marker rss("stitch");
             {
                 timer _("stitch");
                 std::atomic<uint64_t> done{0};
@@ -162,7 +161,7 @@ struct builder {
         m_num_unitigs = all_unitigs.size();
 
         {
-            rss_phase_tracker rss("emit");
+            phase_rss_marker rss("emit");
             emit_fasta(all_unitigs, global_dict.size());
             emit_colors(global_dict);
             rss.stop();
