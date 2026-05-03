@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -27,6 +28,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <string_view>
 #include <sys/stat.h>
 #include <vector>
@@ -51,8 +53,14 @@ inline constexpr size_t DEFAULT_COMPACTOR_GZBUFFER_BYTES = 256 * 1024;
 
 class bucket_compactor {
 public:
-    bucket_compactor(std::string path, size_t spill_bytes, size_t gzbuffer_bytes)
-        : m_path(std::move(path)), m_spill_bytes(spill_bytes) {
+    // `under_pressure` (optional) is a writer-owned atomic flag set by the
+    // RSS watcher when the process approaches the --max-ram budget. When
+    // set, insert_batch spills at the end of every batch (ignoring the
+    // m_spill_bytes threshold), and try_spill() lets the watcher itself
+    // force-flush quiet buckets.
+    bucket_compactor(std::string path, size_t spill_bytes, size_t gzbuffer_bytes,
+                     std::atomic<bool> const* under_pressure = nullptr)
+        : m_path(std::move(path)), m_spill_bytes(spill_bytes), m_under_pressure(under_pressure) {
         m_file = gzopen(m_path.c_str(), "wb1");
         if (!m_file)
             throw std::runtime_error("cannot open bucket file: " + m_path + ": " +
@@ -118,12 +126,30 @@ public:
         }
         prof.ns_hashmap.fetch_add(bucket_write_prof::since(t_map), std::memory_order_relaxed);
         prof.n_records.fetch_add(recs.size(), std::memory_order_relaxed);
-        if (m_bytes >= m_spill_bytes) {
+        // Spill on either threshold or external memory pressure. Under
+        // pressure we spill every batch -- correctness is unchanged
+        // (bucket_walker merges duplicate records across spills) and
+        // RSS gets immediate relief at the cost of more disk records.
+        bool pressure = m_under_pressure && m_under_pressure->load(std::memory_order_relaxed);
+        if (m_bytes >= m_spill_bytes || pressure) {
             auto t_sp = bucket_write_prof::clock::now();
             spill_locked();
             prof.ns_spill.fetch_add(bucket_write_prof::since(t_sp), std::memory_order_relaxed);
             prof.n_spills.fetch_add(1, std::memory_order_relaxed);
         }
+    }
+
+    // Force-spill any pending entries, no-op if already empty. Called by
+    // the writer's RSS watcher to drain quiet buckets that aren't seeing
+    // ingest traffic but still hold accumulated state.
+    void try_spill() {
+        std::lock_guard<std::mutex> lk(m_mu);
+        if (m_dedup.empty()) return;
+        auto& prof = bucket_prof();
+        auto t_sp = bucket_write_prof::clock::now();
+        spill_locked();
+        prof.ns_spill.fetch_add(bucket_write_prof::since(t_sp), std::memory_order_relaxed);
+        prof.n_spills.fetch_add(1, std::memory_order_relaxed);
     }
 
     void close() {
@@ -185,6 +211,7 @@ private:
 
     std::string m_path;
     size_t m_spill_bytes;
+    std::atomic<bool> const* m_under_pressure = nullptr;
     std::mutex m_mu;
     gzFile m_file = nullptr;
     ankerl::unordered_dense::map<std::string, entry, string_hash, string_eq> m_dedup;
@@ -203,12 +230,15 @@ public:
         std::filesystem::create_directories(m_dir);
         m_compactors.reserve(num_buckets);
         for (uint32_t b = 0; b < num_buckets; ++b) {
-            m_compactors.emplace_back(
-                std::make_unique<bucket_compactor>(bucket_path(b), spill_bytes, gzbuffer_bytes));
+            m_compactors.emplace_back(std::make_unique<bucket_compactor>(
+                bucket_path(b), spill_bytes, gzbuffer_bytes, &m_under_pressure));
         }
     }
 
-    ~bucket_writer() { close(); }
+    ~bucket_writer() {
+        stop_rss_watcher();
+        close();
+    }
 
     bucket_writer(bucket_writer const&) = delete;
     bucket_writer& operator=(bucket_writer const&) = delete;
@@ -254,7 +284,67 @@ public:
         return m_total_uncompressed.load(std::memory_order_relaxed);
     }
 
+    // ---- RSS pressure watcher --------------------------------------------
+    //
+    // Spawn a background thread that polls process_peak_rss_bytes() (the
+    // kernel's lifetime high-water mark from getrusage). When the peak
+    // crosses `high_threshold_bytes`, set m_under_pressure: every
+    // bucket_compactor::insert_batch will then spill at end of batch
+    // regardless of its m_bytes threshold, and the watcher itself will
+    // sweep all compactors and force-spill any with pending state. Once
+    // tripped, pressure stays on for the rest of the phase (the kernel's
+    // peak RSS is monotonic, so we can't observe it dropping back).
+    //
+    // The compactors' spill-to-disk semantics already make this safe:
+    // bucket_walker correctly merges duplicate records across spills, so
+    // the only cost of aggressive spilling is more disk records and a
+    // larger uncompressed bucket-write footprint.
+    //
+    // Per-thread bucket buffers and zlib state are NOT spillable -- they
+    // form a structural floor of approximately
+    //   T*B*flush_bases*overhead + B*(gzbuffer + ~384 KiB)
+    // bytes that no amount of pressure response can reduce. The auto-
+    // tune in builder picks flush_bases / gzbuffer to keep that floor
+    // under the budget; pressure response handles whatever the
+    // compactors add on top.
+    void start_rss_watcher(uint64_t high_threshold_bytes,
+                           std::chrono::milliseconds interval = std::chrono::milliseconds(50)) {
+        if (m_watcher_running.exchange(true)) return;  // already started
+        m_high_threshold_bytes = high_threshold_bytes;
+        m_watcher_thread = std::thread([this, interval] { watcher_run(interval); });
+    }
+
+    void stop_rss_watcher() {
+        if (!m_watcher_running.exchange(false)) return;
+        if (m_watcher_thread.joinable()) m_watcher_thread.join();
+    }
+
+    bool under_pressure() const {
+        return m_under_pressure.load(std::memory_order_relaxed);
+    }
+
 private:
+    void watcher_run(std::chrono::milliseconds interval) {
+        while (m_watcher_running.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(interval);
+            if (!m_watcher_running.load(std::memory_order_relaxed)) break;
+            uint64_t peak = process_peak_rss_bytes();
+            if (peak == 0) continue;  // unsupported platform; can't enforce
+            if (peak >= m_high_threshold_bytes) {
+                bool was_under = m_under_pressure.exchange(true, std::memory_order_relaxed);
+                (void)was_under;
+                // Walk all compactors; force-spill any with pending state.
+                // Each compactor takes its own per-bucket lock, so this
+                // serialises only against ingest threads touching the
+                // same bucket -- the rest of the system stays parallel.
+                for (auto& c : m_compactors) {
+                    if (!m_watcher_running.load(std::memory_order_relaxed)) break;
+                    c->try_spill();
+                }
+            }
+        }
+    }
+
     std::string m_dir;
     uint32_t m_num_buckets;
     size_t m_flush_bases;
@@ -262,6 +352,13 @@ private:
     std::atomic<uint64_t> m_total_compressed{0};
     std::atomic<uint64_t> m_total_uncompressed{0};
     bool m_closed = false;
+    // Pressure flag set by the RSS watcher; consulted by every
+    // bucket_compactor::insert_batch via the pointer we hand them at
+    // construction.
+    std::atomic<bool> m_under_pressure{false};
+    std::atomic<bool> m_watcher_running{false};
+    std::thread m_watcher_thread;
+    uint64_t m_high_threshold_bytes = 0;
 };
 
 // ---- Per-thread batching sidecar -------------------------------------------

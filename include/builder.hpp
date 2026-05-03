@@ -97,6 +97,20 @@ struct builder {
 
         bucket_writer writer(tmp_dir, num_buckets, m_flush_bases, m_spill_bytes,
                              m_gzbuffer_bytes);
+        // When --max-ram is set, arm a background RSS watcher: once the
+        // process peak crosses ~85% of the budget, the watcher trips a
+        // pressure flag that makes every bucket_compactor::insert_batch
+        // spill at end-of-batch (and the watcher itself sweeps and
+        // force-spills quiet buckets). This gives bucket-write a hard
+        // cap on the only spillable structure (compactor maps), at the
+        // cost of more disk records under pressure. Per-thread buffers
+        // and zlib state are still bounded by the auto-tune above.
+        if (m_cfg.max_ram_gb > 0) {
+            uint64_t budget_bytes =
+                (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0);
+            uint64_t high_threshold_bytes = (uint64_t)(0.85 * (double)budget_bytes);
+            writer.start_rss_watcher(high_threshold_bytes);
+        }
         {
             phase_rss_marker rss("bucket-write");
             {
@@ -110,6 +124,12 @@ struct builder {
             // Snapshot before writer.close() frees the compactor
             // hashmaps -- their memory is part of the bucket-write peak.
             rss.stop();
+        }
+        // Stop the RSS watcher before close(): we don't want a stray
+        // try_spill firing during close()'s final spill+gzclose loop.
+        writer.stop_rss_watcher();
+        if (writer.under_pressure()) {
+            std::cout << "  bucket-write: hit RSS pressure threshold; spilled compactors aggressively\n";
         }
         writer.close();
         std::cout << "  bucket bytes written: " << writer.total_bytes() << " (compressed; "
