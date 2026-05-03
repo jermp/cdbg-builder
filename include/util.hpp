@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <fcntl.h>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -26,8 +28,16 @@ struct build_config {
     uint32_t k = 31;
     uint32_t num_threads = 1;
     uint32_t m = 0;             // minimizer length, 0 = auto (compute_best_m(k))
-    uint32_t bucket_log2 = 10;  // 2^10 = 1024 minimizer buckets
+    uint32_t bucket_log2 = 0;   // 0 = auto (derived from max_ram_gb if set, else 10)
     std::string tmp_dir;        // scratch dir; empty -> mkdtemp under $TMPDIR
+    // Soft RAM budget in GiB. 0 = no budget. When set, the builder
+    // auto-picks bucket_log2 (more buckets -> smaller per-bucket data
+    // structures) and streams the encoded color bit_vector to a
+    // sidecar file when it would exceed a fraction of the budget.
+    // The peak RSS is reported at end-of-build; if it exceeded the
+    // budget, the report says so (the build is not killed -- the
+    // budget is a soft target, not a hard cap).
+    double max_ram_gb = 0.0;
     bool verbose = false;
 };
 
@@ -89,6 +99,93 @@ inline std::string format_bytes(uint64_t b) {
         std::snprintf(buf, sizeof(buf), "%.2f %s", v, units[u]);
     return buf;
 }
+
+// Current resident set size in bytes (live RSS, not the lifetime peak).
+// Linux: parses VmRSS from /proc/self/status using a single read()
+// syscall to be robust against environments where stdio fopen() is
+// flaky. Returns 0 if unavailable -- callers should fall back to
+// process_peak_rss_bytes() (lifetime monotonic peak) in that case.
+//
+// Used by the bucket-write RSS watcher for hysteresis: trip pressure
+// at a high threshold, release at a low threshold once the spills
+// have actually brought live RSS back down. process_peak_rss_bytes()
+// is monotonic so it can't observe the release.
+inline uint64_t current_rss_bytes() {
+#if defined(__linux__)
+    int fd = ::open("/proc/self/status", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    char buf[4096];
+    ssize_t total = 0;
+    for (;;) {
+        ssize_t n = ::read(fd, buf + total, sizeof(buf) - 1 - (size_t)total);
+        if (n <= 0) break;
+        total += n;
+        if ((size_t)total >= sizeof(buf) - 1) break;
+    }
+    ::close(fd);
+    if (total <= 0) return 0;
+    buf[total] = 0;
+    char const* p = std::strstr(buf, "VmRSS:");
+    if (!p) return 0;
+    p += 6;
+    while (*p == ' ' || *p == '\t') ++p;
+    char* end = nullptr;
+    unsigned long kb = std::strtoul(p, &end, 10);
+    if (end == p) return 0;
+    return (uint64_t)kb * 1024ULL;
+#else
+    return 0;
+#endif
+}
+
+// ---- per-phase RSS marker --------------------------------------------------
+//
+// process_peak_rss_bytes() above is the lifetime high-water mark via
+// getrusage; it is monotonically non-decreasing across the run. We
+// piggy-back on it: at the end of each phase, snapshot it and print
+//
+//     [<phase> peak RSS] X.XX GiB (+Y.YY GiB)
+//
+// where the parenthesised delta is the increase since the previous
+// snapshot. A non-zero delta means this phase pushed the high-water
+// mark; a zero delta means everything this phase touched fit under
+// the previous peak. The signal is coarser than an in-phase sampler
+// (a phase that allocates and frees within itself without crossing
+// the prior watermark shows +0.00) but it works wherever getrusage
+// works -- no /proc parsing, no sampler thread.
+
+class phase_rss_marker {
+public:
+    explicit phase_rss_marker(std::string label) : m_label(std::move(label)) {
+        m_baseline = process_peak_rss_bytes();
+    }
+    ~phase_rss_marker() { stop(); }
+
+    phase_rss_marker(phase_rss_marker const&) = delete;
+    phase_rss_marker& operator=(phase_rss_marker const&) = delete;
+
+    void stop() {
+        if (m_stopped) return;
+        m_stopped = true;
+        uint64_t now = process_peak_rss_bytes();
+        if (now == 0) {
+            std::cout << "  [" << m_label << " peak RSS] unavailable\n";
+            return;
+        }
+        std::cout << "  [" << m_label << " peak RSS] " << format_bytes(now);
+        if (now > m_baseline) {
+            std::cout << " (+" << format_bytes(now - m_baseline) << ")";
+        } else {
+            std::cout << " (+0)";
+        }
+        std::cout << "\n";
+    }
+
+private:
+    std::string m_label;
+    uint64_t m_baseline = 0;
+    bool m_stopped = false;
+};
 
 // ---- progress reporter ------------------------------------------------------
 
