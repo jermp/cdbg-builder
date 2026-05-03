@@ -344,23 +344,50 @@ private:
         return m_cfg.max_ram_gb / PLATFORM_RAM_OVERHEAD;
     }
 
-    // The LZ4 frame compressor state (max64KB block, blockIndependent,
-    // autoFlush=1) plus its small output scratch is ~40 KiB per bucket,
-    // vs zlib level-1's ~256-448 KiB. So with LZ4 the compressor floor
-    // barely contributes and we can use many more buckets at the same
-    // budget. Conservative cap at 64 KiB / bucket including malloc
-    // overhead. Pick the largest log2 in [MIN, MAX] such that
-    // num_buckets * 64 KiB <= 30% of effective --max-ram.
+    // Pick the bucket count by enforcing that the *full* bucket-write
+    // structural floor at MIN values fits in the bucket-write share of
+    // the (platform-derated) budget. The structural floor at the
+    // floor-tunable values is:
+    //
+    //   B * (compressor_per_bucket
+    //        + T * MIN_FLUSH_BASES * BUFFER_OVERHEAD
+    //        + MIN_SPILL_BYTES * COMPACTOR_OVERHEAD)
+    //
+    // i.e. the per-bucket cost when flush_bases / spill_bytes have
+    // already collapsed to their minimums. Picking log2 such that this
+    // fits in SHARE * effective_ram leaves room for the auto-tune to
+    // actually choose values above the floor (and so to spill less
+    // often, write fewer disk records, and stay within real RSS).
+    //
+    // The earlier "compressor-only" check picked too high a log2 once
+    // LZ4 made the compressor cheap: at --max-ram 4 / 8 threads it
+    // accepted 8192 buckets, which collapsed flush_bases and
+    // spill_bytes to floors and pushed the per-thread + compactor
+    // contributions far past budget.
+    //
+    // No --max-ram set -> historical 1024 buckets.
     uint32_t auto_bucket_log2() const {
         if (m_cfg.max_ram_gb <= 0) return MIN_BUCKETS_LOG2;
-        constexpr double COMPRESSOR_FLOOR_SHARE = 0.30;
-        constexpr uint64_t COMPRESSOR_BYTES_PER_BUCKET = 64ull * 1024ull;  // LZ4 cctx + out_buf
-        double budget_for_compressor =
-            effective_max_ram_gb() * 1024.0 * 1024.0 * 1024.0 * COMPRESSOR_FLOOR_SHARE;
+        // Match the constants used by auto_tune_bucket_write_params --
+        // they have to be consistent for this estimate to be right.
+        constexpr double SHARE = 0.50;
+        constexpr double COMPACTOR_OVERHEAD = 5.0;
+        constexpr double BUFFER_OVERHEAD = 2.0;
+        constexpr uint64_t COMPRESSOR_BYTES_PER_BUCKET = 64ull * 1024ull;
+        constexpr uint64_t MIN_FLUSH_BASES = 4ull * 1024ull;
+        constexpr uint64_t MIN_SPILL_BYTES = 16ull * 1024ull;
+
+        const uint64_t T = std::max<uint64_t>(1, m_cfg.num_threads);
+        const uint64_t per_bucket_floor =
+            COMPRESSOR_BYTES_PER_BUCKET +
+            (uint64_t)(T * MIN_FLUSH_BASES * BUFFER_OVERHEAD) +
+            (uint64_t)(MIN_SPILL_BYTES * COMPACTOR_OVERHEAD);
+        const double share_bytes =
+            effective_max_ram_gb() * 1024.0 * 1024.0 * 1024.0 * SHARE;
+
         uint32_t log2 = MAX_BUCKETS_LOG2;
         while (log2 > MIN_BUCKETS_LOG2 &&
-               (double)((uint64_t)1 << log2) * (double)COMPRESSOR_BYTES_PER_BUCKET >
-                   budget_for_compressor) {
+               (double)((uint64_t)1 << log2) * (double)per_bucket_floor > share_bytes) {
             --log2;
         }
         return log2;
