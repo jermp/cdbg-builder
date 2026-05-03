@@ -371,9 +371,9 @@ private:
         // Match the constants used by auto_tune_bucket_write_params --
         // they have to be consistent for this estimate to be right.
         constexpr double SHARE = 0.50;
-        constexpr double COMPACTOR_OVERHEAD = 5.0;
+        constexpr double COMPACTOR_OVERHEAD = 7.0;
         constexpr double BUFFER_OVERHEAD = 2.0;
-        constexpr uint64_t COMPRESSOR_BYTES_PER_BUCKET = 64ull * 1024ull;
+        constexpr uint64_t COMPRESSOR_BYTES_PER_BUCKET = 4ull * 1024ull;
         constexpr uint64_t MIN_FLUSH_BASES = 4ull * 1024ull;
         constexpr uint64_t MIN_SPILL_BYTES = 16ull * 1024ull;
 
@@ -422,10 +422,13 @@ private:
     //   (d) ankerl::unordered_dense map structure overhead per entry.
     //
     // The compressor term used to dominate (zlib level-1 at ~256-448
-    // KiB per gzFile) but with LZ4 frame (max64KB block,
-    // blockIndependent, autoFlush=1) the per-bucket cctx + small
-    // output scratch is ~40-64 KiB. We bake that conservatively into
-    // COMPRESSOR_BYTES_PER_BUCKET = 64 KiB.
+    // KiB per gzFile). With LZ4's block API (LZ4_compress_default is
+    // stateless from the caller's view) there is no persistent
+    // compressor state per bucket -- only the m_batch_buf and
+    // m_out_buf scratch buffers, which are accounted for inside
+    // COMPACTOR_OVERHEAD (raised to 7x). COMPRESSOR_BYTES_PER_BUCKET
+    // here is just a small constant for unmodelled per-bucket
+    // bookkeeping.
     //
     // Strategy: reserve a target share (default 50%) of --max-ram for
     // bucket-write. Subtract the (small) compressor floor. Split what
@@ -442,9 +445,14 @@ private:
             return;
         }
         constexpr double SHARE = 0.50;              // half the budget for bucket-write
-        constexpr double COMPACTOR_OVERHEAD = 5.0;  // compactor: structure + key allocs + frag
+        constexpr double COMPACTOR_OVERHEAD = 7.0;  // compactor: structure + key allocs + frag
         constexpr double BUFFER_OVERHEAD = 2.0;     // per-thread: capacity slack + recs vec
-        constexpr size_t COMPRESSOR_BYTES_PER_BUCKET = 64 * 1024;  // LZ4 cctx + out_buf
+        // LZ4 block API has no persistent compressor state -- the
+        // batch and out buffers we hold between spills are accounted
+        // for by COMPACTOR_OVERHEAD (raised from 5x to 7x to cover
+        // them). Keep a small constant here for unmodelled per-bucket
+        // bookkeeping (FILE handle, mutex padding, etc.).
+        constexpr size_t COMPRESSOR_BYTES_PER_BUCKET = 4 * 1024;
         constexpr size_t MIN_FLUSH_BASES = 4 * 1024;
         constexpr size_t MIN_SPILL_BYTES = 16 * 1024;
         constexpr size_t MAX_FLUSH_BASES = 64 * 1024;   // historical default

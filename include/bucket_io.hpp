@@ -8,29 +8,36 @@
 // stored once with the union of its colors. Compaction happens online in
 // per-bucket hashmaps; ingest threads flush their per-thread buffers into
 // the bucket's hashmap under the bucket mutex, and the hashmap spills its
-// contents to disk (LZ4 frame, fast mode) whenever it crosses a memory
-// budget. The bucket walker correctly merges color sets across multiple
-// spilled records for the same super-k-mer, so spilling is purely a
-// memory bound.
+// contents to disk whenever it crosses a memory budget. The bucket walker
+// correctly merges color sets across multiple spilled records for the
+// same super-k-mer, so spilling is purely a memory bound.
 //
 // On dense pangenome inputs (e.g. many closely-related bacterial genomes)
 // most super-k-mers are shared across colors, so compaction is the main
 // disk-write reduction over a naive one-record-per-occurrence layout.
 //
-// LZ4 (frame API) replaced zlib level-1 here for two reasons:
-//   1. Per-bucket compression-context state is much smaller (~24 KiB
-//      with autoFlush=1 and max64KB blocks vs ~256 KiB for zlib's
-//      deflate state + hash chains + sliding window). On runs with
-//      thousands of buckets this slashes the unspillable structural
-//      floor of bucket-write.
-//   2. LZ4 fast mode is 3-5x faster than zlib level-1 at similar (or
-//      slightly better) compression ratios on our small-record stream,
-//      so spill time drops too.
+// Bucket file format (LZ4 block API + custom per-spill framing):
 //
-// File format: an LZ4 frame written via LZ4F_compressBegin /
-// LZ4F_compressUpdate / LZ4F_compressEnd. Bucket files are ~1.5-2x
-// larger than they were under zlib level-1 in practice; that's the
-// tradeoff for the much smaller in-RAM state.
+//   repeat:
+//     [u32 uncompressed_size]   little-endian; 0 marks end-of-stream
+//     [u32 compressed_size]     bytes of LZ4-compressed data that follow
+//     [compressed bytes]        LZ4_compress_default output
+//
+// Each spill produces ONE frame containing all of that spill's
+// super-k-mer records concatenated. Batching per spill (instead of
+// per-record) is essential: LZ4 has a few-byte per-block framing
+// overhead, and per-record compression of ~100-byte inputs ended up
+// producing files *larger* than the input (overhead exceeded
+// compression savings). Per-spill batching gives proper LZ4
+// compression ratio on the joint super-k-mer record stream.
+//
+// We use the LZ4 block API (LZ4_compress_default / LZ4_decompress_safe)
+// rather than the frame API because there's no per-bucket compression
+// context: LZ4_compress_default is stateless from the caller's view
+// (its internal hash table lives on the call's stack). With thousands
+// of buckets that means zero persistent compressor state per bucket --
+// the per-bucket footprint is just the batch + output scratch buffers,
+// already accounted for in spill_bytes.
 
 #include <algorithm>
 #include <atomic>
@@ -48,7 +55,7 @@
 #include <string_view>
 #include <sys/stat.h>
 #include <vector>
-#include <lz4frame.h>
+#include <lz4.h>
 
 #include <unordered_dense/unordered_dense.h>
 
@@ -62,11 +69,6 @@ namespace cdgb {
 // Default per-bucket hashmap memory budget (estimated). With 1024 buckets
 // at this budget the global ingest peak from the compactors is ~256 MiB.
 inline constexpr size_t DEFAULT_COMPACTOR_SPILL_BYTES = 256 * 1024;
-// Per-bucket LZ4 output scratch buffer initial size. Records are
-// typically <1 KiB and autoFlush=1 produces output proportional to
-// input, so 16 KiB covers the common case; compress_chunk_to_file_locked
-// resizes (rarely) for atypical large records.
-inline constexpr size_t DEFAULT_COMPACTOR_LZ4_OUT_BUF_BYTES = 16 * 1024;
 
 class bucket_compactor {
 public:
@@ -77,42 +79,18 @@ public:
     // m_bytes >= m_spill_bytes so dedup state per spill remains
     // worthwhile.
     //
-    // The spill stream is an LZ4 frame: blockSize=max64KB,
-    // blockMode=independent, contentChecksum=off, blockChecksum=off,
-    // compressionLevel=0 (fast). autoFlush=1 keeps the cctx's internal
-    // tmpBuff small at the cost of slightly worse compression on
-    // sub-block writes -- a good trade for thousands of compactors
-    // alive at once.
-    bucket_compactor(std::string path, size_t spill_bytes,
-                     size_t lz4_out_buf_bytes = DEFAULT_COMPACTOR_LZ4_OUT_BUF_BYTES)
-        : m_path(std::move(path)), m_spill_bytes(spill_bytes),
-          m_out_buf(lz4_out_buf_bytes) {
+    // The compactor doesn't hold any persistent LZ4 state -- all
+    // compression happens via stateless LZ4_compress_default calls
+    // inside spill_locked(). The per-bucket buffers we *do* keep
+    // (m_batch_buf, m_out_buf) grow up to one spill's worth of bytes
+    // and are reused across spills. They're already counted as part
+    // of the compactor's structural cost in the auto-tune model.
+    bucket_compactor(std::string path, size_t spill_bytes)
+        : m_path(std::move(path)), m_spill_bytes(spill_bytes) {
         m_file = std::fopen(m_path.c_str(), "wb");
         if (!m_file)
             throw std::runtime_error("cannot open bucket file: " + m_path + ": " +
                                      std::strerror(errno));
-        LZ4F_errorCode_t e = LZ4F_createCompressionContext(&m_cctx, LZ4F_VERSION);
-        if (LZ4F_isError(e)) {
-            std::fclose(m_file);
-            m_file = nullptr;
-            throw std::runtime_error(std::string("LZ4F_createCompressionContext failed: ") +
-                                     LZ4F_getErrorName(e));
-        }
-        LZ4F_preferences_t prefs;
-        std::memset(&prefs, 0, sizeof(prefs));
-        prefs.frameInfo.blockSizeID = LZ4F_max64KB;
-        prefs.frameInfo.blockMode = LZ4F_blockIndependent;
-        prefs.frameInfo.contentChecksumFlag = LZ4F_noContentChecksum;
-        prefs.frameInfo.blockChecksumFlag = LZ4F_noBlockChecksum;
-        prefs.compressionLevel = 0;
-        prefs.autoFlush = 1;
-        m_prefs = prefs;
-        size_t hdr = LZ4F_compressBegin(m_cctx, m_out_buf.data(), m_out_buf.size(), &prefs);
-        if (LZ4F_isError(hdr))
-            throw std::runtime_error(std::string("LZ4F_compressBegin failed on ") + m_path +
-                                     ": " + LZ4F_getErrorName(hdr));
-        if (hdr > 0 && std::fwrite(m_out_buf.data(), 1, hdr, m_file) != hdr)
-            throw std::runtime_error("short write to " + m_path);
     }
 
     ~bucket_compactor() { close(); }
@@ -208,21 +186,12 @@ public:
         std::lock_guard<std::mutex> lk(m_mu);
         if (m_file) {
             spill_locked();
-            // Finalise the LZ4 frame (writes the end-of-frame marker)
-            // before closing the file. Errors here are fatal: the
-            // bucket file would be unreadable otherwise.
-            size_t end = LZ4F_compressEnd(m_cctx, m_out_buf.data(), m_out_buf.size(), nullptr);
-            if (LZ4F_isError(end))
-                throw std::runtime_error(std::string("LZ4F_compressEnd failed on ") + m_path +
-                                         ": " + LZ4F_getErrorName(end));
-            if (end > 0 && std::fwrite(m_out_buf.data(), 1, end, m_file) != end)
-                throw std::runtime_error("short write to " + m_path);
+            // End-of-stream marker: a [u32 0] uncompressed_size with
+            // no following bytes. bucket_reader stops on this.
+            uint32_t eof = 0;
+            std::fwrite(&eof, sizeof(eof), 1, m_file);
             std::fclose(m_file);
             m_file = nullptr;
-        }
-        if (m_cctx) {
-            LZ4F_freeCompressionContext(m_cctx);
-            m_cctx = nullptr;
         }
     }
 
@@ -232,28 +201,9 @@ private:
         uint8_t flags = 0;
     };
 
-    // Compress `src_size` bytes from `src` into the frame and write to
-    // disk. Grows m_out_buf if needed -- worst-case for autoFlush=1 is
-    // bounded by LZ4F_compressBound(src_size, &prefs), which for our
-    // typical record sizes (<1 KiB) fits comfortably in the default
-    // 80 KiB scratch.
-    void compress_chunk_to_file_locked(uint8_t const* src, size_t src_size) {
-        size_t bound = LZ4F_compressBound(src_size, &m_prefs);
-        if (m_out_buf.size() < bound) m_out_buf.resize(bound);
-        size_t out = LZ4F_compressUpdate(m_cctx, m_out_buf.data(), m_out_buf.size(), src,
-                                         src_size, nullptr);
-        if (LZ4F_isError(out))
-            throw std::runtime_error(std::string("LZ4F_compressUpdate failed on ") + m_path +
-                                     ": " + LZ4F_getErrorName(out));
-        if (out > 0 && std::fwrite(m_out_buf.data(), 1, out, m_file) != out)
-            throw std::runtime_error("short write to " + m_path);
-    }
-
     void spill_locked() {
         if (m_dedup.empty()) return;
-        std::vector<uint8_t> rec_buf;
-        rec_buf.reserve(256);
-        uint64_t spilled = 0;
+        m_batch_buf.clear();
         for (auto& kv : m_dedup) {
             std::string const& key = kv.first;
             entry& e = kv.second;
@@ -262,13 +212,44 @@ private:
             // recurs across batches.
             std::sort(e.colors.begin(), e.colors.end());
             e.colors.erase(std::unique(e.colors.begin(), e.colors.end()), e.colors.end());
-            rec_buf.clear();
+            // Append the serialized record directly into m_batch_buf.
+            // We compress the whole batch with one LZ4 call below;
+            // amortising the per-block framing overhead across all of
+            // the spill's records is what makes compression actually
+            // pay off on inputs this small (~50-200 B per record).
             write_super_kmer(e.flags, e.colors.data(), (uint32_t)e.colors.size(),
-                             (uint8_t const*)key.data(), (uint32_t)key.size(), rec_buf);
-            compress_chunk_to_file_locked(rec_buf.data(), rec_buf.size());
-            spilled += rec_buf.size();
+                             (uint8_t const*)key.data(), (uint32_t)key.size(), m_batch_buf);
         }
-        m_total_uncompressed.fetch_add(spilled, std::memory_order_relaxed);
+        if (m_batch_buf.empty()) {
+            m_dedup.clear();
+            m_bytes = 0;
+            return;
+        }
+        // LZ4 block API: stateless, fast mode (acceleration=1). The
+        // function expects int parameters, so we cap each frame at
+        // ~1 GiB; in practice spills are kilobytes to a few MiB so
+        // this never trips.
+        if (m_batch_buf.size() > (size_t)LZ4_MAX_INPUT_SIZE)
+            throw std::runtime_error("spill batch exceeds LZ4_MAX_INPUT_SIZE on " + m_path);
+        int src_size = (int)m_batch_buf.size();
+        int bound = LZ4_compressBound(src_size);
+        if (bound <= 0)
+            throw std::runtime_error("LZ4_compressBound failed on " + m_path);
+        if (m_out_buf.size() < (size_t)bound) m_out_buf.resize((size_t)bound);
+        int compressed = LZ4_compress_default((char const*)m_batch_buf.data(),
+                                              (char*)m_out_buf.data(), src_size,
+                                              (int)m_out_buf.size());
+        if (compressed <= 0)
+            throw std::runtime_error("LZ4_compress_default failed on " + m_path);
+        // Write per-spill frame: [u32 uncompressed][u32 compressed][bytes].
+        uint32_t u = (uint32_t)src_size;
+        uint32_t c = (uint32_t)compressed;
+        if (std::fwrite(&u, sizeof(u), 1, m_file) != 1 ||
+            std::fwrite(&c, sizeof(c), 1, m_file) != 1 ||
+            std::fwrite(m_out_buf.data(), 1, (size_t)compressed, m_file) != (size_t)compressed) {
+            throw std::runtime_error("short write to " + m_path);
+        }
+        m_total_uncompressed.fetch_add((uint64_t)src_size, std::memory_order_relaxed);
         m_dedup.clear();
         m_bytes = 0;
     }
@@ -293,8 +274,13 @@ private:
     size_t m_spill_bytes;
     std::mutex m_mu;
     std::FILE* m_file = nullptr;
-    LZ4F_cctx* m_cctx = nullptr;
-    LZ4F_preferences_t m_prefs{};
+    // m_batch_buf accumulates the serialized super-k-mer records of one
+    // spill so we can compress them as a single LZ4 block. m_out_buf
+    // holds the LZ4 output. Both grow lazily to one spill's high-water
+    // and stay there for the rest of the phase (cleared but not
+    // shrunk). For our typical spill_bytes ~ 16-256 KiB the combined
+    // cost is a few hundred KiB per bucket.
+    std::vector<uint8_t> m_batch_buf;
     std::vector<uint8_t> m_out_buf;
     ankerl::unordered_dense::map<std::string, entry, string_hash, string_eq> m_dedup;
     size_t m_bytes = 0;
@@ -515,66 +501,56 @@ struct per_thread_bucket_buffers {
 class bucket_reader {
 public:
     // Slurps the whole bucket file (decompressed) into m_buf so that
-    // bucket_walker can iterate records via a simple byte cursor. The
-    // input file is an LZ4 frame produced by bucket_compactor; we
-    // decompress it via LZ4F_decompress in chunks. Output buffer grows
-    // geometrically.
+    // bucket_walker can iterate records via a simple byte cursor.
+    //
+    // File format (matches bucket_compactor on the write side):
+    //   repeat:
+    //     [u32 uncompressed_size]   little-endian; 0 marks end-of-stream
+    //     [u32 compressed_size]
+    //     [compressed bytes]
+    //
+    // Each frame is one spill. We read uncompressed_size + compressed_size,
+    // realloc m_buf if needed, and call LZ4_decompress_safe directly into
+    // m_buf at the current write offset. Output buffer grows geometrically.
     explicit bucket_reader(std::string const& path) {
         std::FILE* f = std::fopen(path.c_str(), "rb");
         if (!f) throw std::runtime_error("cannot open " + path + ": " + std::strerror(errno));
 
-        LZ4F_dctx* dctx = nullptr;
-        LZ4F_errorCode_t e = LZ4F_createDecompressionContext(&dctx, LZ4F_VERSION);
-        if (LZ4F_isError(e)) {
-            std::fclose(f);
-            throw std::runtime_error(std::string("LZ4F_createDecompressionContext failed: ") +
-                                     LZ4F_getErrorName(e));
-        }
-
-        constexpr size_t IN_CHUNK = 64 * 1024;
-        constexpr size_t OUT_CHUNK = 256 * 1024;
-        std::vector<uint8_t> in_buf(IN_CHUNK);
+        std::vector<uint8_t> comp_buf;
         size_t out_off = 0;
 
         for (;;) {
-            size_t in_size = std::fread(in_buf.data(), 1, IN_CHUNK, f);
-            if (in_size == 0) {
-                if (std::ferror(f)) {
-                    LZ4F_freeDecompressionContext(dctx);
-                    std::fclose(f);
-                    throw std::runtime_error("read failed on " + path);
-                }
-                break;  // EOF
+            uint32_t u = 0;
+            size_t got = std::fread(&u, sizeof(u), 1, f);
+            if (got != 1) {
+                // Bucket file written without an EOF marker (shouldn't
+                // happen with our writer, but handle it anyway): EOF
+                // here is fine as long as the stream ends cleanly.
+                if (std::feof(f)) break;
+                std::fclose(f);
+                throw std::runtime_error("short read of frame header on " + path);
             }
-            size_t in_pos = 0;
-            while (in_pos < in_size) {
-                if (m_buf.size() < out_off + OUT_CHUNK) m_buf.resize(out_off + OUT_CHUNK);
-                size_t out_capacity = m_buf.size() - out_off;
-                size_t in_remaining = in_size - in_pos;
-                size_t hint = LZ4F_decompress(dctx, m_buf.data() + out_off, &out_capacity,
-                                              in_buf.data() + in_pos, &in_remaining, nullptr);
-                if (LZ4F_isError(hint)) {
-                    LZ4F_freeDecompressionContext(dctx);
-                    std::fclose(f);
-                    throw std::runtime_error(std::string("LZ4F_decompress failed on ") + path +
-                                             ": " + LZ4F_getErrorName(hint));
-                }
-                in_pos += in_remaining;
-                out_off += out_capacity;
-                if (hint == 0) {
-                    // End of frame. Drain any trailing input and stop.
-                    in_pos = in_size;
-                    break;
-                }
-                if (out_capacity == 0 && in_remaining == 0) {
-                    // Nothing consumed and nothing produced; LZ4 wants
-                    // more input -- break out of inner loop to refill.
-                    break;
-                }
+            if (u == 0) break;  // explicit end-of-stream marker
+            uint32_t c = 0;
+            if (std::fread(&c, sizeof(c), 1, f) != 1) {
+                std::fclose(f);
+                throw std::runtime_error("short read of compressed_size on " + path);
             }
+            if (comp_buf.size() < c) comp_buf.resize(c);
+            if (std::fread(comp_buf.data(), 1, c, f) != c) {
+                std::fclose(f);
+                throw std::runtime_error("short read of compressed payload on " + path);
+            }
+            if (m_buf.size() < out_off + u) m_buf.resize(out_off + u);
+            int decoded = LZ4_decompress_safe((char const*)comp_buf.data(),
+                                              (char*)m_buf.data() + out_off, (int)c, (int)u);
+            if (decoded < 0 || (uint32_t)decoded != u) {
+                std::fclose(f);
+                throw std::runtime_error("LZ4_decompress_safe failed on " + path);
+            }
+            out_off += u;
         }
         m_buf.resize(out_off);
-        LZ4F_freeDecompressionContext(dctx);
         std::fclose(f);
     }
 
