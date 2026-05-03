@@ -126,12 +126,18 @@ public:
         }
         prof.ns_hashmap.fetch_add(bucket_write_prof::since(t_map), std::memory_order_relaxed);
         prof.n_records.fetch_add(recs.size(), std::memory_order_relaxed);
-        // Spill on either threshold or external memory pressure. Under
-        // pressure we spill every batch -- correctness is unchanged
-        // (bucket_walker merges duplicate records across spills) and
-        // RSS gets immediate relief at the cost of more disk records.
+        // Under pressure, drop the spill threshold to a quarter of the
+        // configured value (floored at 8 KiB) instead of "spill on every
+        // batch". Spilling on every batch shreds dedup state across
+        // 100-byte chunks: on the 4546-genome workload that produced
+        // 4.7M spills and 8.6 GB of bucket files (vs 314K spills /
+        // 2.4 GB at the configured threshold). The lower threshold
+        // still provides backpressure (compactors spill ~4x more
+        // often) but each spill carries enough data that the dedup-
+        // state cost is bounded.
         bool pressure = m_under_pressure && m_under_pressure->load(std::memory_order_relaxed);
-        if (m_bytes >= m_spill_bytes || pressure) {
+        size_t threshold = pressure ? std::max<size_t>(m_spill_bytes / 4, 8 * 1024) : m_spill_bytes;
+        if (m_bytes >= threshold) {
             auto t_sp = bucket_write_prof::clock::now();
             spill_locked();
             prof.ns_spill.fetch_add(bucket_write_prof::since(t_sp), std::memory_order_relaxed);
