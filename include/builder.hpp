@@ -340,6 +340,20 @@ private:
         1.0;
 #endif
 
+    // Fraction of --max-ram the bucket-write auto-tune is allowed to
+    // plan for (per-thread buffers + compactor + compressor). The
+    // remainder absorbs the bucket-process working set, which on Mac
+    // expands by ~1.75 GiB on the 4546-genome workload (k-mer rsids
+    // map + per-bucket color_set_dict + libsystem_malloc bookkeeping).
+    // We hand bucket-write a smaller slice on Mac so the cap holds
+    // once bucket-process expands on top.
+    static constexpr double BUCKET_WRITE_SHARE =
+#if defined(__APPLE__)
+        0.40;
+#else
+        0.50;
+#endif
+
     double effective_max_ram_gb() const {
         return m_cfg.max_ram_gb / PLATFORM_RAM_OVERHEAD;
     }
@@ -370,7 +384,7 @@ private:
     // No --max-ram set -> historical 1024 buckets.
     uint32_t auto_bucket_log2() const {
         if (m_cfg.max_ram_gb <= 0) return MIN_BUCKETS_LOG2;
-        constexpr double SHARE = 0.50;
+        constexpr double SHARE = BUCKET_WRITE_SHARE;
         constexpr double COMPACTOR_OVERHEAD = 7.0;
         constexpr size_t TARGET_SPILL_BYTES = 64 * 1024;  // good for LZ4 dedup
 
@@ -437,8 +451,8 @@ private:
             m_spill_bytes = DEFAULT_COMPACTOR_SPILL_BYTES;  // 256 KiB
             return;
         }
-        constexpr double SHARE = 0.50;              // half the budget for bucket-write
-        constexpr double COMPACTOR_OVERHEAD = 7.0;  // compactor: structure + key allocs + frag
+        constexpr double SHARE = BUCKET_WRITE_SHARE;  // share of budget for bucket-write
+        constexpr double COMPACTOR_OVERHEAD = 7.0;    // compactor: structure + key allocs + frag
         constexpr double BUFFER_OVERHEAD = 2.0;     // per-thread: capacity slack + recs vec
         // LZ4 block API has no persistent compressor state -- the
         // batch and out buffers we hold between spills are accounted
