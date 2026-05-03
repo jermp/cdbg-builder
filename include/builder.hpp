@@ -344,50 +344,43 @@ private:
         return m_cfg.max_ram_gb / PLATFORM_RAM_OVERHEAD;
     }
 
-    // Pick the bucket count by enforcing that the *full* bucket-write
-    // structural floor at MIN values fits in the bucket-write share of
-    // the (platform-derated) budget. The structural floor at the
-    // floor-tunable values is:
+    // Pick num_buckets so that the auto-tune can give us spill_bytes
+    // at least TARGET_SPILL_BYTES. Otherwise the bucket files explode
+    // with redundant records:
     //
-    //   B * (compressor_per_bucket
-    //        + T * MIN_FLUSH_BASES * BUFFER_OVERHEAD
-    //        + MIN_SPILL_BYTES * COMPACTOR_OVERHEAD)
+    //   spill_bytes ≈ (SHARE × effective_ram / 2) / (B × COMPACTOR_OVERHEAD)
     //
-    // i.e. the per-bucket cost when flush_bases / spill_bytes have
-    // already collapsed to their minimums. Picking log2 such that this
-    // fits in SHARE * effective_ram leaves room for the auto-tune to
-    // actually choose values above the floor (and so to spill less
-    // often, write fewer disk records, and stay within real RSS).
+    // is the value the compactor-half of the bucket-write share lets
+    // us afford. Each spill clears the per-bucket dedup state, so a
+    // popular super-k-mer that's hit again after a spill is emitted
+    // as a *separate* on-disk record. The smaller spill_bytes is, the
+    // more often this happens, and on the 4546-genome workload
+    // pushing spill_bytes to its 16 KiB floor produced 1.96 M spills
+    // and 10.6 GB of uncompressed bucket bytes -- vs ~313 K spills
+    // and ~3 GB at "reasonable" spill_bytes. The 3.5x bloat then
+    // overwhelmed any savings from the new compression.
     //
-    // The earlier "compressor-only" check picked too high a log2 once
-    // LZ4 made the compressor cheap: at --max-ram 4 / 8 threads it
-    // accepted 8192 buckets, which collapsed flush_bases and
-    // spill_bytes to floors and pushed the per-thread + compactor
-    // contributions far past budget.
+    // Strategy: solve for the largest B in [MIN, MAX] such that
+    // B × TARGET_SPILL_BYTES × COMPACTOR_OVERHEAD ≤ (SHARE × eff)/2.
+    // Bigger budgets get more buckets (which helps bucket-process
+    // parallelism); tighter budgets get fewer buckets (so spill_bytes
+    // can stay at the target and each spill carries enough data that
+    // dedup pays off).
     //
     // No --max-ram set -> historical 1024 buckets.
     uint32_t auto_bucket_log2() const {
         if (m_cfg.max_ram_gb <= 0) return MIN_BUCKETS_LOG2;
-        // Match the constants used by auto_tune_bucket_write_params --
-        // they have to be consistent for this estimate to be right.
         constexpr double SHARE = 0.50;
         constexpr double COMPACTOR_OVERHEAD = 7.0;
-        constexpr double BUFFER_OVERHEAD = 2.0;
-        constexpr uint64_t COMPRESSOR_BYTES_PER_BUCKET = 4ull * 1024ull;
-        constexpr uint64_t MIN_FLUSH_BASES = 4ull * 1024ull;
-        constexpr uint64_t MIN_SPILL_BYTES = 16ull * 1024ull;
+        constexpr size_t TARGET_SPILL_BYTES = 64 * 1024;  // good for LZ4 dedup
 
-        const uint64_t T = std::max<uint64_t>(1, m_cfg.num_threads);
-        const uint64_t per_bucket_floor =
-            COMPRESSOR_BYTES_PER_BUCKET +
-            (uint64_t)(T * MIN_FLUSH_BASES * BUFFER_OVERHEAD) +
-            (uint64_t)(MIN_SPILL_BYTES * COMPACTOR_OVERHEAD);
-        const double share_bytes =
-            effective_max_ram_gb() * 1024.0 * 1024.0 * 1024.0 * SHARE;
+        const double compactor_share_bytes =
+            effective_max_ram_gb() * 1024.0 * 1024.0 * 1024.0 * (SHARE / 2.0);
+        const double max_b =
+            compactor_share_bytes / ((double)TARGET_SPILL_BYTES * COMPACTOR_OVERHEAD);
 
         uint32_t log2 = MAX_BUCKETS_LOG2;
-        while (log2 > MIN_BUCKETS_LOG2 &&
-               (double)((uint64_t)1 << log2) * (double)per_bucket_floor > share_bytes) {
+        while (log2 > MIN_BUCKETS_LOG2 && (double)((uint64_t)1 << log2) > max_b) {
             --log2;
         }
         return log2;
