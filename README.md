@@ -9,6 +9,12 @@ Given `N` input files (each treated as one *color*), the tool produces:
 
 - `<out>.fa` — a FASTA of *monochromatic colored unitigs*. Each header is the
   integer id of the color set the unitig belongs to.
+- `<out>.u2c` — a serialized `bits::bit_vector` of length `num_unitigs` where
+  bit *i* is set iff unitig *i* (in the `.fa` emission order) is the last
+  unitig of a color-set run. The popcount equals the number of distinct
+  color sets and the last bit is always set. Downstream consumers (e.g.
+  Fulgor) recover the per-unitig color-set id via `rank1(unitig_id)` after
+  building a rank index over this bit_vector.
 - `<out>.colors` — the color sets, serialized in Fulgor's `hybrid` format.
 
 Inputs may be FASTA, FASTQ, or gzipped variants of either; the file at line
@@ -43,7 +49,7 @@ Options:
 |----------------------|-------------------------------------------------------------------|---------|
 | `-i PATH`            | Text file with one input path per line (one color each)           | —       |
 | `-k INT`             | k-mer length (≤ 63)                                               | —       |
-| `-o NAME`            | Output basename; writes `NAME.fa` and `NAME.colors`               | —       |
+| `-o NAME`            | Output basename; writes `NAME.fa`, `NAME.u2c`, and `NAME.colors`  | —       |
 | `-t INT`             | Number of worker threads                                          | 1       |
 | `-m INT`             | Minimizer length used for bucketing                               | auto    |
 | `--buckets-log2 INT` | `2^N` minimizer-derived bucket files on disk                      | 10      |
@@ -88,8 +94,10 @@ Run `cdgb-build` (from the `build/` directory) with `k = 31` and 8 threads:
 This produces:
 
 - `~/Salmonella_enterica/salmonella_4546.fa` — colored unitigs in FASTA form
+- `~/Salmonella_enterica/salmonella_4546.u2c` — unitig-to-color-set
+  bit_vector
 - `~/Salmonella_enterica/salmonella_4546.colors` — Fulgor-compatible hybrid
   color sets
 
-The two files can then be consumed by downstream tools that accept Fulgor's
+The three files can then be consumed by downstream tools that accept Fulgor's
 hybrid color-set format.
