@@ -297,14 +297,27 @@ private:
     //
     // Bucket-write peak comes from three terms that we model as:
     //
-    //   per-thread buffers ≈ num_threads × num_buckets × flush_bases
-    //   compactor footprint ≈ num_buckets × spill_bytes × overhead
-    //   zlib state         ≈ num_buckets × (gzbuffer + ~256 KiB internal)
+    //   per-thread buffers ≈ num_threads × num_buckets × flush_bases × BUFFER_OVERHEAD
+    //   compactor footprint ≈ num_buckets × spill_bytes × COMPACTOR_OVERHEAD
+    //   zlib state         ≈ num_buckets × (gzbuffer + ZLIB_STATE_PER_BUCKET)
     //
-    // overhead ~= 2.5x covers the unordered_dense map node overhead +
-    // std::string keys (heap-allocated past SSO) + per-vector headers.
-    // The internal zlib state per gzFile is ~256 KiB at level-1
-    // compression and we can't tune it; only gzbuffer is exposed.
+    // The overhead factors are empirical: nominal storage substantially
+    // undercounts what the process actually resident-pages because of
+    //   (a) std::vector capacity slack (per-thread buffers retain their
+    //       high-water capacity for the whole phase),
+    //   (b) std::string heap allocations for compactor keys (each ~80 B
+    //       header + bytes + malloc header beyond the 15 B SSO),
+    //   (c) glibc malloc fragmentation across millions of small allocs
+    //       churned by repeated spill cycles,
+    //   (d) ankerl::unordered_dense map structure overhead per entry.
+    //
+    // Calibrated against a 4546-genome, 8-thread, 4 GiB-budget run where
+    // the unscaled model predicted ~2 GiB but real bucket-write peak was
+    // ~4.7 GiB. The 2.3x gap is split as ~2x for per-thread (capacity
+    // slack + recs vector) and ~5x / 2.5x = 2x for compactor (frag + key
+    // string allocs). Internal zlib state at level 1 with default
+    // memLevel is ~128 K hash + 32 K window + small slack ≈ 384 K, plus
+    // the gzbuffer.
     //
     // Strategy: reserve a target share (default 50%) of --max-ram for
     // bucket-write. Subtract the un-tunable zlib state. Split what
@@ -323,8 +336,9 @@ private:
             return;
         }
         constexpr double SHARE = 0.50;            // half the budget for bucket-write
-        constexpr double OVERHEAD = 2.5;          // compactor map structure + key allocs
-        constexpr size_t ZLIB_STATE_PER_BUCKET = 256 * 1024;  // un-tunable
+        constexpr double COMPACTOR_OVERHEAD = 5.0;  // compactor: structure + key allocs + frag
+        constexpr double BUFFER_OVERHEAD = 2.0;     // per-thread: capacity slack + recs vec
+        constexpr size_t ZLIB_STATE_PER_BUCKET = 384 * 1024;  // un-tunable
         constexpr size_t MIN_FLUSH_BASES = 4 * 1024;
         constexpr size_t MIN_SPILL_BYTES = 16 * 1024;
         constexpr size_t MIN_GZBUFFER_BYTES = 16 * 1024;
@@ -356,12 +370,15 @@ private:
         uint64_t half = remainder / 2;
 
         // flush_bases per (thread, bucket); cap at the historical default.
-        size_t flush = (size_t)(T * B == 0 ? MAX_FLUSH_BASES : half / (T * B));
+        double flush_d =
+            T * B == 0 ? (double)MAX_FLUSH_BASES : (double)half / (T * B * BUFFER_OVERHEAD);
+        size_t flush = (size_t)flush_d;
         if (flush < MIN_FLUSH_BASES) flush = MIN_FLUSH_BASES;
         if (flush > MAX_FLUSH_BASES) flush = MAX_FLUSH_BASES;
 
         // spill_bytes per bucket (with overhead factor).
-        double spill_d = B == 0 ? (double)MAX_SPILL_BYTES : (double)half / (B * OVERHEAD);
+        double spill_d =
+            B == 0 ? (double)MAX_SPILL_BYTES : (double)half / (B * COMPACTOR_OVERHEAD);
         size_t spill = (size_t)spill_d;
         if (spill < MIN_SPILL_BYTES) spill = MIN_SPILL_BYTES;
         if (spill > MAX_SPILL_BYTES) spill = MAX_SPILL_BYTES;
