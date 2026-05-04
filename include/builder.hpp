@@ -169,13 +169,33 @@ struct builder {
         streaming_color_set_dict global_dict(m_num_colors,
                                              m_cfg.out_basename + ".color_sets");
         std::mutex global_mu;
+        // bucket-process is embarrassingly parallel (each thread takes
+        // the next bucket from a shared counter; almost no
+        // contention), so wall time scales linearly with thread count.
+        // BUT each in-flight thread holds ~per-bucket walker state of
+        // (record_sets + kmer_info + bucket_unitigs); on dense
+        // pangenome inputs this grows to hundreds of MB per bucket.
+        // 16 threads × hundreds of MB blows the cap.
+        //
+        // pick_bucket_process_threads_ chooses concurrency so the
+        // per-thread walker state * threads stays under a target
+        // share of --max-ram. When --max-ram is unset we use the
+        // user-supplied num_threads as-is.
+        const uint32_t bp_threads = pick_bucket_process_threads_(
+            writer.total_uncompressed_bytes(), num_buckets, m_cfg.num_threads,
+            m_cfg.max_ram_gb);
+        if (bp_threads != m_cfg.num_threads) {
+            std::cout << "  bucket-process concurrency capped at " << bp_threads
+                      << " (from --threads " << m_cfg.num_threads
+                      << ") to fit per-bucket walker state in --max-ram\n";
+        }
         {
             phase_rss_marker rss("bucket-process");
             {
                 timer _("bucket-process");
                 std::atomic<uint64_t> done{0};
                 progress prog("bucket-process", done, num_buckets);
-                process_buckets(writer, m_cfg.k, m_cfg.num_threads, frag_unitigs, out_mu,
+                process_buckets(writer, m_cfg.k, bp_threads, frag_unitigs, out_mu,
                                 global_dict, global_mu, &done);
                 prog.stop();
                 std::cout << "  bucket fragments: " << frag_unitigs.size() << "\n";
@@ -564,6 +584,43 @@ private:
     // ceiling at MAX_K to stay within RLIMIT_NOFILE headroom
     // (bucket-write's FDs are already closed when stitch starts,
     // so we have ~1024 FDs available).
+    // Cap bucket-process concurrency by --max-ram. Each in-flight
+    // thread holds a per-bucket walker working set whose dominant
+    // contributors are
+    //   (a) record_sets: distinct color lists in this bucket, kept
+    //       as sorted vector<uint32_t> in memory;
+    //   (b) kmer_info:   per-canonical-k-mer rsid map.
+    // Both scale with the bucket's input bytes, which we approximate
+    // as uncompressed_bucket_bytes / num_buckets. An empirical
+    // overhead factor of 15× over that fits the 50K-genome benchmark
+    // (~43 MiB raw / bucket -> ~640 MiB walker state observed).
+    //
+    // Budget share: we let bucket-process consume up to 50% of
+    // --max-ram for walker state, leaving room for frag_unitigs (the
+    // accumulating output of process_buckets), the global streaming
+    // dict, and slack. Floor at 1 thread, ceiling at the user-
+    // requested num_threads.
+    static uint32_t pick_bucket_process_threads_(uint64_t total_uncompressed_bytes,
+                                                 uint32_t num_buckets,
+                                                 uint32_t requested_threads,
+                                                 double max_ram_gb) {
+        if (requested_threads == 0) requested_threads = 1;
+        if (max_ram_gb <= 0 || num_buckets == 0) return requested_threads;
+        constexpr double WALKER_OVERHEAD = 15.0;
+        constexpr double WALKER_SHARE = 0.50;
+        constexpr uint64_t MIN_PER_BUCKET = 64ull * 1024 * 1024;  // 64 MiB floor
+        const uint64_t per_bucket_estimate = std::max<uint64_t>(
+            MIN_PER_BUCKET,
+            (uint64_t)((double)total_uncompressed_bytes / num_buckets * WALKER_OVERHEAD));
+        const uint64_t budget_bytes =
+            (uint64_t)(max_ram_gb * 1024.0 * 1024.0 * 1024.0 * WALKER_SHARE);
+        if (budget_bytes < per_bucket_estimate) return 1;
+        uint64_t allowed = budget_bytes / per_bucket_estimate;
+        if (allowed < 1) allowed = 1;
+        if (allowed > requested_threads) allowed = requested_threads;
+        return (uint32_t)allowed;
+    }
+
     static uint32_t pick_unitig_bucket_count_(uint64_t num_color_classes,
                                               uint64_t total_seq_bytes_estimate,
                                               double max_ram_gb) {
