@@ -1,32 +1,41 @@
 #pragma once
 
-// Disk-backed unitig sink for the stitch -> emit boundary.
+// Disk-backed sinks/readers used to keep unitig and fragment seq
+// bytes off the heap across the bucket-process / stitch / emit
+// boundaries. Three classes live here:
 //
-// stitch_unitigs_streaming feeds each finished merged unitig into a
-// caller-provided sink. We use this writer as that sink so the seq
-// strings never have to all coexist in RAM during emit_fasta.
+// 1) unitig_bucket_writer  -- stitch -> emit
+//    Sink for stitch_unitigs_streaming. Partitions finished merged
+//    unitigs into K cid-range bucket files: bucket b holds every
+//    unitig with cid in [b * S, (b+1) * S) where
+//    S = ceil(num_color_classes / num_buckets). emit_fasta iterates
+//    buckets in ascending order and sorts each bucket's records by
+//    cid in memory before writing FASTA, so the .fa output is
+//    strictly cid-ascending (which the u2c bit_vector consumer
+//    requires). Per-bucket peak at emit is one bucket's seq payload
+//    plus its record-vector overhead.
 //
-// Bucketing by cid range:
-//   We partition cid -> bucket so that bucket b holds every unitig
-//   with cid in [b * S, (b+1) * S), where S = ceil(num_color_classes /
-//   num_buckets). bucket 0 has the smallest cids; bucket num_buckets-1
-//   has the largest. emit_fasta iterates buckets in ascending order
-//   and within each bucket sorts the records by cid; the resulting
-//   .fa output order is therefore exactly cid-ascending, which is
-//   what the u2c bit_vector (downstream consumer's run-end marker)
-//   requires.
+//    Per-bucket file format: a sequence of records, one per finished
+//    unitig, until EOF:
+//      [u32 cid][u32 seq_len][seq_len bytes raw ACGT]
 //
-// Per-bucket file format: a sequence of records, one per finished
-// unitig, until EOF.
-//   [u32 cid]
-//   [u32 seq_len]
-//   [seq_len bytes]    raw ACGT (the stitch sink writes the merged
-//                      unitig's seq bytes verbatim)
+// 2) frag_unitig_writer  -- bucket-process -> stitch
+//    Sink for process_buckets. Streams every finished fragment
+//    (cid + open_flags + bases) to a single mutex-protected append-
+//    only file. With this in place the in-RAM accumulator that used
+//    to hold every fragment never grows past per-thread buffers.
 //
-// Per-bucket peak in-memory footprint at read time is one bucket's
-// worth of seq bytes -- with K = 64 buckets and 1.88 M total unitigs
-// totalling ~190 MB of seq, that's ~3 MB per bucket plus ~400 KB of
-// per-record bookkeeping. Comfortably bounded.
+//    File format: a sequence of records, one per fragment, until EOF:
+//      [u32 cid][u8 open_flags][u32 seq_len][seq_len bytes raw ACGT]
+//
+// 3) frag_unitig_reader  -- mmap-backed view over (2)'s file
+//    Used by stitch. Walks the spill file once to build a 16 B/entry
+//    index of (cid, open_flags+seq_len packed, seq_offset). mmaps
+//    the file PROT_READ + MADV_RANDOM so seq bytes are accessible as
+//    std::string_view directly into the kernel page cache; no full
+//    vector<stitchable_unitig> is materialised. Index size on
+//    salmonella-25K (~26.6 M fragments) is ~425 MB vs ~2.8 GB for an
+//    in-RAM std::vector<stitchable_unitig> at the same scale.
 
 #include <algorithm>
 #include <cerrno>

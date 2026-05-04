@@ -64,7 +64,7 @@
 
 namespace cdgb {
 
-// ---- Per-bucket in-memory compactor + gzip-streaming output -----------------
+// ---- Per-bucket in-memory compactor + LZ4-framed disk output ---------------
 
 // Default per-bucket hashmap memory budget (estimated). With 1024 buckets
 // at this budget the global ingest peak from the compactors is ~256 MiB.
@@ -374,12 +374,14 @@ public:
     // there's no release; pressure stays sticky once tripped. Less
     // efficient but still correct.
     //
-    // Per-thread bucket buffers and LZ4 cctx state are NOT spillable --
-    // they form a structural floor of approximately
-    //   T*B*flush_bases*overhead + B*(lz4_cctx_state + lz4_out_buf)
+    // Per-thread bucket buffers and per-compactor scratch (m_batch_buf,
+    // m_out_buf) are NOT spillable -- they form a structural floor of
+    // approximately
+    //   T * B * flush_bases * BUFFER_OVERHEAD
+    //     + B * spill_bytes * COMPACTOR_OVERHEAD
     // bytes that no amount of pressure response can reduce. The auto-
-    // tune in builder picks flush_bases / num_buckets to keep that
-    // floor under the budget share for bucket-write.
+    // tune in builder picks flush_bases / spill_bytes / num_buckets so
+    // that floor stays under the bucket-write share of --max-ram.
     void start_rss_watcher(uint64_t high_threshold_bytes, uint64_t low_threshold_bytes,
                            std::chrono::milliseconds interval = std::chrono::milliseconds(100)) {
         if (m_watcher_running.exchange(true)) return;  // already started
@@ -453,9 +455,11 @@ private:
     std::atomic<uint64_t> m_total_compressed{0};
     std::atomic<uint64_t> m_total_uncompressed{0};
     bool m_closed = false;
-    // Pressure flag set by the RSS watcher; consulted by every
-    // bucket_compactor::insert_batch via the pointer we hand them at
-    // construction.
+    // Pressure flag set by the RSS watcher; informational only
+    // (surfaced via under_pressure() / pressure_was_engaged() for the
+    // post-phase log line). Backpressure is implemented by the watcher
+    // sweeping all compactors with try_spill(), not by ingest threads
+    // consulting this flag.
     std::atomic<bool> m_under_pressure{false};
     std::atomic<bool> m_pressure_was_engaged{false};
     std::atomic<uint64_t> m_observed_rss_high{0};
