@@ -417,31 +417,27 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
 
 }  // namespace detail
 
-// Parallel driver. Each worker processes one bucket at a time. After
-// each bucket the worker takes `global_mu` and merges that bucket's
-// local compact_color_set_dict into the shared streaming `global_dict`, building
-// a local->global cid table and remapping the bucket's unitigs in-place.
-// This folds what used to be a separate single-threaded "intern color
-// sets" pass over every emitted unitig (O(num_unitigs) ~6M) into the
-// parallel bucket-process phase, paying it on the
-// O(unique-color-sets-per-bucket) ~few thousand granularity instead.
-//
-// The streaming dict encodes each new color set into its bit_vector
-// builder *during* intern() rather than holding the uncompressed
-// vector; this keeps peak RAM proportional to the *compressed*
-// .colors output rather than to the sum of class sizes.
-//
-// `out_mu` still serializes the final append into the shared `out`.
 // Process all buckets in parallel; emit stitchable fragments through a
-// caller-supplied sink. Each thread takes the next bucket from a
-// shared counter, builds the per-bucket walker state, walks the
-// chains, merges its local compact_color_set_dict into the shared global
-// streaming dict, remaps each fragment's cid from local to global,
-// then feeds each fragment into `sink(stitchable_unitig&&)`.
+// caller-supplied sink. Each worker takes the next bucket from a
+// shared atomic counter, builds the per-bucket walker state, walks the
+// chains, merges its local compact_color_set_dict into the shared
+// streaming `global_dict` under `global_mu`, remaps each fragment's
+// cid from local to global, then feeds each fragment into
+// `sink(stitchable_unitig&&)`.
+//
+// Per-bucket dedup folds what used to be a separate single-threaded
+// "intern color sets" pass over every emitted unitig (~6 M on
+// salmonella-4546) into the parallel bucket-process phase: the global
+// merge runs once per distinct local class (~few thousand per bucket),
+// not per fragment. The global dict encodes each new color set into
+// its bit_vector builder during intern() and immediately spills
+// complete 64-bit words to the final <basename>.color_sets file --
+// peak RAM stays proportional to the per-class metadata count, not to
+// the sum of class sizes.
 //
 // `sink` is required to be safe for concurrent calls from
-// num_threads worker threads (use an internal mutex if needed). For
-// the production pipeline this is a frag_unitig_writer that streams
+// num_threads worker threads (use an internal mutex if needed). The
+// production pipeline passes a frag_unitig_writer that streams
 // fragments to disk so the in-RAM accumulator never reaches its
 // multi-GB peak.
 template <typename Sink>

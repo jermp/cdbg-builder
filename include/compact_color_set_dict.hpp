@@ -1,35 +1,37 @@
 #pragma once
 
-// Per-bucket-friendly variant of color_set_dict that stores classes in a
-// hybrid-encoded bit_vector instead of as live std::vector<uint32_t>'s.
-// API is the same dedup-by-128-bit-hash story as
-// streaming_color_set_dict, but the encoded bits stay in memory (one
-// per dict instance) rather than being flushed to a file.
+// In-memory hybrid-encoded color-set dict for the bucket walker.
 //
-// Use case: the bucket walker holds two color_set_dicts per in-flight
-// bucket -- record_sets (per-record interned color lists) and
-// local_dict (per-bucket final color classes). On dense pangenome
-// inputs each dict can grow to hundreds of MB per bucket; with 16
-// threads in flight that becomes ~10 GB and blows --max-ram budgets.
-// compact_color_set_dict cuts this by ~10-30x by encoding each list
-// inline with the same hybrid sparse / dense / complementary-dense
-// rules used in the final on-disk index.
+// Same dedup-by-128-bit-hash story as streaming_color_set_dict, but
+// the encoded bits stay in memory (one per dict instance) rather than
+// being flushed to a file. Used inside process_bucket for both
+// record_sets (per-record interned color lists) and local_dict (the
+// per-bucket final color classes assigned to each k-mer). With 16
+// threads in flight, holding the source color lists as live
+// std::vector<uint32_t>'s grew to ~10 GB on the 25K-genome workload;
+// hybrid-encoding them here cuts that to ~hundreds of MB.
 //
-// API differences from color_set_dict:
-//   - at(id, std::vector<uint32_t>& out) -- decodes into a caller-
-//     provided scratch buffer; does NOT return a reference (the bits
-//     would have to be re-decoded on every access).
-//   - No mutable_at / classes() iteration (would force decoding all
-//     classes at once, defeating the memory win).
-//   - 128-bit hash dedup, NO byte-level equality check (we don't keep
-//     the original colors any more after encoding). Collision rate per
-//     pair is ~2^-64; with 5000 entries per bucket and 2048 buckets
-//     that's ~3e-9 chance over the run.
+// API:
+//   - intern(colors)          -> id, identical hashing rules as the
+//                                 streaming dict
+//   - at(id, scratch)         -> fills the caller-supplied scratch
+//                                 vector with the decoded color list.
+//                                 Returns no reference because the
+//                                 bits would otherwise be re-decoded
+//                                 on every access.
+//   - size()                  -> number of distinct classes in the dict
+//
+// No mutable_at / classes() iterator: those would force decoding all
+// classes at once, defeating the memory win.
+//
+// Dedup is 128-bit hash only; we don't keep the original colors after
+// encoding, so byte-level confirmation isn't possible. Collision rate
+// per pair is ~2^-64; with ~5000 entries per bucket and ~2048 buckets
+// that's ~3e-9 chance of any collision over a run.
 //
 // Per-class metadata: 24 B (primary hash, secondary hash, bit_offset).
 // Plus the hybrid-encoded bits in m_bvb. For 5000 classes per bucket
-// at ~14000 colors each, expect ~10-30 MB per bucket vs ~280 MB for
-// the live-vector dict.
+// at ~14000 colors each, expect ~10-30 MB per bucket.
 
 #include <cassert>
 #include <cstdint>

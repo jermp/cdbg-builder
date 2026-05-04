@@ -25,8 +25,12 @@
 //   //   b.num_color_classes()  -- count of distinct color sets in <basename>.color_sets
 //
 // build() throws std::runtime_error on configuration errors or I/O
-// failures. On success, <basename>.fa and <basename>.color_sets are written
-// and the scratch directory (cfg.tmp_dir or an mkdtemp'd one) is removed.
+// failures. On success, three artifacts are written:
+//   <basename>.fa          colored unitigs in FASTA, headers = cid
+//   <basename>.u2c         unitig-to-color-set bit_vector (run-end
+//                          marker, popcount = num_color_classes)
+//   <basename>.color_sets  hybrid-encoded color sets + EF offsets
+// The scratch directory (cfg.tmp_dir or an mkdtemp'd one) is removed.
 
 #include <atomic>
 #include <cerrno>
@@ -142,7 +146,7 @@ struct builder {
             rss.stop();
         }
         // Stop the RSS watcher before close(): we don't want a stray
-        // try_spill firing during close()'s final spill+gzclose loop.
+        // try_spill firing during close()'s final spill+fclose loop.
         writer->stop_rss_watcher();
         if (writer->pressure_was_engaged()) {
             std::cout << "  bucket-write: RSS pressure engaged; observed live-RSS high "
@@ -161,10 +165,11 @@ struct builder {
         // Fragments are NOT accumulated in an in-RAM vector -- on
         // dense pangenome inputs that vector grew to multi-GB during
         // bucket-process and was the dominant peak contributor.
-        // Instead we stream each fragment through a disk-backed
-        // frag_unitig_writer to a single tmp file, then load the file
-        // back into a vector once at the start of stitch (which
-        // currently still does in-RAM stitching).
+        // Instead each fragment is streamed through a disk-backed
+        // frag_unitig_writer to a single tmp file. Stitch then opens
+        // a mmap-backed frag_unitig_reader over that file and walks
+        // chains in-place via string_view into the kernel page cache;
+        // no full vector<stitchable_unitig> is ever materialised.
         //
         // Streaming dict: encodes each new color set into its bvb at
         // intern() time and immediately flushes complete 64-bit words
@@ -315,9 +320,9 @@ private:
                                      std::to_string(MIN_BUCKETS_LOG2) + ", " +
                                      std::to_string(MAX_BUCKETS_LOG2) + "]");
         }
-        // bucket_writer opens one gzFile per bucket. Raise the soft FD
-        // limit if needed; clamp bucket_log2 if even the hard limit
-        // isn't enough.
+        // bucket_writer opens one FILE per bucket (LZ4-framed, raw
+        // stdio). Raise the soft FD limit if needed; clamp bucket_log2
+        // if even the hard limit isn't enough.
         m_cfg.bucket_log2 = ensure_fd_capacity_for_buckets_(m_cfg.bucket_log2);
         auto_tune_bucket_write_params();
     }
@@ -349,19 +354,6 @@ private:
         return fitted;
     }
 
-    // Heuristic, balancing two competing pressures:
-    //   - bucket-process per-bucket data shrinks with more buckets.
-    //   - bucket-write zlib state grows ~448 KiB per bucket (un-tunable
-    //     internal state + gzbuffer), which becomes the dominant peak
-    //     contributor on tight budgets.
-    //
-    // Strategy: pick the largest bucket_log2 such that the zlib floor
-    // num_buckets * ~448 KiB stays under ~30% of --max-ram. That keeps
-    // bucket-write's unspillable structural floor bounded; the
-    // remaining 70% absorbs per-thread buffers, compactor data, and
-    // the bucket-process working set.
-    //
-    // No --max-ram set -> historical 1024 buckets.
     // Per-platform RAM-overhead multiplier. The auto-tune below models
     // bucket-write peak using overhead constants calibrated on macOS,
     // where libsystem_malloc has heavier per-allocation bookkeeping and
