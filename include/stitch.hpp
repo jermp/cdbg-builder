@@ -33,15 +33,14 @@
 // interns color sets to a small integer id inside its `kmers_merge`
 // phase, so its per-bucket walk and its cross-bucket `links_compaction`
 // (the analog of our stitch) can both gate on cheap integer
-// comparisons. We do the same thing slightly later: after process_buckets
-// emits fragments still holding `std::vector<uint32_t>` color lists,
-// main runs an `intern color sets` pass that calls
-// color_set_dict::intern on each fragment and stores the returned id in
-// stitchable_unitig::cid. From that point on, the stitch equality check
-// is a uint32_t compare and walk_chain inherits the cid by integer
-// assignment instead of copying a thousand-entry vector.
-// Functionally equivalent to GGCAT's gating; structurally one extra
-// pass instead of folding the interning into per-bucket processing.
+// comparisons. We do the same thing slightly later: process_bucket
+// itself interns each emitted fragment's color list into the
+// per-bucket compact_color_set_dict and stores the returned local
+// cid in stitchable_unitig::cid; process_buckets remaps local cids
+// to global cids when merging into the shared streaming dict. From
+// that point on, the stitch equality check is a uint32_t compare
+// and walk_chain inherits the cid by integer assignment instead of
+// copying a thousand-entry vector.
 
 #include <array>
 #include <atomic>

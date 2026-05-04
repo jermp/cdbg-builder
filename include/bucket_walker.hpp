@@ -28,7 +28,6 @@
 #include <unordered_dense/unordered_dense.h>
 
 #include "bucket_io.hpp"
-#include "color_set_dict.hpp"
 #include "compact_color_set_dict.hpp"
 #include "kmer.hpp"
 #include "streaming_color_set_dict.hpp"
@@ -37,9 +36,10 @@
 namespace cdgb {
 
 // Per-k-mer color accumulator. We don't store raw colors here. Instead,
-// each bucket maintains a `record_sets` color_set_dict that interns the
-// (already sorted+deduped) color list of every super-k-mer record read
-// from the bucket file. A k-mer entry holds only the *ids* of the records
+// each bucket maintains a `record_sets` compact_color_set_dict that
+// interns the (already sorted+deduped) color list of every super-k-mer
+// record read from the bucket file (hybrid-encoded, decoded on demand
+// into a scratch). A k-mer entry holds only the *ids* of the records
 // that contributed to it.
 //
 // In practice almost every k-mer is contributed by a single record (the
@@ -76,7 +76,7 @@ struct stitchable_unitig {
     // Color-class id. While process_bucket is emitting unitigs, this is
     // a *local* cid into that bucket's local_dict; process_buckets then
     // remaps it to a global cid as it merges each bucket's local_dict
-    // into the shared global color_set_dict. By the time stitch_unitigs
+    // into the shared global streaming_color_set_dict. By the time stitch_unitigs
     // and the FASTA emitter run, all cids are global.
     uint32_t cid = UINT32_MAX;
     uint8_t open_flags = 0;  // bits from UNITIG_OPEN_*
@@ -419,7 +419,7 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
 
 // Parallel driver. Each worker processes one bucket at a time. After
 // each bucket the worker takes `global_mu` and merges that bucket's
-// local color_set_dict into the shared streaming `global_dict`, building
+// local compact_color_set_dict into the shared streaming `global_dict`, building
 // a local->global cid table and remapping the bucket's unitigs in-place.
 // This folds what used to be a separate single-threaded "intern color
 // sets" pass over every emitted unitig (O(num_unitigs) ~6M) into the
@@ -435,7 +435,7 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
 // Process all buckets in parallel; emit stitchable fragments through a
 // caller-supplied sink. Each thread takes the next bucket from a
 // shared counter, builds the per-bucket walker state, walks the
-// chains, merges its local color_set_dict into the shared global
+// chains, merges its local compact_color_set_dict into the shared global
 // streaming dict, remaps each fragment's cid from local to global,
 // then feeds each fragment into `sink(stitchable_unitig&&)`.
 //

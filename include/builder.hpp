@@ -56,7 +56,6 @@
 #include "bucket_io.hpp"
 #include "bucket_ingester.hpp"
 #include "bucket_walker.hpp"
-#include "color_set_dict.hpp"
 #include "minimizer.hpp"
 #include "stitch.hpp"
 #include "streaming_color_set_dict.hpp"
@@ -393,7 +392,7 @@ private:
     // plan for (per-thread buffers + compactor + compressor). The
     // remainder absorbs the bucket-process working set, which on Mac
     // expands by ~1.75 GiB on the 4546-genome workload (k-mer rsids
-    // map + per-bucket color_set_dict + libsystem_malloc bookkeeping).
+    // map + per-bucket compact_color_set_dict + libsystem_malloc bookkeeping).
     // We hand bucket-write a smaller slice on Mac so the cap holds
     // once bucket-process expands on top.
     static constexpr double BUCKET_WRITE_SHARE =
