@@ -29,6 +29,7 @@
 
 #include "bucket_io.hpp"
 #include "color_set_dict.hpp"
+#include "compact_color_set_dict.hpp"
 #include "kmer.hpp"
 #include "streaming_color_set_dict.hpp"
 #include "super_kmer.hpp"
@@ -99,7 +100,7 @@ using bucket_kmer_map = ankerl::unordered_dense::map<kmer_int_t, bucket_kmer_inf
 // k-mer storage is just the rsid (or short list of rsids), not the colors
 // themselves. See the kmer_entry comment for the memory rationale.
 inline void load_bucket(std::string const& path, uint32_t k, bucket_kmer_map& out,
-                        color_set_dict& record_sets) {
+                        compact_color_set_dict& record_sets) {
     bucket_reader reader(path);
     uint8_t flags = 0;
     std::vector<uint32_t> colors;
@@ -252,9 +253,9 @@ inline left_end_check classify_left_end(
     return {false, false};
 }
 
-inline void process_bucket(std::string const& path, uint32_t k,
+inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_colors,
                            std::vector<stitchable_unitig>& out_local,
-                           color_set_dict& out_local_dict) {
+                           compact_color_set_dict& out_local_dict) {
     bucket_kmer_map kmer_info;
     ankerl::unordered_dense::map<kmer_int_t, uint32_t, kmer_hasher> cid_of;
     {
@@ -263,7 +264,13 @@ inline void process_bucket(std::string const& path, uint32_t k,
         // record-set arena and the inner rsid vectors (via the
         // kmer_entry{} reset below) before the walk phase, so the walk
         // sees only kmer_info's phantom bits + cid_of.
-        color_set_dict record_sets;
+        //
+        // record_sets is the compact (hybrid-encoded) variant -- on
+        // dense pangenome inputs the live-vector dict grew to hundreds
+        // of MB per bucket; with N threads in flight that became the
+        // dominant peak contributor. compact stores each color list
+        // hybrid-encoded and decodes on access into a scratch buffer.
+        compact_color_set_dict record_sets(num_colors);
         load_bucket(path, k, kmer_info, record_sets);
 
         // Common case: a k-mer is contributed by a single record, so its
@@ -277,9 +284,14 @@ inline void process_bucket(std::string const& path, uint32_t k,
         std::vector<uint32_t> rsid_to_cid(record_sets.size(), UINT32_MAX);
         cid_of.reserve(kmer_info.size());
 
+        // Scratch reused across all .at() calls so we don't allocate a
+        // fresh decoded-colors buffer per access.
+        std::vector<uint32_t> at_scratch;
+
         auto cid_for_single_rsid = [&](uint32_t rsid) -> uint32_t {
             if (rsid_to_cid[rsid] == UINT32_MAX) {
-                rsid_to_cid[rsid] = out_local_dict.intern(record_sets.at(rsid));
+                record_sets.at(rsid, at_scratch);
+                rsid_to_cid[rsid] = out_local_dict.intern(std::move(at_scratch));
             }
             return rsid_to_cid[rsid];
         };
@@ -304,8 +316,9 @@ inline void process_bucket(std::string const& path, uint32_t k,
                 } else {
                     merged_scratch.clear();
                     for (uint32_t r : rsids_scratch) {
-                        auto const& v = record_sets.at(r);
-                        merged_scratch.insert(merged_scratch.end(), v.begin(), v.end());
+                        record_sets.at(r, at_scratch);
+                        merged_scratch.insert(merged_scratch.end(), at_scratch.begin(),
+                                              at_scratch.end());
                     }
                     std::sort(merged_scratch.begin(), merged_scratch.end());
                     merged_scratch.erase(
@@ -419,8 +432,21 @@ inline void process_bucket(std::string const& path, uint32_t k,
 // .colors output rather than to the sum of class sizes.
 //
 // `out_mu` still serializes the final append into the shared `out`.
-inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t num_threads,
-                            std::vector<stitchable_unitig>& out, std::mutex& out_mu,
+// Process all buckets in parallel; emit stitchable fragments through a
+// caller-supplied sink. Each thread takes the next bucket from a
+// shared counter, builds the per-bucket walker state, walks the
+// chains, merges its local color_set_dict into the shared global
+// streaming dict, remaps each fragment's cid from local to global,
+// then feeds each fragment into `sink(stitchable_unitig&&)`.
+//
+// `sink` is required to be safe for concurrent calls from
+// num_threads worker threads (use an internal mutex if needed). For
+// the production pipeline this is a frag_unitig_writer that streams
+// fragments to disk so the in-RAM accumulator never reaches its
+// multi-GB peak.
+template <typename Sink>
+inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t num_colors,
+                            uint32_t num_threads, Sink&& sink,
                             streaming_color_set_dict& global_dict, std::mutex& global_mu,
                             std::atomic<uint64_t>* done = nullptr) {
     if (num_threads == 0) num_threads = 1;
@@ -430,34 +456,45 @@ inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t nu
     workers.reserve(num_threads);
 
     auto run = [&]() {
-        std::vector<stitchable_unitig> local;
+        // Reused per-thread scratch for decoding local_dict entries
+        // before handing them to the streaming global_dict. Allocated
+        // once per thread; reused across all of this thread's buckets.
+        std::vector<uint32_t> decode_scratch;
         for (;;) {
             uint32_t b = next.fetch_add(1);
             if (b >= B) break;
             std::vector<stitchable_unitig> bucket_unitigs;
-            color_set_dict local_dict;
+            // Hybrid-encoded local dict: per-bucket footprint shrinks
+            // ~10-30x vs the live-vector dict, so N threads in flight
+            // stay within the per-thread share of --max-ram on dense
+            // pangenome inputs.
+            compact_color_set_dict local_dict(num_colors);
             try {
-                detail::process_bucket(writer.bucket_path(b), k, bucket_unitigs, local_dict);
+                detail::process_bucket(writer.bucket_path(b), k, num_colors, bucket_unitigs,
+                                       local_dict);
             } catch (std::exception& e) {
                 std::cerr << "error processing bucket " << b << ": " << e.what() << '\n';
             }
             // Merge this bucket's local dict into the shared global
             // dict, build a local->global cid table, then remap each
-            // unitig's cid before we drop the local dict.
+            // unitig's cid before we drop the local dict. Each local
+            // class is decoded into the per-thread scratch, then
+            // moved into global_dict.intern (which encodes again into
+            // the streaming bvb).
             std::vector<uint32_t> local_to_global(local_dict.size());
             {
                 std::lock_guard<std::mutex> lk(global_mu);
                 for (uint32_t lc = 0; lc < local_dict.size(); ++lc) {
-                    local_to_global[lc] = global_dict.intern(std::move(local_dict.mutable_at(lc)));
+                    local_dict.at(lc, decode_scratch);
+                    local_to_global[lc] = global_dict.intern(std::move(decode_scratch));
                 }
             }
-            for (auto& u : bucket_unitigs) u.cid = local_to_global[u.cid];
-            local.insert(local.end(), std::make_move_iterator(bucket_unitigs.begin()),
-                         std::make_move_iterator(bucket_unitigs.end()));
+            for (auto& u : bucket_unitigs) {
+                u.cid = local_to_global[u.cid];
+                sink(std::move(u));
+            }
             if (done) done->fetch_add(1, std::memory_order_relaxed);
         }
-        std::lock_guard<std::mutex> lk(out_mu);
-        for (auto& u : local) out.emplace_back(std::move(u));
     };
 
     for (uint32_t t = 0; t < num_threads; ++t) workers.emplace_back(run);

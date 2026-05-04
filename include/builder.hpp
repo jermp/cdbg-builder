@@ -46,6 +46,10 @@
 
 #include <unistd.h>
 
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
+
 #include <bit_vector.hpp>
 #include <essentials.hpp>
 
@@ -99,7 +103,8 @@ struct builder {
         std::string const tmp_dir = resolve_tmp_dir();
         std::cout << "  tmp_dir = " << tmp_dir << "\n";
 
-        bucket_writer writer(tmp_dir, num_buckets, m_flush_bases, m_spill_bytes);
+        auto writer = std::make_unique<bucket_writer>(tmp_dir, num_buckets, m_flush_bases,
+                                                      m_spill_bytes);
         // When --max-ram is set, arm a background RSS watcher with
         // hysteresis. Bucket-write must leave room for what comes
         // after: bucket-process adds ~1 GiB on top on multi-thousand-
@@ -121,7 +126,7 @@ struct builder {
                 (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0);
             uint64_t high_threshold_bytes = (uint64_t)(0.60 * (double)budget_bytes);
             uint64_t low_threshold_bytes = (uint64_t)(0.45 * (double)budget_bytes);
-            writer.start_rss_watcher(high_threshold_bytes, low_threshold_bytes);
+            writer->start_rss_watcher(high_threshold_bytes, low_threshold_bytes);
         }
         {
             phase_rss_marker rss("bucket-write");
@@ -129,7 +134,7 @@ struct builder {
                 timer _("bucket-write");
                 std::atomic<uint64_t> done{0};
                 progress prog("bucket-write", done, files.size());
-                ingest_bucketed(files, m_cfg.k, m_cfg.m, m_cfg.bucket_log2, writer,
+                ingest_bucketed(files, m_cfg.k, m_cfg.m, m_cfg.bucket_log2, *writer,
                                 m_cfg.num_threads, &done);
                 prog.stop();
             }
@@ -139,33 +144,36 @@ struct builder {
         }
         // Stop the RSS watcher before close(): we don't want a stray
         // try_spill firing during close()'s final spill+gzclose loop.
-        writer.stop_rss_watcher();
-        if (writer.pressure_was_engaged()) {
+        writer->stop_rss_watcher();
+        if (writer->pressure_was_engaged()) {
             std::cout << "  bucket-write: RSS pressure engaged; observed live-RSS high "
-                      << format_bytes(writer.observed_rss_high()) << "\n";
+                      << format_bytes(writer->observed_rss_high()) << "\n";
         }
-        writer.close();
-        std::cout << "  bucket bytes written: " << writer.total_bytes() << " (compressed; "
-                  << writer.total_uncompressed_bytes() << " uncompressed)\n";
+        writer->close();
+        std::cout << "  bucket bytes written: " << writer->total_bytes() << " (compressed; "
+                  << writer->total_uncompressed_bytes() << " uncompressed)\n";
         bucket_prof().print(m_cfg.num_threads);
 
-        // Bucket processing emits stitchable fragments AND merges per-bucket
-        // color sets into the shared global dict on the fly. By the time we
-        // exit this block, every fragment already carries a global cid.
-        std::vector<stitchable_unitig> frag_unitigs;
-        std::mutex out_mu;
-        // Streaming dict: encodes each new color set into its bvb at
-        // intern() time, holding only metadata (32 B/class) plus the
-        // compressed bits. Compared to the previous in-RAM-vectors
-        // dict, this caps peak RAM during the dominant bucket-process
-        // phase by the *compressed* color-set size, not the sum of
-        // class sizes.
+        // Bucket processing emits stitchable fragments AND merges
+        // per-bucket color sets into the shared global dict on the
+        // fly. By the time we exit this block, every fragment already
+        // carries a global cid.
+        //
+        // Fragments are NOT accumulated in an in-RAM vector -- on
+        // dense pangenome inputs that vector grew to multi-GB during
+        // bucket-process and was the dominant peak contributor.
+        // Instead we stream each fragment through a disk-backed
+        // frag_unitig_writer to a single tmp file, then load the file
+        // back into a vector once at the start of stitch (which
+        // currently still does in-RAM stitching).
+        //
         // Streaming dict: encodes each new color set into its bvb at
         // intern() time and immediately flushes complete 64-bit words
         // to the final <basename>.color_sets file. Per-class memory
-        // is just 32 bytes of metadata; the compressed bit_vector
+        // is just 16 bytes of metadata; the compressed bit_vector
         // never sits in RAM. EF offsets are appended to the file at
         // finalize().
+        frag_unitig_writer frag_sink(tmp_dir + "/frag_unitigs.bin");
         streaming_color_set_dict global_dict(m_num_colors,
                                              m_cfg.out_basename + ".color_sets");
         std::mutex global_mu;
@@ -175,42 +183,72 @@ struct builder {
                 timer _("bucket-process");
                 std::atomic<uint64_t> done{0};
                 progress prog("bucket-process", done, num_buckets);
-                process_buckets(writer, m_cfg.k, m_cfg.num_threads, frag_unitigs, out_mu,
-                                global_dict, global_mu, &done);
+                process_buckets(*writer, m_cfg.k, m_num_colors, m_cfg.num_threads,
+                                std::ref(frag_sink), global_dict, global_mu, &done);
                 prog.stop();
-                std::cout << "  bucket fragments: " << frag_unitigs.size() << "\n";
+                std::cout << "  bucket fragments: " << frag_sink.count() << "\n";
                 std::cout << "  distinct color classes: " << global_dict.size() << "\n";
             }
             rss.stop();
         }
         m_num_color_classes = global_dict.size();
+        frag_sink.close_for_writing();
+        // bucket_writer's per-bucket compactor state (m_dict_classes
+        // and other reuse-friendly buffers) is alive at high-water
+        // until the writer is destroyed -- ~300 MB on 25K scale that
+        // would otherwise carry into stitch. Drop it now; the bucket
+        // *files* on disk are still there (cleanup_tmp_dir removes
+        // them at end of build), and process_buckets has already read
+        // them.
+        writer.reset();
+        // glibc holds free'd allocations in per-thread arenas across
+        // phase boundaries; on a 16-thread bucket-process this can
+        // be 500 MB - 1 GB of "free but not returned to OS" memory
+        // that still counts toward RSS during stitch. Force release
+        // back to the kernel before stitch starts.
+        release_free_heap_to_os_();
 
-        // Stitch streams each finished unitig directly into a disk-
-        // backed bucket sink: bucket b holds cids in
-        // [b * S, (b+1) * S) where S = ceil(num_color_classes / K).
-        // This keeps the in-memory peak during stitch bounded by the
-        // walker's adjacency + visited bitmaps + the trailing partial
-        // chain -- the merged seq strings are not retained.
-        const uint32_t unitig_bucket_count = pick_unitig_bucket_count_(m_num_color_classes);
-        unitig_bucket_writer uwriter(tmp_dir, m_num_color_classes, unitig_bucket_count);
+        // Stitch streams each finished unitig into a cid-range
+        // unitig_bucket_writer. The K bucket count auto-scales so
+        // per-bucket peak at emit stays under ~10% of --max-ram. We
+        // size K up-front from a single index-only walk over the
+        // mmap-backed frag spill (no seq bytes touched here).
+        std::unique_ptr<unitig_bucket_writer> uwriter_ptr;
         {
+            // Scope the frag_unitig_reader to just the stitch phase so
+            // its index vector + mmap are released before emit. emit
+            // only needs uwriter (cid-bucketed unitig spill) and
+            // global_dict (streaming color sets).
             phase_rss_marker rss("stitch");
             {
                 timer _("stitch");
+                frag_unitig_reader frag_reader(frag_sink.path());
+
+                uint64_t total_frag_seq_bytes = 0;
+                for (size_t i = 0; i < frag_reader.size(); ++i)
+                    total_frag_seq_bytes += frag_reader.seq_view(i).size();
+
+                const uint32_t unitig_bucket_count = pick_unitig_bucket_count_(
+                    m_num_color_classes, total_frag_seq_bytes, m_cfg.max_ram_gb);
+                uwriter_ptr = std::make_unique<unitig_bucket_writer>(
+                    tmp_dir, m_num_color_classes, unitig_bucket_count);
+
                 std::atomic<uint64_t> done{0};
-                progress prog("stitch", done, frag_unitigs.size());
-                stitch_unitigs_streaming(frag_unitigs, m_cfg.k, std::ref(uwriter), &done);
+                progress prog("stitch", done, frag_reader.size());
+                stitch_unitigs_streaming(frag_reader, m_cfg.k, std::ref(*uwriter_ptr), &done);
                 prog.stop();
-                frag_unitigs = {};
-                std::cout << "  unitigs after stitching: " << uwriter.total_unitigs() << "\n";
+                std::cout << "  unitigs after stitching: " << uwriter_ptr->total_unitigs() << "\n";
+                // frag_reader destroyed here -- mmap unmapped, index freed.
             }
             rss.stop();
         }
-        m_num_unitigs = uwriter.total_unitigs();
+        // Spill file no longer needed; safe to unlink.
+        frag_sink.unlink();
+        m_num_unitigs = uwriter_ptr->total_unitigs();
 
         {
             phase_rss_marker rss("emit");
-            emit_fasta(uwriter);
+            emit_fasta(*uwriter_ptr);
             emit_colors(global_dict);
             rss.stop();
         }
@@ -541,17 +579,56 @@ private:
         std::filesystem::remove_all(tmp_dir, ec);
     }
 
-    // Pick the cid-range bucket count for the unitig spill. We want
-    // each bucket's seq payload to fit comfortably in RAM during
-    // emit. For the salmonella-4546 reference (~190 MB total seq /
-    // 1.88 M unitigs across 972 K cids), 64 buckets gives ~3 MB / 30 K
-    // unitigs per bucket -- comfortably bounded regardless of
-    // --max-ram. We don't need the bucket count to scale with the
-    // budget: emit reads one bucket at a time.
-    static uint32_t pick_unitig_bucket_count_(uint64_t num_color_classes) {
+    // Pick the cid-range bucket count for the unitig spill, so the
+    // peak in-RAM seq footprint at emit time -- one bucket loaded
+    // and sorted -- stays under a target fraction of --max-ram.
+    //
+    // Each bucket's records: roughly total_seq_bytes / K plus
+    // ~2x overhead (std::string capacity slack + per-record book-
+    // keeping in the sort vector). We size K so that target
+    // per-bucket footprint is <= 10% of --max-ram, leaving the
+    // remaining 90% for whatever else is resident at emit time
+    // (the streaming color-set dict's metadata, the FILE buffer,
+    // the u2c bit_vector, etc.). Floor at MIN_K so we don't end
+    // up with one giant bucket when --max-ram is unset or huge,
+    // ceiling at MAX_K to stay within RLIMIT_NOFILE headroom
+    // (bucket-write's FDs are already closed when stitch starts,
+    // so we have ~1024 FDs available).
+    // Best-effort release of free'd glibc-arena memory back to the
+    // kernel. No-op on non-glibc allocators (musl, jemalloc). Worth
+    // calling at phase boundaries because on 16-thread workloads the
+    // per-thread arena freelists can hold 1 GB+ that still counts in
+    // RSS even after all containers were destroyed.
+    static void release_free_heap_to_os_() {
+#if defined(__GLIBC__)
+        ::malloc_trim(0);
+#endif
+    }
+
+    static uint32_t pick_unitig_bucket_count_(uint64_t num_color_classes,
+                                              uint64_t total_seq_bytes_estimate,
+                                              double max_ram_gb) {
         if (num_color_classes == 0) return 1;
-        constexpr uint32_t TARGET = 64;
-        return (uint32_t)std::min<uint64_t>(num_color_classes, TARGET);
+        constexpr uint32_t MIN_K = 16;
+        constexpr uint32_t MAX_K = 1024;
+        constexpr uint32_t DEFAULT_K = 64;
+        constexpr double OVERHEAD = 2.0;
+        constexpr double SHARE = 0.10;
+
+        if (max_ram_gb <= 0 || total_seq_bytes_estimate == 0) {
+            return (uint32_t)std::min<uint64_t>(num_color_classes, DEFAULT_K);
+        }
+        const uint64_t budget_bytes =
+            (uint64_t)(max_ram_gb * 1024.0 * 1024.0 * 1024.0 * SHARE);
+        if (budget_bytes == 0) {
+            return (uint32_t)std::min<uint64_t>(num_color_classes, DEFAULT_K);
+        }
+        const uint64_t needed = (uint64_t)((double)total_seq_bytes_estimate * OVERHEAD);
+        uint64_t k = (needed + budget_bytes - 1) / budget_bytes;
+        if (k < MIN_K) k = MIN_K;
+        if (k > MAX_K) k = MAX_K;
+        if (k > num_color_classes) k = num_color_classes;
+        return (uint32_t)k;
     }
 
     // FASTA emit. Hand-rolled 1 MiB buffer + std::to_chars for the
