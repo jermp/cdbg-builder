@@ -149,23 +149,26 @@ struct builder {
                   << writer.total_uncompressed_bytes() << " uncompressed)\n";
         bucket_prof().print(m_cfg.num_threads);
 
-        // Bucket processing emits stitchable fragments AND merges per-bucket
-        // color sets into the shared global dict on the fly. By the time we
-        // exit this block, every fragment already carries a global cid.
-        std::vector<stitchable_unitig> frag_unitigs;
-        std::mutex out_mu;
-        // Streaming dict: encodes each new color set into its bvb at
-        // intern() time, holding only metadata (32 B/class) plus the
-        // compressed bits. Compared to the previous in-RAM-vectors
-        // dict, this caps peak RAM during the dominant bucket-process
-        // phase by the *compressed* color-set size, not the sum of
-        // class sizes.
+        // Bucket processing emits stitchable fragments AND merges
+        // per-bucket color sets into the shared global dict on the
+        // fly. By the time we exit this block, every fragment already
+        // carries a global cid.
+        //
+        // Fragments are NOT accumulated in an in-RAM vector -- on
+        // dense pangenome inputs that vector grew to multi-GB during
+        // bucket-process and was the dominant peak contributor.
+        // Instead we stream each fragment through a disk-backed
+        // frag_unitig_writer to a single tmp file, then load the file
+        // back into a vector once at the start of stitch (which
+        // currently still does in-RAM stitching).
+        //
         // Streaming dict: encodes each new color set into its bvb at
         // intern() time and immediately flushes complete 64-bit words
         // to the final <basename>.color_sets file. Per-class memory
-        // is just 32 bytes of metadata; the compressed bit_vector
+        // is just 16 bytes of metadata; the compressed bit_vector
         // never sits in RAM. EF offsets are appended to the file at
         // finalize().
+        frag_unitig_writer frag_sink(tmp_dir + "/frag_unitigs.bin");
         streaming_color_set_dict global_dict(m_num_colors,
                                              m_cfg.out_basename + ".color_sets");
         std::mutex global_mu;
@@ -175,15 +178,24 @@ struct builder {
                 timer _("bucket-process");
                 std::atomic<uint64_t> done{0};
                 progress prog("bucket-process", done, num_buckets);
-                process_buckets(writer, m_cfg.k, m_cfg.num_threads, frag_unitigs, out_mu,
+                process_buckets(writer, m_cfg.k, m_cfg.num_threads, std::ref(frag_sink),
                                 global_dict, global_mu, &done);
                 prog.stop();
-                std::cout << "  bucket fragments: " << frag_unitigs.size() << "\n";
+                std::cout << "  bucket fragments: " << frag_sink.count() << "\n";
                 std::cout << "  distinct color classes: " << global_dict.size() << "\n";
             }
             rss.stop();
         }
         m_num_color_classes = global_dict.size();
+        frag_sink.close_for_writing();
+
+        // Load the spilled fragments back into memory for stitch.
+        // (Future work: stream/lazy access during stitch so this peak
+        // stays under --max-ram. For now this restores the historical
+        // peak shape during stitch.)
+        std::vector<stitchable_unitig> frag_unitigs;
+        frag_sink.load_to_vector(frag_unitigs);
+        frag_sink.unlink();
 
         // Estimate total seq bytes that stitch will write to the
         // unitig spill, used to size K below. Stitch can only shrink

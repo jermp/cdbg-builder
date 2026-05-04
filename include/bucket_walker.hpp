@@ -419,10 +419,22 @@ inline void process_bucket(std::string const& path, uint32_t k,
 // .colors output rather than to the sum of class sizes.
 //
 // `out_mu` still serializes the final append into the shared `out`.
+// Process all buckets in parallel; emit stitchable fragments through a
+// caller-supplied sink. Each thread takes the next bucket from a
+// shared counter, builds the per-bucket walker state, walks the
+// chains, merges its local color_set_dict into the shared global
+// streaming dict, remaps each fragment's cid from local to global,
+// then feeds each fragment into `sink(stitchable_unitig&&)`.
+//
+// `sink` is required to be safe for concurrent calls from
+// num_threads worker threads (use an internal mutex if needed). For
+// the production pipeline this is a frag_unitig_writer that streams
+// fragments to disk so the in-RAM accumulator never reaches its
+// multi-GB peak.
+template <typename Sink>
 inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t num_threads,
-                            std::vector<stitchable_unitig>& out, std::mutex& out_mu,
-                            streaming_color_set_dict& global_dict, std::mutex& global_mu,
-                            std::atomic<uint64_t>* done = nullptr) {
+                            Sink&& sink, streaming_color_set_dict& global_dict,
+                            std::mutex& global_mu, std::atomic<uint64_t>* done = nullptr) {
     if (num_threads == 0) num_threads = 1;
     const uint32_t B = writer.num_buckets();
     std::atomic<uint32_t> next{0};
@@ -430,7 +442,6 @@ inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t nu
     workers.reserve(num_threads);
 
     auto run = [&]() {
-        std::vector<stitchable_unitig> local;
         for (;;) {
             uint32_t b = next.fetch_add(1);
             if (b >= B) break;
@@ -451,13 +462,12 @@ inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t nu
                     local_to_global[lc] = global_dict.intern(std::move(local_dict.mutable_at(lc)));
                 }
             }
-            for (auto& u : bucket_unitigs) u.cid = local_to_global[u.cid];
-            local.insert(local.end(), std::make_move_iterator(bucket_unitigs.begin()),
-                         std::make_move_iterator(bucket_unitigs.end()));
+            for (auto& u : bucket_unitigs) {
+                u.cid = local_to_global[u.cid];
+                sink(std::move(u));
+            }
             if (done) done->fetch_add(1, std::memory_order_relaxed);
         }
-        std::lock_guard<std::mutex> lk(out_mu);
-        for (auto& u : local) out.emplace_back(std::move(u));
     };
 
     for (uint32_t t = 0; t < num_threads; ++t) workers.emplace_back(run);

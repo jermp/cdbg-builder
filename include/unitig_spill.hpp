@@ -173,4 +173,126 @@ private:
     uint64_t m_total_unitigs = 0;
 };
 
+// ----------------------------------------------------------------------------
+// Disk-backed sink for the bucket-process -> stitch boundary.
+//
+// process_buckets feeds each finished fragment into a caller-provided
+// sink. Used as that sink, frag_unitig_writer streams every fragment
+// to a single append-only file in tmp_dir, so the accumulating
+// std::vector<stitchable_unitig> never grows to its multi-GB peak
+// during bucket-process. After bucket-process completes, callers
+// either load the file back into a vector before stitch (simple path)
+// or read it lazily during stitch (memory-frugal path -- not
+// implemented here).
+//
+// File format: a sequence of records, one per finished fragment.
+//   [u32 cid]
+//   [u8  open_flags]
+//   [u32 seq_len]
+//   [seq_len bytes]    raw ACGT
+//
+// operator() is mutex-protected: process_buckets calls it from
+// num_threads worker threads concurrently. Each call writes one
+// record's worth of bytes (~50-150 B typical) under the lock; mutex
+// contention on a workload of ~50 M fragments is negligible compared
+// to the per-bucket walker work.
+
+class frag_unitig_writer {
+public:
+    explicit frag_unitig_writer(std::string path)
+        : m_path(std::move(path)) {
+        m_file = std::fopen(m_path.c_str(), "wb+");
+        if (!m_file)
+            throw std::runtime_error("cannot open frag spill: " + m_path);
+    }
+
+    ~frag_unitig_writer() {
+        if (m_file) std::fclose(m_file);
+    }
+
+    frag_unitig_writer(frag_unitig_writer const&) = delete;
+    frag_unitig_writer& operator=(frag_unitig_writer const&) = delete;
+
+    void operator()(stitchable_unitig&& u) {
+        std::lock_guard<std::mutex> lk(m_mu);
+        const uint32_t cid = u.cid;
+        const uint8_t flags = u.open_flags;
+        const uint32_t seq_len = (uint32_t)u.seq.size();
+        if (std::fwrite(&cid, sizeof(cid), 1, m_file) != 1 ||
+            std::fwrite(&flags, sizeof(flags), 1, m_file) != 1 ||
+            std::fwrite(&seq_len, sizeof(seq_len), 1, m_file) != 1)
+            throw std::runtime_error("short write to " + m_path);
+        if (seq_len > 0 &&
+            std::fwrite(u.seq.data(), 1, seq_len, m_file) != (size_t)seq_len)
+            throw std::runtime_error("short write to " + m_path);
+        ++m_count;
+        // Free the merged seq's backing storage in place: the caller
+        // already moved into us.
+        std::string().swap(u.seq);
+    }
+
+    uint64_t count() const { return m_count; }
+    std::string const& path() const { return m_path; }
+
+    // Close the writer side. Call before reads.
+    void close_for_writing() {
+        std::lock_guard<std::mutex> lk(m_mu);
+        if (m_file) {
+            std::fflush(m_file);
+            std::fclose(m_file);
+            m_file = nullptr;
+        }
+    }
+
+    // Read every record back into `out`. Reserves up-front from
+    // m_count so no reallocation churn. The frag spill file is
+    // sequential-access friendly so this is one big sequential read.
+    void load_to_vector(std::vector<stitchable_unitig>& out) {
+        out.clear();
+        out.reserve(m_count);
+        std::FILE* f = std::fopen(m_path.c_str(), "rb");
+        if (!f) throw std::runtime_error("cannot reopen frag spill: " + m_path);
+        for (;;) {
+            uint32_t cid = 0;
+            size_t got = std::fread(&cid, sizeof(cid), 1, f);
+            if (got != 1) {
+                if (std::feof(f)) break;
+                std::fclose(f);
+                throw std::runtime_error("short read of cid from " + m_path);
+            }
+            uint8_t flags = 0;
+            uint32_t seq_len = 0;
+            if (std::fread(&flags, sizeof(flags), 1, f) != 1 ||
+                std::fread(&seq_len, sizeof(seq_len), 1, f) != 1) {
+                std::fclose(f);
+                throw std::runtime_error("short read of header from " + m_path);
+            }
+            stitchable_unitig u;
+            u.cid = cid;
+            u.open_flags = flags;
+            u.seq.resize(seq_len);
+            if (seq_len > 0 &&
+                std::fread(u.seq.data(), 1, seq_len, f) != (size_t)seq_len) {
+                std::fclose(f);
+                throw std::runtime_error("short read of seq from " + m_path);
+            }
+            out.push_back(std::move(u));
+        }
+        std::fclose(f);
+    }
+
+    void unlink() {
+        if (m_path.empty()) return;
+        std::error_code ec;
+        std::filesystem::remove(m_path, ec);
+        m_path.clear();
+    }
+
+private:
+    std::string m_path;
+    std::FILE* m_file = nullptr;
+    std::mutex m_mu;
+    uint64_t m_count = 0;
+};
+
 }  // namespace cdgb
