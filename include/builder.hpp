@@ -103,7 +103,8 @@ struct builder {
         std::string const tmp_dir = resolve_tmp_dir();
         std::cout << "  tmp_dir = " << tmp_dir << "\n";
 
-        bucket_writer writer(tmp_dir, num_buckets, m_flush_bases, m_spill_bytes);
+        auto writer = std::make_unique<bucket_writer>(tmp_dir, num_buckets, m_flush_bases,
+                                                      m_spill_bytes);
         // When --max-ram is set, arm a background RSS watcher with
         // hysteresis. Bucket-write must leave room for what comes
         // after: bucket-process adds ~1 GiB on top on multi-thousand-
@@ -125,7 +126,7 @@ struct builder {
                 (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0);
             uint64_t high_threshold_bytes = (uint64_t)(0.60 * (double)budget_bytes);
             uint64_t low_threshold_bytes = (uint64_t)(0.45 * (double)budget_bytes);
-            writer.start_rss_watcher(high_threshold_bytes, low_threshold_bytes);
+            writer->start_rss_watcher(high_threshold_bytes, low_threshold_bytes);
         }
         {
             phase_rss_marker rss("bucket-write");
@@ -133,7 +134,7 @@ struct builder {
                 timer _("bucket-write");
                 std::atomic<uint64_t> done{0};
                 progress prog("bucket-write", done, files.size());
-                ingest_bucketed(files, m_cfg.k, m_cfg.m, m_cfg.bucket_log2, writer,
+                ingest_bucketed(files, m_cfg.k, m_cfg.m, m_cfg.bucket_log2, *writer,
                                 m_cfg.num_threads, &done);
                 prog.stop();
             }
@@ -143,14 +144,14 @@ struct builder {
         }
         // Stop the RSS watcher before close(): we don't want a stray
         // try_spill firing during close()'s final spill+gzclose loop.
-        writer.stop_rss_watcher();
-        if (writer.pressure_was_engaged()) {
+        writer->stop_rss_watcher();
+        if (writer->pressure_was_engaged()) {
             std::cout << "  bucket-write: RSS pressure engaged; observed live-RSS high "
-                      << format_bytes(writer.observed_rss_high()) << "\n";
+                      << format_bytes(writer->observed_rss_high()) << "\n";
         }
-        writer.close();
-        std::cout << "  bucket bytes written: " << writer.total_bytes() << " (compressed; "
-                  << writer.total_uncompressed_bytes() << " uncompressed)\n";
+        writer->close();
+        std::cout << "  bucket bytes written: " << writer->total_bytes() << " (compressed; "
+                  << writer->total_uncompressed_bytes() << " uncompressed)\n";
         bucket_prof().print(m_cfg.num_threads);
 
         // Bucket processing emits stitchable fragments AND merges
@@ -182,7 +183,7 @@ struct builder {
                 timer _("bucket-process");
                 std::atomic<uint64_t> done{0};
                 progress prog("bucket-process", done, num_buckets);
-                process_buckets(writer, m_cfg.k, m_num_colors, m_cfg.num_threads,
+                process_buckets(*writer, m_cfg.k, m_num_colors, m_cfg.num_threads,
                                 std::ref(frag_sink), global_dict, global_mu, &done);
                 prog.stop();
                 std::cout << "  bucket fragments: " << frag_sink.count() << "\n";
@@ -192,6 +193,14 @@ struct builder {
         }
         m_num_color_classes = global_dict.size();
         frag_sink.close_for_writing();
+        // bucket_writer's per-bucket compactor state (m_dict_classes
+        // and other reuse-friendly buffers) is alive at high-water
+        // until the writer is destroyed -- ~300 MB on 25K scale that
+        // would otherwise carry into stitch. Drop it now; the bucket
+        // *files* on disk are still there (cleanup_tmp_dir removes
+        // them at end of build), and process_buckets has already read
+        // them.
+        writer.reset();
         // glibc holds free'd allocations in per-thread arenas across
         // phase boundaries; on a 16-thread bucket-process this can
         // be 500 MB - 1 GB of "free but not returned to OS" memory
