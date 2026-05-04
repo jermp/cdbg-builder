@@ -341,6 +341,12 @@ public:
                 throw std::runtime_error("mmap failed on " + m_path);
             }
             m_mmap_base = (uint8_t const*)p;
+            // Walk_chain accesses fragments in chain order, which has
+            // no spatial locality with the on-disk layout. MADV_RANDOM
+            // tells the kernel to stop prefetching surrounding pages
+            // and to reclaim resident pages more aggressively under
+            // memory pressure -- both reduce stitch-phase peak RSS.
+            ::madvise((void*)m_mmap_base, m_mmap_size, MADV_RANDOM);
         }
         // Walk the file once to populate the index. Records are
         // [u32 cid][u8 flags][u32 seq_len][seq_len bytes]. Sequential
@@ -359,10 +365,11 @@ public:
             off += 4;
             if (off + seq_len > m_mmap_size)
                 throw std::runtime_error("truncated frag spill seq in " + m_path);
+            if (seq_len > MAX_SEQ_LEN)
+                throw std::runtime_error("seq_len exceeds 30-bit cap in " + m_path);
             entry e;
             e.cid = cid;
-            e.seq_len = seq_len;
-            e.open_flags = flags;
+            e.flags_and_len = ((uint32_t)flags << 30) | (seq_len & MAX_SEQ_LEN);
             e.seq_offset = off;
             m_entries.push_back(e);
             off += seq_len;
@@ -384,20 +391,27 @@ public:
     // Source interface for stitch_unitigs_streaming.
     size_t size() const { return m_entries.size(); }
     uint32_t cid(size_t i) const { return m_entries[i].cid; }
-    uint8_t open_flags(size_t i) const { return m_entries[i].open_flags; }
+    uint8_t open_flags(size_t i) const {
+        return (uint8_t)(m_entries[i].flags_and_len >> 30);
+    }
     std::string_view seq_view(size_t i) const {
         auto const& e = m_entries[i];
-        return std::string_view((char const*)m_mmap_base + e.seq_offset, e.seq_len);
+        return std::string_view((char const*)m_mmap_base + e.seq_offset,
+                                e.flags_and_len & MAX_SEQ_LEN);
     }
 
 private:
+    // 16-byte packed entry: cid (4) + flags-and-len (4: 2 bits flags +
+    // 30 bits seq_len) + seq_offset (8). Saves 8 B/entry vs the
+    // natural-aligned 24-byte struct -- on 26.6 M fragments that's
+    // ~213 MB of index RAM.
+    static constexpr uint32_t MAX_SEQ_LEN = (1u << 30) - 1;
     struct entry {
         uint32_t cid;
-        uint32_t seq_len;
-        uint8_t open_flags;
-        // 7 bytes implicit padding before seq_offset; 24-byte struct.
+        uint32_t flags_and_len;  // top 2 bits: open_flags; bottom 30 bits: seq_len
         uint64_t seq_offset;
     };
+    static_assert(sizeof(entry) == 16, "frag_unitig_reader::entry must be 16 bytes");
 
     std::string m_path;
     int m_fd = -1;

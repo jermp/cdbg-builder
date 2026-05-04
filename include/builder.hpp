@@ -46,6 +46,10 @@
 
 #include <unistd.h>
 
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
+
 #include <bit_vector.hpp>
 #include <essentials.hpp>
 
@@ -188,6 +192,12 @@ struct builder {
         }
         m_num_color_classes = global_dict.size();
         frag_sink.close_for_writing();
+        // glibc holds free'd allocations in per-thread arenas across
+        // phase boundaries; on a 16-thread bucket-process this can
+        // be 500 MB - 1 GB of "free but not returned to OS" memory
+        // that still counts toward RSS during stitch. Force release
+        // back to the kernel before stitch starts.
+        release_free_heap_to_os_();
 
         // Stitch streams each finished unitig into a cid-range
         // unitig_bucket_writer. The K bucket count auto-scales so
@@ -575,6 +585,17 @@ private:
     // ceiling at MAX_K to stay within RLIMIT_NOFILE headroom
     // (bucket-write's FDs are already closed when stitch starts,
     // so we have ~1024 FDs available).
+    // Best-effort release of free'd glibc-arena memory back to the
+    // kernel. No-op on non-glibc allocators (musl, jemalloc). Worth
+    // calling at phase boundaries because on 16-thread workloads the
+    // per-thread arena freelists can hold 1 GB+ that still counts in
+    // RSS even after all containers were destroyed.
+    static void release_free_heap_to_os_() {
+#if defined(__GLIBC__)
+        ::malloc_trim(0);
+#endif
+    }
+
     static uint32_t pick_unitig_bucket_count_(uint64_t num_color_classes,
                                               uint64_t total_seq_bytes_estimate,
                                               double max_ram_gb) {
