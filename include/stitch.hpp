@@ -125,10 +125,30 @@ inline kmer_int_t side_junction_canonical(std::string_view seq, uint32_t k, uint
     return rc;
 }
 
-struct link {
-    uint32_t other = UINT32_MAX;
-    uint8_t other_side = 0;
-};
+// Adjacency is stored as one uint64_t per fragment, two packed
+// 32-bit "link" values (low 32 = LEFT, high 32 = RIGHT). Each link
+// is (other_idx << 1) | other_side; the all-ones sentinel
+// LINK_NONE = UINT32_MAX means "no link on this side". 8 bytes per
+// fragment vs 16 for the previous std::array<{u32,u8}, 2> layout
+// (which paid an 8-byte padding cost) -- saves ~213 MB on a 26.6 M
+// fragment workload.
+inline constexpr uint32_t LINK_NONE = UINT32_MAX;
+
+inline uint32_t pack_link(uint32_t other, uint8_t other_side) {
+    return (other << 1) | (other_side & 1u);
+}
+inline uint32_t link_other(uint32_t packed) { return packed >> 1; }
+inline uint8_t link_side(uint32_t packed) { return (uint8_t)(packed & 1u); }
+
+inline uint32_t adj_get(uint64_t e, uint8_t side) {
+    return side == SIDE_LEFT ? (uint32_t)e : (uint32_t)(e >> 32);
+}
+inline void adj_set(uint64_t& e, uint8_t side, uint32_t packed) {
+    if (side == SIDE_LEFT)
+        e = (e & 0xFFFFFFFF00000000ULL) | (uint64_t)packed;
+    else
+        e = (e & 0x00000000FFFFFFFFULL) | ((uint64_t)packed << 32);
+}
 
 }  // namespace detail
 
@@ -155,7 +175,12 @@ inline void stitch_unitigs_streaming(Source& frag, uint32_t k, Sink&& sink,
     using detail::SIDE_RIGHT;
     using detail::end_ref;
     using detail::junction_ends;
-    using detail::link;
+    using detail::LINK_NONE;
+    using detail::adj_get;
+    using detail::adj_set;
+    using detail::pack_link;
+    using detail::link_other;
+    using detail::link_side;
 
     if (k < 2) {
         for (size_t i = 0; i < frag.size(); ++i) {
@@ -200,10 +225,12 @@ inline void stitch_unitigs_streaming(Source& frag, uint32_t k, Sink&& sink,
         }
     }
 
-    // 2) Build adjacency. adj[u][side] = (other_unitig, other_side) on the
-    //    own-frame `side` of u that the link enters.
+    // 2) Build adjacency. adj[u] is a uint64_t holding two packed
+    //    32-bit links (low 32 bits = LEFT side, high 32 bits = RIGHT
+    //    side). Each link encodes (other_unitig << 1) | other_side;
+    //    LINK_NONE means "no link on that side." 8 bytes / fragment.
     std::cerr << "[stitch] building adjacency over " << by_junction.size() << " junctions...\n";
-    std::vector<std::array<link, 2>> adj(frag.size());
+    std::vector<uint64_t> adj(frag.size(), ~uint64_t(0));
 
     auto pair_compatible = [](end_ref const& a, end_ref const& b) {
         // (R,L) or (L,R) with same is_canonical_fwd, OR same side with
@@ -221,8 +248,8 @@ inline void stitch_unitigs_streaming(Source& frag, uint32_t k, Sink&& sink,
         if (frag.cid(e1.unitig_idx) != frag.cid(e2.unitig_idx)) continue;
         if (!pair_compatible(e1, e2)) continue;
         // Both directions of the link.
-        adj[e1.unitig_idx][e1.side] = {e2.unitig_idx, e2.side};
-        adj[e2.unitig_idx][e2.side] = {e1.unitig_idx, e1.side};
+        adj_set(adj[e1.unitig_idx], e1.side, pack_link(e2.unitig_idx, e2.side));
+        adj_set(adj[e2.unitig_idx], e2.side, pack_link(e1.unitig_idx, e1.side));
     }
 
     // 3) Walk chains.
@@ -266,12 +293,12 @@ inline void stitch_unitigs_streaming(Source& frag, uint32_t k, Sink&& sink,
         for (;;) {
             // The own-frame side of cur exposed at merged-RIGHT.
             uint8_t exit_side_own = f_cur ? SIDE_LEFT : SIDE_RIGHT;
-            link const& lnk = adj[cur][exit_side_own];
-            if (lnk.other == UINT32_MAX) {
+            uint32_t lnk = adj_get(adj[cur], exit_side_own);
+            if (lnk == LINK_NONE) {
                 if (open_at_side(cur, exit_side_own)) merged.open_flags |= UNITIG_OPEN_RIGHT;
                 break;
             }
-            uint32_t nxt = lnk.other;
+            uint32_t nxt = link_other(lnk);
             if (visited[nxt]) {
                 // Cycle closure: stop here. The cycle's k-mers have all
                 // already been emitted via earlier appends; we must NOT
@@ -282,7 +309,7 @@ inline void stitch_unitigs_streaming(Source& frag, uint32_t k, Sink&& sink,
             // Entering through nxt's RIGHT means nxt is flipped (so its own
             // R becomes its merged-LEFT); entering through nxt's LEFT means
             // nxt is unflipped.
-            bool f_nxt = (lnk.other_side == SIDE_RIGHT);
+            bool f_nxt = (link_side(lnk) == SIDE_RIGHT);
             std::string add = take_seq(nxt, f_nxt);
             merged.seq.append(add.begin() + (k - 1), add.end());
             visited[nxt] = 1;
@@ -297,13 +324,13 @@ inline void stitch_unitigs_streaming(Source& frag, uint32_t k, Sink&& sink,
     // Pass A: start at unitigs with a free own-LEFT side.
     for (uint32_t i = 0; i < frag.size(); ++i) {
         if (visited[i]) continue;
-        if (adj[i][SIDE_LEFT].other == UINT32_MAX) { walk_chain(i, /*start_flipped=*/false); }
+        if (adj_get(adj[i], SIDE_LEFT) == LINK_NONE) { walk_chain(i, /*start_flipped=*/false); }
     }
     // Pass B: start at unitigs with a free own-RIGHT side (and own-LEFT
     // already linked, otherwise pass A would have caught it).
     for (uint32_t i = 0; i < frag.size(); ++i) {
         if (visited[i]) continue;
-        if (adj[i][SIDE_RIGHT].other == UINT32_MAX) { walk_chain(i, /*start_flipped=*/true); }
+        if (adj_get(adj[i], SIDE_RIGHT) == LINK_NONE) { walk_chain(i, /*start_flipped=*/true); }
     }
     // Pass C: pure cross-bucket cycles (both sides linked but the chain
     // closes on itself).
