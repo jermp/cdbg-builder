@@ -34,10 +34,17 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "bucket_walker.hpp"  // stitchable_unitig
 
@@ -293,6 +300,110 @@ private:
     std::FILE* m_file = nullptr;
     std::mutex m_mu;
     uint64_t m_count = 0;
+};
+
+// ----------------------------------------------------------------------------
+// mmap-backed read-only view over a frag_unitig_writer's spill file.
+// Builds an in-memory index of (cid, open_flags, seq_offset, seq_len) per
+// fragment and mmaps the file so seq bytes are accessible as
+// std::string_view directly into the kernel page cache. With this, stitch
+// can run without ever loading all fragment seqs into RAM as
+// std::string's: the OS pages in seq bytes on demand and reclaims them
+// under memory pressure.
+//
+// Memory cost: ~24 B per fragment for the index; for 26.6 M fragments
+// that's ~640 MB (vs ~2.8 GB for an in-memory std::vector<stitchable_unitig>
+// at the same scale). Mmap pages don't count toward RSS until accessed
+// and dirty pages aren't ours -- the kernel can evict file-backed read-
+// only pages without involving us.
+//
+// Used by the stitch phase via the templated stitch_unitigs_streaming.
+// frag_unitig_reader satisfies the Source interface (size / cid /
+// open_flags / seq_view).
+
+class frag_unitig_reader {
+public:
+    explicit frag_unitig_reader(std::string path) : m_path(std::move(path)) {
+        m_fd = ::open(m_path.c_str(), O_RDONLY);
+        if (m_fd < 0)
+            throw std::runtime_error("open failed for frag spill: " + m_path + ": " +
+                                     std::strerror(errno));
+        struct stat st;
+        if (::fstat(m_fd, &st) < 0) {
+            ::close(m_fd);
+            throw std::runtime_error("fstat failed on " + m_path);
+        }
+        m_mmap_size = (size_t)st.st_size;
+        if (m_mmap_size > 0) {
+            void* p = ::mmap(nullptr, m_mmap_size, PROT_READ, MAP_PRIVATE, m_fd, 0);
+            if (p == MAP_FAILED) {
+                ::close(m_fd);
+                throw std::runtime_error("mmap failed on " + m_path);
+            }
+            m_mmap_base = (uint8_t const*)p;
+        }
+        // Walk the file once to populate the index. Records are
+        // [u32 cid][u8 flags][u32 seq_len][seq_len bytes]. Sequential
+        // access -- kernel readahead handles the I/O cost.
+        size_t off = 0;
+        while (off < m_mmap_size) {
+            if (off + 4 + 1 + 4 > m_mmap_size)
+                throw std::runtime_error("truncated frag spill header in " + m_path);
+            uint32_t cid;
+            std::memcpy(&cid, m_mmap_base + off, 4);
+            off += 4;
+            uint8_t flags = m_mmap_base[off];
+            off += 1;
+            uint32_t seq_len;
+            std::memcpy(&seq_len, m_mmap_base + off, 4);
+            off += 4;
+            if (off + seq_len > m_mmap_size)
+                throw std::runtime_error("truncated frag spill seq in " + m_path);
+            entry e;
+            e.cid = cid;
+            e.seq_len = seq_len;
+            e.open_flags = flags;
+            e.seq_offset = off;
+            m_entries.push_back(e);
+            off += seq_len;
+        }
+    }
+
+    ~frag_unitig_reader() {
+        if (m_mmap_base) {
+            ::munmap((void*)m_mmap_base, m_mmap_size);
+        }
+        if (m_fd >= 0) {
+            ::close(m_fd);
+        }
+    }
+
+    frag_unitig_reader(frag_unitig_reader const&) = delete;
+    frag_unitig_reader& operator=(frag_unitig_reader const&) = delete;
+
+    // Source interface for stitch_unitigs_streaming.
+    size_t size() const { return m_entries.size(); }
+    uint32_t cid(size_t i) const { return m_entries[i].cid; }
+    uint8_t open_flags(size_t i) const { return m_entries[i].open_flags; }
+    std::string_view seq_view(size_t i) const {
+        auto const& e = m_entries[i];
+        return std::string_view((char const*)m_mmap_base + e.seq_offset, e.seq_len);
+    }
+
+private:
+    struct entry {
+        uint32_t cid;
+        uint32_t seq_len;
+        uint8_t open_flags;
+        // 7 bytes implicit padding before seq_offset; 24-byte struct.
+        uint64_t seq_offset;
+    };
+
+    std::string m_path;
+    int m_fd = -1;
+    uint8_t const* m_mmap_base = nullptr;
+    size_t m_mmap_size = 0;
+    std::vector<entry> m_entries;
 };
 
 }  // namespace cdgb

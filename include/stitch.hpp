@@ -112,9 +112,9 @@ struct junction_ends {
     uint8_t count = 0;  // 0, 1, 2, or 3 (overflow: more than 2 ends)
 };
 
-inline kmer_int_t side_junction_canonical(stitchable_unitig const& u, uint32_t k, uint8_t side,
+inline kmer_int_t side_junction_canonical(std::string_view seq, uint32_t k, uint8_t side,
                                           bool& is_canonical_fwd) {
-    char const* p = (side == SIDE_LEFT) ? u.seq.data() : u.seq.data() + (u.seq.size() - (k - 1));
+    char const* p = (side == SIDE_LEFT) ? seq.data() : seq.data() + (seq.size() - (k - 1));
     kmer_int_t fwd = encode_kminus1(p, k - 1);
     kmer_int_t rc = reverse_complement(fwd, k - 1);
     if (fwd <= rc) {
@@ -137,9 +137,19 @@ struct link {
 // vector. Use this when the caller spills unitigs to disk so the
 // stitched seq strings don't all coexist in RAM. The vector-returning
 // stitch_unitigs() is a thin adapter around this.
-template <typename Sink>
-inline void stitch_unitigs_streaming(std::vector<stitchable_unitig>& frag, uint32_t k,
-                                     Sink&& sink,
+//
+// `Source` is a generic frag accessor with the interface:
+//   size_t size() const
+//   uint32_t cid(size_t i) const
+//   uint8_t  open_flags(size_t i) const
+//   std::string_view seq_view(size_t i) const
+//
+// Production builds pass a frag_unitig_reader (mmap-backed, fragments'
+// seq bytes never sit in RAM as std::string's). The
+// vector_frag_source adapter below wraps a std::vector<stitchable_unitig>
+// so unit tests / dev paths still work without disk spill.
+template <typename Source, typename Sink>
+inline void stitch_unitigs_streaming(Source& frag, uint32_t k, Sink&& sink,
                                      std::atomic<uint64_t>* done = nullptr) {
     using detail::SIDE_LEFT;
     using detail::SIDE_RIGHT;
@@ -148,8 +158,13 @@ inline void stitch_unitigs_streaming(std::vector<stitchable_unitig>& frag, uint3
     using detail::link;
 
     if (k < 2) {
-        for (auto& u : frag) {
+        for (size_t i = 0; i < frag.size(); ++i) {
             if (done) done->fetch_add(1, std::memory_order_relaxed);
+            stitchable_unitig u;
+            u.cid = frag.cid(i);
+            u.open_flags = frag.open_flags(i);
+            std::string_view sv = frag.seq_view(i);
+            u.seq.assign(sv.data(), sv.size());
             sink(std::move(u));
         }
         return;
@@ -169,17 +184,18 @@ inline void stitch_unitigs_streaming(std::vector<stitchable_unitig>& frag, uint3
         // step below sees the overflow.
         if (je.count < 3) ++je.count;
     };
-    for (uint32_t i = 0; i < frag.size(); ++i) {
-        auto const& u = frag[i];
-        if (u.seq.size() < k) continue;
-        if (u.open_flags & UNITIG_OPEN_LEFT) {
+    for (uint32_t i = 0; i < (uint32_t)frag.size(); ++i) {
+        std::string_view sv = frag.seq_view(i);
+        if (sv.size() < k) continue;
+        const uint8_t flags = frag.open_flags(i);
+        if (flags & UNITIG_OPEN_LEFT) {
             bool is_fwd;
-            kmer_int_t key = detail::side_junction_canonical(u, k, SIDE_LEFT, is_fwd);
+            kmer_int_t key = detail::side_junction_canonical(sv, k, SIDE_LEFT, is_fwd);
             add_end(key, {i, SIDE_LEFT, is_fwd});
         }
-        if (u.open_flags & UNITIG_OPEN_RIGHT) {
+        if (flags & UNITIG_OPEN_RIGHT) {
             bool is_fwd;
-            kmer_int_t key = detail::side_junction_canonical(u, k, SIDE_RIGHT, is_fwd);
+            kmer_int_t key = detail::side_junction_canonical(sv, k, SIDE_RIGHT, is_fwd);
             add_end(key, {i, SIDE_RIGHT, is_fwd});
         }
     }
@@ -202,7 +218,7 @@ inline void stitch_unitigs_streaming(std::vector<stitchable_unitig>& frag, uint3
         end_ref const& e1 = je.a;
         end_ref const& e2 = je.b;
         // O(1) color-class comparison (cid was assigned by main before stitch).
-        if (frag[e1.unitig_idx].cid != frag[e2.unitig_idx].cid) continue;
+        if (frag.cid(e1.unitig_idx) != frag.cid(e2.unitig_idx)) continue;
         if (!pair_compatible(e1, e2)) continue;
         // Both directions of the link.
         adj[e1.unitig_idx][e1.side] = {e2.unitig_idx, e2.side};
@@ -214,20 +230,27 @@ inline void stitch_unitigs_streaming(std::vector<stitchable_unitig>& frag, uint3
     std::cerr << "[stitch] walking chains...\n";
     std::vector<uint8_t> visited(frag.size(), 0);
 
+    // Always copy from source: source seq is either a vector entry's
+    // string (move would invalidate it for re-access) or a mmap'd
+    // region (can't be moved). Per-chain transient cost; the merged
+    // seq is later moved into the sink.
     auto take_seq = [&](uint32_t idx, bool flipped) -> std::string {
-        return flipped ? detail::revcomp_string(frag[idx].seq) : std::move(frag[idx].seq);
+        std::string_view sv = frag.seq_view(idx);
+        std::string s(sv.data(), sv.size());
+        if (flipped) s = detail::revcomp_string(s);
+        return s;
     };
 
     auto open_at_side = [&](uint32_t idx, uint8_t side_own) -> bool {
         uint8_t bit = (side_own == SIDE_LEFT) ? UNITIG_OPEN_LEFT : UNITIG_OPEN_RIGHT;
-        return (frag[idx].open_flags & bit) != 0;
+        return (frag.open_flags(idx) & bit) != 0;
     };
 
     auto walk_chain = [&](uint32_t start_idx, bool start_flipped) {
         stitchable_unitig merged;
         // Inherit cid; chain members have equal cids by construction (the
         // adjacency build only links pairs with matching cid).
-        merged.cid = frag[start_idx].cid;
+        merged.cid = frag.cid(start_idx);
         merged.seq = take_seq(start_idx, start_flipped);
         visited[start_idx] = 1;
         if (done) done->fetch_add(1, std::memory_order_relaxed);
@@ -290,16 +313,32 @@ inline void stitch_unitigs_streaming(std::vector<stitchable_unitig>& frag, uint3
     }
 }
 
+// Source adapter wrapping a std::vector<stitchable_unitig> so the
+// templated stitch_unitigs_streaming can accept it. Used by the
+// vector-returning stitch_unitigs() compat adapter and any test code
+// that already has its frags in memory.
+struct vector_frag_source {
+    std::vector<stitchable_unitig> const& v;
+    explicit vector_frag_source(std::vector<stitchable_unitig> const& vec) : v(vec) {}
+    size_t size() const { return v.size(); }
+    uint32_t cid(size_t i) const { return v[i].cid; }
+    uint8_t open_flags(size_t i) const { return v[i].open_flags; }
+    std::string_view seq_view(size_t i) const {
+        return std::string_view(v[i].seq.data(), v[i].seq.size());
+    }
+};
+
 // Backwards-compatible vector-returning adapter around the streaming
 // variant. Useful for unit tests; the production builder pipeline now
-// passes its own disk-backed sink directly to stitch_unitigs_streaming.
+// passes a frag_unitig_reader directly to stitch_unitigs_streaming.
 inline void stitch_unitigs(std::vector<stitchable_unitig>& frag, uint32_t k,
                            std::vector<stitchable_unitig>& out,
                            std::atomic<uint64_t>* done = nullptr) {
     out.clear();
     out.reserve(frag.size());
     auto sink = [&](stitchable_unitig&& u) { out.emplace_back(std::move(u)); };
-    stitch_unitigs_streaming(frag, k, sink, done);
+    vector_frag_source src(frag);
+    stitch_unitigs_streaming(src, k, sink, done);
 }
 
 }  // namespace cdgb

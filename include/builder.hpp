@@ -189,48 +189,47 @@ struct builder {
         m_num_color_classes = global_dict.size();
         frag_sink.close_for_writing();
 
-        // Load the spilled fragments back into memory for stitch.
-        // (Future work: stream/lazy access during stitch so this peak
-        // stays under --max-ram. For now this restores the historical
-        // peak shape during stitch.)
-        std::vector<stitchable_unitig> frag_unitigs;
-        frag_sink.load_to_vector(frag_unitigs);
-        frag_sink.unlink();
-
-        // Estimate total seq bytes that stitch will write to the
-        // unitig spill, used to size K below. Stitch can only shrink
-        // the total (each merge drops k-1 bases of overlap), so the
-        // sum over fragments is a safe upper bound. One pass over
-        // frag_unitigs, no copies.
-        uint64_t total_frag_seq_bytes = 0;
-        for (auto const& f : frag_unitigs) total_frag_seq_bytes += f.seq.size();
-
-        // Stitch streams each finished unitig directly into a disk-
-        // backed bucket sink: bucket b holds cids in
-        // [b * S, (b+1) * S) where S = ceil(num_color_classes / K).
-        // K auto-scales so per-bucket peak stays under ~10% of
-        // --max-ram, regardless of how big the index gets.
-        const uint32_t unitig_bucket_count = pick_unitig_bucket_count_(
-            m_num_color_classes, total_frag_seq_bytes, m_cfg.max_ram_gb);
-        unitig_bucket_writer uwriter(tmp_dir, m_num_color_classes, unitig_bucket_count);
+        // Stitch streams each finished unitig into a cid-range
+        // unitig_bucket_writer. The K bucket count auto-scales so
+        // per-bucket peak at emit stays under ~10% of --max-ram. We
+        // size K up-front from a single index-only walk over the
+        // mmap-backed frag spill (no seq bytes touched here).
+        std::unique_ptr<unitig_bucket_writer> uwriter_ptr;
         {
+            // Scope the frag_unitig_reader to just the stitch phase so
+            // its index vector + mmap are released before emit. emit
+            // only needs uwriter (cid-bucketed unitig spill) and
+            // global_dict (streaming color sets).
             phase_rss_marker rss("stitch");
             {
                 timer _("stitch");
+                frag_unitig_reader frag_reader(frag_sink.path());
+
+                uint64_t total_frag_seq_bytes = 0;
+                for (size_t i = 0; i < frag_reader.size(); ++i)
+                    total_frag_seq_bytes += frag_reader.seq_view(i).size();
+
+                const uint32_t unitig_bucket_count = pick_unitig_bucket_count_(
+                    m_num_color_classes, total_frag_seq_bytes, m_cfg.max_ram_gb);
+                uwriter_ptr = std::make_unique<unitig_bucket_writer>(
+                    tmp_dir, m_num_color_classes, unitig_bucket_count);
+
                 std::atomic<uint64_t> done{0};
-                progress prog("stitch", done, frag_unitigs.size());
-                stitch_unitigs_streaming(frag_unitigs, m_cfg.k, std::ref(uwriter), &done);
+                progress prog("stitch", done, frag_reader.size());
+                stitch_unitigs_streaming(frag_reader, m_cfg.k, std::ref(*uwriter_ptr), &done);
                 prog.stop();
-                frag_unitigs = {};
-                std::cout << "  unitigs after stitching: " << uwriter.total_unitigs() << "\n";
+                std::cout << "  unitigs after stitching: " << uwriter_ptr->total_unitigs() << "\n";
+                // frag_reader destroyed here -- mmap unmapped, index freed.
             }
             rss.stop();
         }
-        m_num_unitigs = uwriter.total_unitigs();
+        // Spill file no longer needed; safe to unlink.
+        frag_sink.unlink();
+        m_num_unitigs = uwriter_ptr->total_unitigs();
 
         {
             phase_rss_marker rss("emit");
-            emit_fasta(uwriter);
+            emit_fasta(*uwriter_ptr);
             emit_colors(global_dict);
             rss.stop();
         }
