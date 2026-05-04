@@ -178,8 +178,8 @@ struct builder {
                 timer _("bucket-process");
                 std::atomic<uint64_t> done{0};
                 progress prog("bucket-process", done, num_buckets);
-                process_buckets(writer, m_cfg.k, m_cfg.num_threads, std::ref(frag_sink),
-                                global_dict, global_mu, &done);
+                process_buckets(writer, m_cfg.k, m_num_colors, m_cfg.num_threads,
+                                std::ref(frag_sink), global_dict, global_mu, &done);
                 prog.stop();
                 std::cout << "  bucket fragments: " << frag_sink.count() << "\n";
                 std::cout << "  distinct color classes: " << global_dict.size() << "\n";
