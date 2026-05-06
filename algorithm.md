@@ -2,9 +2,6 @@
 
 This document describes how `cdbg-builder` constructs a **colored compacted
 de Bruijn graph (ccdBG)** and how it builds and compresses the color sets.
-The intended audience is a developer evaluating performance, looking for
-optimization opportunities, or planning a downstream consumer of the
-output files.
 
 ---
 
@@ -20,7 +17,8 @@ a user-supplied basename:
 - **`<out>.u2c`** — a `bits::bit_vector` of length `num_unitigs` where
   bit *i* is set iff unitig *i* (in `.fa` emission order) is the last
   unitig of a color-set run. Popcount = `num_color_classes`. Downstream
-  consumers (Fulgor) recover the per-unitig color-set id via
+  consumers (e.g., [Fulgor](https://github.com/jermp/fulgor))
+  recover the per-unitig color-set id via
   `rank1(unitig_id)` after building a rank index over this bit_vector.
 - **`<out>.color_sets`** — header + hybrid-encoded distinct color sets +
   Elias–Fano of per-class bit-offsets. See §6 for the on-disk layout
@@ -99,6 +97,7 @@ minimizer is a **super-k-mer**. The super-k-mer's bucket id is
 to match GGCAT's `cn_nthash.rs` convention.
 
 Each super-k-mer record carries:
+
 - `flags` : `IS_ACGT_BEGIN` (this super-k-mer's first k-mer has no
   predecessor in input), `IS_ACGT_END` (analogously). The bucket
   walker uses these to insert *phantom* edges across buckets (§4.4).
@@ -119,6 +118,7 @@ acquires that bucket's mutex and calls
 ### 3.4 Per-bucket compactor (online dedup)
 
 Each `bucket_compactor` (one per bucket) holds:
+
 - `m_dedup`: an `ankerl::unordered_dense::map<std::string, entry>`
   keyed by the 2-bit-packed super-k-mer bytes, with `entry =
   { colors, flags }`.
@@ -201,6 +201,7 @@ bases). See `super_kmer.hpp`.
 ### 4.1 Goal
 
 For each bucket independently:
+
 1. Build the local dBG over canonical k-mers in that bucket, with
    awareness of *phantom* edges that cross into neighboring buckets.
 2. Walk maximal unitig fragments. Each fragment is monochromatic.
@@ -234,6 +235,7 @@ Three structures per in-flight bucket:
 ### 4.3 Loading a bucket
 
 `load_bucket`:
+
 1. Open the bucket file, decompress LZ4 frames, parse `super_kmer`
    records.
 2. For each record: intern colors into `record_sets` → get rsid.
@@ -283,6 +285,7 @@ A single `streaming_color_set_dict` is shared across all bucket
 threads, guarded by `global_mu`.
 
 `intern(colors)`:
+
 1. Compute primary (`wyhash`) + secondary (`fnv1a`) 128-bit hash.
 2. Look up in `m_index` (hash-only key, no byte-compare). On hit
    return existing id; collision rate is ~2^-64 per pair, negligible
@@ -369,7 +372,7 @@ K auto-scales with `--max-ram` (target: per-bucket peak ~10 % of
 budget). Per-bucket file format:
 `[u32 cid][u32 seq_len][seq bytes]` repeated.
 
-### 6.2 emit_fasta + u2c
+### 6.2 `emit_fasta` + `u2c`
 
 `emit_fasta` walks K buckets in ascending order. For each bucket:
 
@@ -384,16 +387,14 @@ After all buckets: set the very last bit (closes the final run),
 build the bit_vector, `essentials::save` to `<out>.u2c`.
 
 `u2c` invariants:
+
 - `num_bits == num_unitigs` (one bit per unitig in `.fa` order).
 - `popcount == num_color_classes`.
 - The last bit is always set.
 - Downstream consumer recovers each unitig's color-set id via
   `rank1(unitig_id)` after building a rank index.
 
-This matches Fulgor's `m_u2c` layout
-(`include/index.hpp`).
-
-### 6.3 emit_color_sets
+### 6.3 `emit_color_sets`
 
 `global_dict.finalize()` runs:
 
@@ -477,22 +478,6 @@ delta-gaps over the COMPLEMENT (the (num_colors - N) absent values)
 When N is close to `num_colors`, the absent set is small and sparse-
 codes well. Saves bits vs the dense bitmap.
 
-### 7.4 Why this works on pangenome data
-
-For a closely-related bacterial pangenome (e.g. salmonella-25K),
-many super-k-mers are present in *most* genomes (core genes), giving
-many very-dense color lists; many others are present in only a few
-genomes (accessory genes), giving sparse lists. Mid-density lists
-are uncommon. The three-regime split exploits both ends.
-
-### 7.5 Decoding
-
-`compact_color_set_dict::decode_one_` (the inverse, used per `at()`
-call) reads the same bits back into a caller-supplied scratch
-vector. Streaming reads from the on-disk bit_vector are done by
-downstream consumers (Fulgor) using a `bits::bit_vector::iterator`
-constructed at the EF-given offset.
-
 ---
 
 ## 8. Output file formats
@@ -500,10 +485,12 @@ constructed at the EF-given offset.
 ### 8.1 `<out>.fa`
 
 Standard FASTA. Each record:
+
 ```
 >cid
 <seq bases ACGT>
 ```
+
 Records are emitted in **strictly cid-ascending** order. Multiple
 records can share a `cid` (multiple unitigs in one color class) and
 appear consecutively.
@@ -542,6 +529,7 @@ COMPACTOR_OVERHEAD = 7x. Auto-tune solves this for `flush_bases` and
 pressure watcher provides a runtime safety net.
 
 Bucket-process peak per in-flight thread:
+
 ```
 record_sets   (compact, hybrid-encoded)   ~10–30 MB / bucket
 local_dict    (compact, hybrid-encoded)   ~10–30 MB / bucket
