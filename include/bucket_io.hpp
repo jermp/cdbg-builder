@@ -105,9 +105,14 @@ public:
 
     // Insert a batch of records (parsed). `bases_storage` holds the 2-bit
     // values (one per byte) for every record; each record points into it
-    // via [bases_off, bases_off + bases_len). Caller may clear/reset its
+    // via [bases_off, bases_off + bases_len). The `hash` field is a
+    // wyhash of the bases, computed by the producer at append time
+    // while the bases are still hot in L1; we feed it directly to the
+    // dedup map's find() instead of rehashing the bases bytes here
+    // (where they are typically cold). Caller may clear/reset its
     // buffers after this returns.
     struct pending_record {
+        uint64_t hash;
         uint32_t color;
         uint32_t bases_off;
         uint32_t bases_len;
@@ -124,10 +129,13 @@ public:
         auto t_map = bucket_write_prof::clock::now();
         for (auto const& r : recs) {
             std::string_view key((char const*)bases_storage.data() + r.bases_off, r.bases_len);
-            // Transparent find avoids allocating a std::string on the hot
-            // (already-seen) path. The std::string is constructed only on
-            // a miss, when we actually have to insert into the map.
-            auto it = m_dedup.find(key);
+            // Heterogeneous lookup with a precomputed hash. Our
+            // string_hash::operator()(hashed_view) just returns h.hash,
+            // so find() doesn't re-hash the bases. The bases bytes are
+            // only re-touched on a hash collision (then string_eq does
+            // the byte compare).
+            hashed_view hv{key, r.hash};
+            auto it = m_dedup.find(hv);
             if (it == m_dedup.end()) {
                 entry e;
                 // Within a single batch from one input thread, a fresh
@@ -254,20 +262,50 @@ private:
         m_bytes = 0;
     }
 
-    // Transparent hash/eq so find() can take a string_view directly without
-    // building a std::string. Saves a heap allocation + copy on every
-    // already-seen super-k-mer, which is the common case once the first
-    // input file has populated each bucket's hashmap.
+    // Heterogeneous lookup key bundling bases + a precomputed wyhash.
+    // The producer (per_thread_bucket_buffers::append) computes the
+    // hash while the bases are still hot in L1; the compactor's
+    // find(hashed_view) returns that hash without touching the bases
+    // bytes again. Bytes are only re-read on a hash collision, when
+    // string_eq runs the byte compare against the stored std::string.
+    struct hashed_view {
+        std::string_view sv;
+        uint64_t hash;
+    };
+
+public:
+    // wyhash function exposed so producers (per_thread_bucket_buffers
+    // ::append) can compute the same hash the compactor's hashmap
+    // would have computed internally on find(). Same call ankerl uses
+    // for its default std::string_view hash, so the values match.
+    static uint64_t hash_bases(std::string_view sv) noexcept {
+        return ankerl::unordered_dense::hash<std::string_view>{}(sv);
+    }
+    static uint64_t hash_bases(uint8_t const* p, uint32_t n) noexcept {
+        return hash_bases(std::string_view((char const*)p, n));
+    }
+
+private:
     struct string_hash {
         using is_transparent = void;
         using is_avalanching = void;
         size_t operator()(std::string_view sv) const noexcept {
             return ankerl::unordered_dense::hash<std::string_view>{}(sv);
         }
+        size_t operator()(hashed_view const& h) const noexcept { return (size_t)h.hash; }
     };
     struct string_eq {
         using is_transparent = void;
         bool operator()(std::string_view a, std::string_view b) const noexcept { return a == b; }
+        bool operator()(std::string_view a, hashed_view const& b) const noexcept {
+            return a == b.sv;
+        }
+        bool operator()(hashed_view const& a, std::string_view b) const noexcept {
+            return a.sv == b;
+        }
+        bool operator()(hashed_view const& a, hashed_view const& b) const noexcept {
+            return a.sv == b.sv;
+        }
     };
 
     std::string m_path;
@@ -485,7 +523,12 @@ struct per_thread_bucket_buffers {
         auto& bbuf = bases[b];
         uint32_t off = (uint32_t)bbuf.size();
         bbuf.insert(bbuf.end(), sk_bases, sk_bases + len);
-        recs[b].push_back({color, off, len, (uint8_t)(flags & 0x3u)});
+        // Hash the bases now while they're still hot in L1 from the
+        // emit_super_kmers buffer; the compactor reuses this hash on
+        // its dedup-map find() instead of re-hashing the (typically
+        // cold) bytes from the writer's bases_storage.
+        uint64_t h = bucket_compactor::hash_bases(sk_bases, len);
+        recs[b].push_back({h, color, off, len, (uint8_t)(flags & 0x3u)});
         if (bbuf.size() >= sink->flush_bases()) sink->flush(b, recs[b], bbuf);
     }
 
