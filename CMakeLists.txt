@@ -27,6 +27,7 @@ set(BITS_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/external/bits/include)
 set(ESSENTIALS_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/external/bits/external/essentials/include)
 set(CMD_LINE_PARSER_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/external/cmd_line_parser/include)
 set(LZ4_DIR ${CMAKE_SOURCE_DIR}/external/lz4/lib)
+set(LIBDEFLATE_DIR ${CMAKE_SOURCE_DIR}/external/libdeflate)
 
 if(NOT EXISTS ${BITS_INCLUDE_DIR})
     message(FATAL_ERROR
@@ -41,6 +42,11 @@ endif()
 if(NOT EXISTS ${LZ4_DIR}/lz4frame.h)
     message(FATAL_ERROR
         "external/lz4 is missing.\n"
+        "Run: git submodule update --init --recursive")
+endif()
+if(NOT EXISTS ${LIBDEFLATE_DIR}/libdeflate.h)
+    message(FATAL_ERROR
+        "external/libdeflate is missing.\n"
         "Run: git submodule update --init --recursive")
 endif()
 
@@ -62,13 +68,28 @@ add_library(lz4_static STATIC
 set_target_properties(lz4_static PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(lz4_static PUBLIC ${LZ4_DIR})
 
-# zlib is still needed for transparent .gz input via kseq.h. The
-# bucket-file path no longer uses it.
-find_package(ZLIB REQUIRED)
+# libdeflate (decompress-only). Vendored as a submodule and built via
+# its own CMakeLists.txt with compression / zlib / shared lib / cli
+# disabled. We only call libdeflate_alloc_decompressor +
+# libdeflate_gzip_decompress_ex from seq_reader.hpp -- no compressor
+# state, no zlib wrapper. ~2-3x faster than zlib for decompression on
+# bacterial genome FASTA inputs.
+set(LIBDEFLATE_BUILD_STATIC_LIB ON CACHE BOOL "" FORCE)
+set(LIBDEFLATE_BUILD_SHARED_LIB OFF CACHE BOOL "" FORCE)
+set(LIBDEFLATE_COMPRESSION_SUPPORT OFF CACHE BOOL "" FORCE)
+set(LIBDEFLATE_DECOMPRESSION_SUPPORT ON CACHE BOOL "" FORCE)
+set(LIBDEFLATE_GZIP_SUPPORT ON CACHE BOOL "" FORCE)
+set(LIBDEFLATE_ZLIB_SUPPORT OFF CACHE BOOL "" FORCE)
+set(LIBDEFLATE_BUILD_GZIP OFF CACHE BOOL "" FORCE)
+set(LIBDEFLATE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(LIBDEFLATE_INSTALL OFF CACHE BOOL "" FORCE)
+add_subdirectory(${LIBDEFLATE_DIR} ${CMAKE_BINARY_DIR}/libdeflate EXCLUDE_FROM_ALL)
+
 find_package(Threads REQUIRED)
 
 add_executable(cdgb-build src/main.cpp)
-target_link_libraries(cdgb-build PRIVATE ZLIB::ZLIB Threads::Threads lz4_static)
+target_link_libraries(cdgb-build PRIVATE Threads::Threads lz4_static libdeflate_static)
+target_include_directories(cdgb-build PRIVATE ${LIBDEFLATE_DIR})
 
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "C++ flags: ${CMAKE_CXX_FLAGS}")
