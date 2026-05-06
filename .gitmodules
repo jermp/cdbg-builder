@@ -7,3 +7,6 @@
 [submodule "external/lz4"]
 	path = external/lz4
 	url = https://github.com/lz4/lz4.git
+[submodule "external/libdeflate"]
+	path = external/libdeflate
+	url = https://github.com/ebiggers/libdeflate.git
