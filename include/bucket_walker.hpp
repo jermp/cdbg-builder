@@ -32,6 +32,7 @@
 #include "kmer.hpp"
 #include "streaming_color_set_dict.hpp"
 #include "super_kmer.hpp"
+#include "util.hpp"
 
 namespace cdgb {
 
@@ -101,12 +102,15 @@ using bucket_kmer_map = ankerl::unordered_dense::map<kmer_int_t, bucket_kmer_inf
 // themselves. See the kmer_entry comment for the memory rationale.
 inline void load_bucket(std::string const& path, uint32_t k, bucket_kmer_map& out,
                         compact_color_set_dict& record_sets) {
+    auto& prof = process_prof();
     bucket_reader reader(path);
     uint8_t flags = 0;
     std::vector<uint32_t> colors;
     std::vector<uint8_t> bases;
     while (reader.next(flags, colors, bases)) {
+        prof.n_records.fetch_add(1, std::memory_order_relaxed);
         if (bases.size() < k) continue;
+        prof.n_kmers.fetch_add((uint64_t)(bases.size() - (k - 1)), std::memory_order_relaxed);
 
         // Intern the record's already-sorted-deduped color list. Move
         // into the dict on a miss; on a hit it's just a heterogeneous
@@ -256,6 +260,7 @@ inline left_end_check classify_left_end(
 inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_colors,
                            std::vector<stitchable_unitig>& out_local,
                            compact_color_set_dict& out_local_dict) {
+    auto& prof = process_prof();
     bucket_kmer_map kmer_info;
     ankerl::unordered_dense::map<kmer_int_t, uint32_t, kmer_hasher> cid_of;
     {
@@ -271,7 +276,11 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
         // dominant peak contributor. compact stores each color list
         // hybrid-encoded and decodes on access into a scratch buffer.
         compact_color_set_dict record_sets(num_colors);
+        auto t_load = bucket_process_prof::clock::now();
         load_bucket(path, k, kmer_info, record_sets);
+        prof.ns_load.fetch_add(bucket_process_prof::since(t_load), std::memory_order_relaxed);
+
+        auto t_resolve = bucket_process_prof::clock::now();
 
         // Common case: a k-mer is contributed by a single record, so its
         // eventual color set is identical to that record's color list.
@@ -331,8 +340,11 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
             // Drop per-k-mer rsid storage immediately; phantom bits stay.
             e = kmer_entry{};
         }
+        prof.ns_resolve.fetch_add(bucket_process_prof::since(t_resolve),
+                                  std::memory_order_relaxed);
     }
 
+    auto t_walk = bucket_process_prof::clock::now();
     ankerl::unordered_dense::map<kmer_int_t, uint8_t, kmer_hasher> visited;
     visited.reserve(kmer_info.size());
 
@@ -413,6 +425,10 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
         if (visited.find(can) != visited.end()) continue;
         extend_and_emit(can, false, cid_of[can], /*open_left=*/false);
     }
+    prof.ns_walk.fetch_add(bucket_process_prof::since(t_walk), std::memory_order_relaxed);
+    prof.n_unitigs.fetch_add((uint64_t)out_local.size(), std::memory_order_relaxed);
+    prof.n_local_classes.fetch_add((uint64_t)out_local_dict.size(),
+                                   std::memory_order_relaxed);
 }
 
 }  // namespace detail
@@ -479,16 +495,23 @@ inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t nu
             // the streaming bvb).
             std::vector<uint32_t> local_to_global(local_dict.size());
             {
-                std::lock_guard<std::mutex> lk(global_mu);
+                auto t_wait = bucket_process_prof::clock::now();
+                std::unique_lock<std::mutex> lk(global_mu);
+                process_prof().ns_merge_lock_wait.fetch_add(
+                    bucket_process_prof::since(t_wait), std::memory_order_relaxed);
+                auto t_merge = bucket_process_prof::clock::now();
                 for (uint32_t lc = 0; lc < local_dict.size(); ++lc) {
                     local_dict.at(lc, decode_scratch);
                     local_to_global[lc] = global_dict.intern(std::move(decode_scratch));
                 }
+                process_prof().ns_merge.fetch_add(bucket_process_prof::since(t_merge),
+                                                  std::memory_order_relaxed);
             }
             for (auto& u : bucket_unitigs) {
                 u.cid = local_to_global[u.cid];
                 sink(std::move(u));
             }
+            process_prof().n_buckets.fetch_add(1, std::memory_order_relaxed);
             if (done) done->fetch_add(1, std::memory_order_relaxed);
         }
     };

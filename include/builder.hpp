@@ -195,6 +195,7 @@ struct builder {
             }
             rss.stop();
         }
+        process_prof().print(m_cfg.num_threads);
         m_num_color_classes = global_dict.size();
         frag_sink.close_for_writing();
         // bucket_writer's per-bucket compactor state (m_dict_classes
