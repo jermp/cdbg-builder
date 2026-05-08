@@ -377,12 +377,22 @@ struct bucket_process_prof {
     // hashmap lookups, no color-list work.
     std::atomic<uint64_t> ns_walk{0};
 
+    // ---- merge work split into pre-* (lock-free) and locked phases ----
+    // Lock-free pre-merge: decode each local_dict class into a vector
+    // (compact_color_set_dict::at).
+    std::atomic<uint64_t> ns_pre_decode{0};
+    // Lock-free pre-merge: wyhash + fnv1a of the decoded color list.
+    // Heavy on multi-thousand-color lists; previously ran inside the
+    // critical section.
+    std::atomic<uint64_t> ns_pre_hash{0};
+
     // ---- global merge (in process_buckets driver, under global_mu) ----
     // Time waiting to acquire global_mu before merging this bucket's
     // local_dict into the streaming global_dict.
     std::atomic<uint64_t> ns_merge_lock_wait{0};
-    // Time held under global_mu: decode each local class + global_dict
-    // .intern + remap unitig cids.
+    // Time held under global_mu: dedup-find + on-miss encode + offset
+    // sidecar write. With pre-decode + pre-hash done lock-free this is
+    // just the hashmap probe and (rarely) the encoder work.
     std::atomic<uint64_t> ns_merge{0};
 
     // ---- counters ----
@@ -411,10 +421,13 @@ struct bucket_process_prof {
             "  load        %7.2fs   (bucket_reader + LZ4 + record intern + kmer hashmap roll)\n"
             "  resolve     %7.2fs   (rsid -> local cid; record_sets.at + local_dict.intern)\n"
             "  walk        %7.2fs   (classify_left_end + extend_and_emit)\n"
+            "  pre_decode  %7.2fs   (local_dict.at, lock-free)\n"
+            "  pre_hash    %7.2fs   (wyhash + fnv1a on decoded class, lock-free)\n"
             "  merge_wait  %7.2fs   (waiting on global_mu)\n"
-            "  merge       %7.2fs   (global_dict.intern under global_mu + cid remap)\n"
+            "  merge       %7.2fs   (global_dict.intern_with_hashes under global_mu)\n"
             "  counts: buckets=%llu records=%llu kmers=%llu local_classes=%llu unitigs=%llu\n",
-            s(ns_load), s(ns_resolve), s(ns_walk), s(ns_merge_lock_wait), s(ns_merge),
+            s(ns_load), s(ns_resolve), s(ns_walk), s(ns_pre_decode), s(ns_pre_hash),
+            s(ns_merge_lock_wait), s(ns_merge),
             (unsigned long long)load_a(n_buckets), (unsigned long long)load_a(n_records),
             (unsigned long long)load_a(n_kmers), (unsigned long long)load_a(n_local_classes),
             (unsigned long long)load_a(n_unitigs));

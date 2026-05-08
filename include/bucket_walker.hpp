@@ -468,10 +468,6 @@ inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t nu
     workers.reserve(num_threads);
 
     auto run = [&]() {
-        // Reused per-thread scratch for decoding local_dict entries
-        // before handing them to the streaming global_dict. Allocated
-        // once per thread; reused across all of this thread's buckets.
-        std::vector<uint32_t> decode_scratch;
         for (;;) {
             uint32_t b = next.fetch_add(1);
             if (b >= B) break;
@@ -488,21 +484,60 @@ inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t nu
                 std::cerr << "error processing bucket " << b << ": " << e.what() << '\n';
             }
             // Merge this bucket's local dict into the shared global
-            // dict, build a local->global cid table, then remap each
-            // unitig's cid before we drop the local dict. Each local
-            // class is decoded into the per-thread scratch, then
-            // moved into global_dict.intern (which encodes again into
-            // the streaming bvb).
+            // dict. The previous version did decode + wyhash + fnv1a
+            // + dedup-find + (on miss) encode all under global_mu;
+            // with 32 threads on dense pangenome inputs that pinned
+            // ~80% of bucket-process wall on lock contention.
+            //
+            // Split the work into two halves: (a) decode the local
+            // class + compute its 128-bit content hash, lock-free, in
+            // batches of MERGE_BATCH; then (b) take global_mu and
+            // call intern_with_hashes() for each pre-hashed entry --
+            // just the hashmap probe + on-miss encode + offset write,
+            // which is microseconds vs the tens of microseconds the
+            // hash compute takes on a multi-thousand-color list.
+            //
+            // Batch size keeps the lock-free buffer bounded:
+            // MERGE_BATCH * worst-case-color-list. 32 colors at
+            // num_colors=50K is ~6 MB peak per thread, well under
+            // budget.
+            constexpr size_t MERGE_BATCH = 32;
+            struct prepared_class {
+                std::vector<uint32_t> colors;
+                streaming_color_set_dict::precomputed_hash h;
+            };
+            std::vector<prepared_class> batch(MERGE_BATCH);
             std::vector<uint32_t> local_to_global(local_dict.size());
-            {
+
+            for (uint32_t lc_start = 0; lc_start < local_dict.size();
+                 lc_start += MERGE_BATCH) {
+                uint32_t batch_n = (uint32_t)std::min<size_t>(
+                    MERGE_BATCH, (size_t)local_dict.size() - lc_start);
+
+                // Lock-free phase: decode + hash.
+                auto t_dec = bucket_process_prof::clock::now();
+                for (uint32_t i = 0; i < batch_n; ++i) {
+                    local_dict.at(lc_start + i, batch[i].colors);
+                }
+                process_prof().ns_pre_decode.fetch_add(
+                    bucket_process_prof::since(t_dec), std::memory_order_relaxed);
+
+                auto t_hash = bucket_process_prof::clock::now();
+                for (uint32_t i = 0; i < batch_n; ++i) {
+                    batch[i].h = streaming_color_set_dict::compute_hashes(batch[i].colors);
+                }
+                process_prof().ns_pre_hash.fetch_add(
+                    bucket_process_prof::since(t_hash), std::memory_order_relaxed);
+
+                // Locked phase: intern with pre-computed hashes.
                 auto t_wait = bucket_process_prof::clock::now();
                 std::unique_lock<std::mutex> lk(global_mu);
                 process_prof().ns_merge_lock_wait.fetch_add(
                     bucket_process_prof::since(t_wait), std::memory_order_relaxed);
                 auto t_merge = bucket_process_prof::clock::now();
-                for (uint32_t lc = 0; lc < local_dict.size(); ++lc) {
-                    local_dict.at(lc, decode_scratch);
-                    local_to_global[lc] = global_dict.intern(std::move(decode_scratch));
+                for (uint32_t i = 0; i < batch_n; ++i) {
+                    local_to_global[lc_start + i] = global_dict.intern_with_hashes(
+                        std::move(batch[i].colors), batch[i].h);
                 }
                 process_prof().ns_merge.fetch_add(bucket_process_prof::since(t_merge),
                                                   std::memory_order_relaxed);

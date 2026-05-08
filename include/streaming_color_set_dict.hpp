@@ -115,11 +115,30 @@ struct streaming_color_set_dict {
     streaming_color_set_dict(streaming_color_set_dict&&) = delete;
     streaming_color_set_dict& operator=(streaming_color_set_dict&&) = delete;
 
-    uint32_t intern(std::vector<uint32_t>&& candidate) {
-        uint64_t primary = wyhash_(candidate);
-        uint64_t secondary = fnv1a_(candidate);
+    // 128-bit content hash for a candidate color list. Caller can
+    // compute this lock-free and pass it to intern_with_hashes(),
+    // saving the per-call wyhash + fnv1a work (the dominant cost
+    // of intern() on multi-thousand-color lists).
+    struct precomputed_hash {
+        uint64_t primary;
+        uint64_t secondary;
+    };
+    static precomputed_hash compute_hashes(std::vector<uint32_t> const& v) noexcept {
+        return {wyhash_(v), fnv1a_(v)};
+    }
 
-        auto it = m_index.find(hash_pair{primary, secondary});
+    uint32_t intern(std::vector<uint32_t>&& candidate) {
+        return intern_with_hashes(std::move(candidate), compute_hashes(candidate));
+    }
+
+    // Variant of intern() that uses caller-supplied hashes. The two
+    // hashes MUST be wyhash + fnv1a of `candidate` (i.e. produced by
+    // compute_hashes()) -- internal dedup relies on this. Lets the
+    // bucket-process merge phase compute hashes outside the global
+    // lock so threads only serialise on the actual hashmap-find +
+    // encode work.
+    uint32_t intern_with_hashes(std::vector<uint32_t>&& candidate, precomputed_hash h) {
+        auto it = m_index.find(hash_pair{h.primary, h.secondary});
         if (it != m_index.end()) return *it;
 
         uint64_t bit_offset = m_flushed_words * 64 + m_bvb.num_bits();
@@ -133,7 +152,7 @@ struct streaming_color_set_dict {
             throw std::runtime_error("short write of class offset to " + m_offsets_path);
 
         uint32_t id = (uint32_t)m_classes.size();
-        m_classes.push_back({primary, secondary});
+        m_classes.push_back({h.primary, h.secondary});
         m_index.insert(id);
         m_total_integers += candidate.size();
 
