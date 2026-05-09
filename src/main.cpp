@@ -21,16 +21,16 @@ bool parse_args(int argc, char** argv, cdgb::build_config& cfg) {
     parser.add("num_threads", "Number of worker threads (default 1).", "-t", false);
     parser.add("m", "Minimizer length (default: auto, derived from k).", "-m", false);
     parser.add("buckets_log2",
-               "log2 of the bucket count (default: auto -- derived from --max-ram if set,"
+               "log2 of the bucket count (default: auto -- derived from -g if set,"
                " else 10).",
-               "--buckets-log2", false);
+               "-b", false);
     parser.add("tmp_dir", "Scratch directory for bucket files (default: mkdtemp under $TMPDIR).",
-               "--tmp-dir", false);
+               "-d", false);
     parser.add("max_ram_gb",
                "Soft RAM budget in GiB. The builder auto-tunes bucket_log2 and spills the"
                " color bit_vector to disk to try to stay within this budget; the actual"
                " peak RSS is reported at the end (no hard kill if exceeded).",
-               "--max-ram", false);
+               "-g", false);
     parser.add("verbose", "Verbose output.", "--verbose", false, true);
 
     if (!parser.parse()) return false;

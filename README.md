@@ -30,7 +30,9 @@ Inputs may be FASTA, FASTQ, or gzipped variants of either; the file at line
 
 ## Build
 
-Requirements: a C++17 compiler, CMake ≥ 3.13, and zlib.
+Requirements: a C++17 compiler and CMake ≥ 3.13. All other dependencies
+(libdeflate, lz4, bits, cmd_line_parser, unordered_dense, kseq) are
+vendored as git submodules.
 
 ```bash
 git clone --recursive https://github.com/jermp/cdbg-builder.git
@@ -48,21 +50,22 @@ The build produces a single executable, `cdgb-build`, in the `build/` directory.
 ## Usage
 
 ```
-cdgb-build -i <filenames_list> -k <k> -o <out_basename> [-t <num_threads>]
+cdgb-build -i <filenames_list> -k <k> -o <out_basename> [-t <num_threads>] [-g <GiB>]
 ```
 
 Options:
 
-| Flag                 | Description                                                       | Default |
-|----------------------|-------------------------------------------------------------------|---------|
-| `-i PATH`            | Text file with one input path per line (one color each)           | —       |
-| `-k INT`             | k-mer length (≤ 63)                                               | —       |
-| `-o NAME`            | Output basename; writes `NAME.fa`, `NAME.u2c`, and `NAME.color_sets` | —       |
-| `-t INT`             | Number of worker threads                                          | 1       |
-| `-m INT`             | Minimizer length used for bucketing                               | auto    |
-| `--buckets-log2 INT` | `2^N` minimizer-derived bucket files on disk                      | 10      |
-| `--tmp-dir PATH`     | Scratch directory for the bucket files (created if missing; if it already exists it must be empty; removed on success) | mkdtemp |
-| `-v`                 | Verbose output                                                    | off     |
+| Flag         | Description                                                       | Default |
+|--------------|-------------------------------------------------------------------|---------|
+| `-i PATH`    | Text file with one input path per line (one color each)           | —       |
+| `-k INT`     | k-mer length (≤ 63)                                               | —       |
+| `-o NAME`    | Output basename; writes `NAME.fa`, `NAME.u2c`, and `NAME.color_sets` | —    |
+| `-t INT`     | Number of worker threads                                          | 1       |
+| `-m INT`     | Minimizer length used for bucketing                               | auto    |
+| `-b INT`     | log2 of the bucket count (`2^N` bucket files on disk)             | auto (derived from `-g` if set, else 10) |
+| `-d PATH`    | Scratch directory for the bucket files (created if missing; if it already exists it must be empty; removed on success) | mkdtemp |
+| `-g FLOAT`   | Soft RAM budget in GiB. Tunes bucket count + spill thresholds and arms a runtime RSS watcher; peak is reported at the end (not a hard cap) | unset |
+| `--verbose`  | Verbose output                                                    | off     |
 
 The build pipeline is GGCAT-style: stream input → write super-k-mers
 into per-minimizer bucket files on disk → walk each bucket independently
@@ -88,7 +91,8 @@ Build the filenames list (one absolute path per line):
 find $(pwd)/Salmonella_enterica/Genomes/*.fasta > salmonella_4546_filenames.txt
 ```
 
-Run `cdgb-build` (from the `build/` directory) with `k = 31` and 8 threads:
+Run `cdgb-build` (from the `build/` directory) with `k = 31`, 8 threads,
+and a 4 GiB soft RAM budget:
 
 ```bash
 ./cdgb-build \
@@ -96,8 +100,14 @@ Run `cdgb-build` (from the `build/` directory) with `k = 31` and 8 threads:
     -o ~/Salmonella_enterica/salmonella_4546 \
     -k 31 \
     -t 8 \
+    -g 4 \
     --verbose
 ```
+
+For larger pangenomes, scale `-t` to your core count and `-g` to
+roughly half of available memory. The bucket-write phase auto-tunes
+the bucket count and per-bucket spill thresholds against `-g` to
+keep peak RSS under that budget.
 
 This produces:
 

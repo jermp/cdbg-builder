@@ -73,7 +73,7 @@ inline constexpr size_t DEFAULT_COMPACTOR_SPILL_BYTES = 256 * 1024;
 class bucket_compactor {
 public:
     // try_spill() is the writer's RSS-watcher entry point: when the
-    // process is over the --max-ram budget the watcher walks every
+    // process is over the -g budget the watcher walks every
     // compactor and force-spills any with pending data. Per-batch
     // ingest itself is unaware of pressure; spill cadence stays at
     // m_bytes >= m_spill_bytes so dedup state per spill remains
@@ -419,7 +419,7 @@ public:
     //     + B * spill_bytes * COMPACTOR_OVERHEAD
     // bytes that no amount of pressure response can reduce. The auto-
     // tune in builder picks flush_bases / spill_bytes / num_buckets so
-    // that floor stays under the bucket-write share of --max-ram.
+    // that floor stays under the bucket-write share of -g.
     void start_rss_watcher(uint64_t high_threshold_bytes, uint64_t low_threshold_bytes,
                            std::chrono::milliseconds interval = std::chrono::milliseconds(100)) {
         if (m_watcher_running.exchange(true)) return;  // already started
