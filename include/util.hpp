@@ -353,4 +353,90 @@ inline bucket_write_prof& bucket_prof() {
     return p;
 }
 
+// ---- bucket-process profiling counters --------------------------------------
+//
+// Mirrors bucket_write_prof for the bucket-process phase. Phase-level
+// timers only (per-record / per-kmer timers would dwarf the work
+// they're trying to measure: 24.5B records for the 50K workload at
+// ~20ns/clock_now() == ~10 minutes of overhead). Phase counts let us
+// see whether the 1141s is mostly load_bucket vs rsid->cid resolve
+// vs walk vs the global-dict merge under mutex.
+struct bucket_process_prof {
+    using clock = std::chrono::steady_clock;
+
+    // ---- per-bucket phases inside process_bucket ----
+    // load_bucket: read every super-k-mer record, intern its color list
+    // into record_sets, roll k-mers into kmer_info. Most likely the
+    // dominant line because it touches every record + every k-mer.
+    std::atomic<uint64_t> ns_load{0};
+    // rsid->cid resolve: for each k-mer, decode its (single or merged)
+    // record-color list and intern into local_dict. ~1 intern per
+    // distinct local class per bucket.
+    std::atomic<uint64_t> ns_resolve{0};
+    // walk: classify_left_end + extend_and_emit passes. Repeated
+    // hashmap lookups, no color-list work.
+    std::atomic<uint64_t> ns_walk{0};
+
+    // ---- merge work split into pre-* (lock-free) and locked phases ----
+    // Lock-free pre-merge: decode each local_dict class into a vector
+    // (compact_color_set_dict::at).
+    std::atomic<uint64_t> ns_pre_decode{0};
+    // Lock-free pre-merge: wyhash + fnv1a of the decoded color list.
+    // Heavy on multi-thousand-color lists; previously ran inside the
+    // critical section.
+    std::atomic<uint64_t> ns_pre_hash{0};
+
+    // ---- global merge (in process_buckets driver, under global_mu) ----
+    // Time waiting to acquire global_mu before merging this bucket's
+    // local_dict into the streaming global_dict.
+    std::atomic<uint64_t> ns_merge_lock_wait{0};
+    // Time held under global_mu: dedup-find + on-miss encode + offset
+    // sidecar write. With pre-decode + pre-hash done lock-free this is
+    // just the hashmap probe and (rarely) the encoder work.
+    std::atomic<uint64_t> ns_merge{0};
+
+    // ---- counters ----
+    std::atomic<uint64_t> n_buckets{0};
+    std::atomic<uint64_t> n_records{0};       // total super-k-mer records read
+    std::atomic<uint64_t> n_kmers{0};         // total k-mers rolled (sum of bases.size()-k+1)
+    std::atomic<uint64_t> n_local_classes{0}; // sum of local_dict.size() across buckets
+    std::atomic<uint64_t> n_unitigs{0};       // total bucket_unitigs emitted
+
+    static inline uint64_t since(clock::time_point t0) {
+        return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - t0)
+            .count();
+    }
+
+    void print(uint32_t num_threads) const {
+        auto load_a = [](std::atomic<uint64_t> const& a) {
+            return a.load(std::memory_order_relaxed);
+        };
+        double per_thread = num_threads > 0 ? (double)num_threads : 1.0;
+        auto s = [&](std::atomic<uint64_t> const& a) {
+            return (double)load_a(a) / 1e9 / per_thread;
+        };
+        std::fprintf(
+            stderr,
+            "[bucket-process profile] (per-thread time, ns/threads -> wall-equiv):\n"
+            "  load        %7.2fs   (bucket_reader + LZ4 + record intern + kmer hashmap roll)\n"
+            "  resolve     %7.2fs   (rsid -> local cid; record_sets.at + local_dict.intern)\n"
+            "  walk        %7.2fs   (classify_left_end + extend_and_emit)\n"
+            "  pre_decode  %7.2fs   (local_dict.at, lock-free)\n"
+            "  pre_hash    %7.2fs   (wyhash + fnv1a on decoded class, lock-free)\n"
+            "  merge_wait  %7.2fs   (waiting on global_mu)\n"
+            "  merge       %7.2fs   (global_dict.intern_with_hashes under global_mu)\n"
+            "  counts: buckets=%llu records=%llu kmers=%llu local_classes=%llu unitigs=%llu\n",
+            s(ns_load), s(ns_resolve), s(ns_walk), s(ns_pre_decode), s(ns_pre_hash),
+            s(ns_merge_lock_wait), s(ns_merge),
+            (unsigned long long)load_a(n_buckets), (unsigned long long)load_a(n_records),
+            (unsigned long long)load_a(n_kmers), (unsigned long long)load_a(n_local_classes),
+            (unsigned long long)load_a(n_unitigs));
+    }
+};
+
+inline bucket_process_prof& process_prof() {
+    static bucket_process_prof p;
+    return p;
+}
+
 }  // namespace cdgb
