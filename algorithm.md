@@ -33,17 +33,21 @@ maximal path with internal nodes of in-degree = out-degree = 1.
 
 ## 2. Pipeline overview
 
-The build runs in four sequential phases. The wall-time numbers come
-from the salmonella-25K benchmark (25 000 input genomes, k = 31, m = 12,
-16 threads, --max-ram 4 GB) and are representative of dense pangenome
-inputs.
+The build runs in four sequential phases. Wall-time numbers below come
+from three reference benchmarks on bacterial pangenome inputs
+(k = 31, m = 12, `--max-ram` set to ~16 % of input size):
 
-| phase | wall (25K) | what it does | files written |
-|---|---|---|---|
-| **bucket-write** | ~296 s | partition input k-mers into B disk buckets | `tmp/bucket_*.bin` (LZ4) |
-| **bucket-process** | ~419 s | per-bucket dBG + walk; emit fragments | `tmp/frag_unitigs.bin` ; `out.color_sets` (streamed) |
-| **stitch** | ~16 s  | join open-ended fragments across buckets | `tmp/unitig_bucket_*.bin` |
-| **emit** | ~4 s   | write `.fa` + `.u2c`; finalize `.color_sets` | `out.fa`, `out.u2c`, `out.color_sets` |
+| phase | 25K (16 t / 4 GB) | 50K (32 t / 16 GB) | 100K (32 t / 16 GB) | files written |
+|---|---|---|---|---|
+| **bucket-write** | ~280 s | ~287 s | ~1964 s | `tmp/bucket_*.bin` (LZ4) |
+| **bucket-process** | ~286 s | ~364 s | ~1126 s | `tmp/frag_unitigs.bin` ; `out.color_sets` (streamed) |
+| **stitch** | ~16 s  | ~27 s | ~57 s | `tmp/unitig_bucket_*.bin` |
+| **emit** | ~4 s   | ~12 s | ~13 s | `out.fa`, `out.u2c`, `out.color_sets` |
+| **total** | **~589 s** | **~690 s** | **~3164 s** | |
+
+The 100K bucket-write number is dominated by disk I/O reading the
+input files (the per-thread profile sums to only ~500 s wall-equiv,
+the rest is mmap-fault-wait reading 150 GB of compressed input).
 
 The four phases are strictly serial: each consumes the prior phase's
 on-disk output and finishes before the next starts. Within a phase,
@@ -75,9 +79,10 @@ out.fa + out.u2c + finalize out.color_sets                ← emit
 
 ### 3.1 Goal
 
-Read every input file, decompose each ACGT-only run into super-k-mers,
-compute each super-k-mer's **canonical minimizer**, and append it to the
-bucket file selected by that minimizer. After this phase:
+Read every input file (libdeflate-decompressed if `.gz`), decompose
+each ACGT-only run into super-k-mers, compute each super-k-mer's
+**canonical minimizer**, and append it to the bucket file selected by
+that minimizer. After this phase:
 
 - Each bucket file holds one stream of super-k-mer records.
 - Records are *compacted*: a super-k-mer that occurred in many input
@@ -110,10 +115,13 @@ Each super-k-mer record carries:
 Each ingest worker thread owns a `per_thread_bucket_buffers` (one
 `std::vector<pending_record>` and one `std::vector<uint8_t>` of bases
 per bucket). `append()` pushes the record's metadata + appends the
-bases bytes — no lock, no hashmap. When a bucket's bases-buffer
-crosses `flush_bases` (auto-tuned, typically 16–64 KiB), the thread
-acquires that bucket's mutex and calls
-`bucket_compactor::insert_batch`.
+bases bytes + **precomputes a wyhash of the super-k-mer bases** while
+they're still hot in L1 from the buffer write — no lock, no hashmap.
+The hash is stashed in `pending_record::hash` so the compactor's
+later dedup-find doesn't have to re-touch the (typically cold) bases
+bytes. When a bucket's bases-buffer crosses `flush_bases` (auto-
+tuned, typically 8–64 KiB), the thread acquires that bucket's mutex
+and calls `bucket_compactor::insert_batch`.
 
 ### 3.4 Per-bucket compactor (online dedup)
 
@@ -125,10 +133,14 @@ Each `bucket_compactor` (one per bucket) holds:
 - `m_batch_buf`, `m_out_buf`: scratch vectors reused across spills.
 - `m_file`: the open bucket file handle.
 
-`insert_batch` walks the incoming batch, transparent-finds each
-super-k-mer in `m_dedup` (no string allocation on hit), and either
-inserts a new entry or appends the new color to an existing one's
-`colors` vector. Sort+unique on `colors` is deferred until spill.
+`insert_batch` walks the incoming batch, finds each super-k-mer in
+`m_dedup` via heterogeneous lookup with a `hashed_view{string_view,
+uint64_t}` whose hasher returns the precomputed hash directly. The
+bases bytes are only re-read on a hash collision (then `string_eq`
+runs the byte compare against the stored `std::string`). On hit it
+appends the new color to the existing entry's `colors` vector; on
+miss it constructs the std::string and emplaces. Sort+unique on
+`colors` is deferred until spill.
 
 ### 3.5 Spill: serialize, LZ4-compress, write a frame
 
@@ -282,50 +294,100 @@ in §4.7.
 ### 4.6 Streaming the global color-set dict
 
 A single `streaming_color_set_dict` is shared across all bucket
-threads, guarded by `global_mu`.
+threads, guarded by `global_mu`. The dict exposes two intern
+entry points:
 
-`intern(colors)`:
+- `intern(colors)` — computes the 128-bit content hash inline (wyhash
+  primary + fnv1a secondary), then dispatches to ↓.
+- `intern_with_hashes(colors, h)` — caller supplies the precomputed
+  hash. Used by the batched merge in §4.7 so the (heavy) hash
+  compute happens lock-free.
 
-1. Compute primary (`wyhash`) + secondary (`fnv1a`) 128-bit hash.
-2. Look up in `m_index` (hash-only key, no byte-compare). On hit
+Either way, the hot work under the lock is:
+
+1. Look up in `m_index` (hash-only key, no byte-compare). On hit
    return existing id; collision rate is ~2^-64 per pair, negligible
    over our class counts.
-3. On miss: hybrid-encode the new class's bits via
+2. On miss: hybrid-encode the new class's bits via
    `hybrid_builder::encode_one` into an in-memory
    `bits::bit_vector::builder`.
-4. Append every COMPLETE 64-bit word from the builder to
+3. Append every COMPLETE 64-bit word from the builder to
    `<out>.color_sets` (the file is opened at construction with a
    placeholder header). Only the trailing partial word stays in
    memory.
-5. Append the new class's `bit_offset` to a sidecar file
+4. Append the new class's `bit_offset` to a sidecar file
    `<out>.color_sets.tmp_offsets` for the EF later.
 
 Per-class metadata held in RAM: 16 B (primary + secondary hash). The
 compressed bit_vector itself is never resident.
 
-### 4.7 Per-bucket → global merge
+### 4.7 Per-bucket → global merge (batched, hash precomputed)
 
-After `process_bucket` returns, the worker thread takes `global_mu`
-and walks its `local_dict`:
+After `process_bucket` returns, the worker thread merges its
+`local_dict` into `global_dict`. The naive single-mutex version
+(decode + hash + dedup-find + on-miss-encode all under `global_mu`)
+serialised 32 threads on multi-thousand-color lists; the
+bucket-process diagnostic showed ~80 % of bucket-process wall on
+50K was lock contention.
+
+The current path splits per-class work into a lock-free pre-phase
+and a much smaller locked phase, in batches of `MERGE_BATCH = 32`:
 
 ```cpp
-for each local class lc:
-    local_dict.at(lc, decode_scratch);
-    local_to_global[lc] = global_dict.intern(std::move(decode_scratch));
+for each batch of up to 32 local classes:
+    // Lock-free.
+    for i in batch:
+        local_dict.at(lc, batch[i].colors);
+        batch[i].h = streaming_color_set_dict::compute_hashes(batch[i].colors);
+    // Locked.
+    {
+        lock_guard<mutex> lk(global_mu);
+        for i in batch:
+            local_to_global[lc] = global_dict.intern_with_hashes(
+                std::move(batch[i].colors), batch[i].h);
+    }
 ```
 
-Then it remaps each unitig fragment's `cid` from local → global and
-streams the fragment to the disk-backed `frag_unitig_writer`. Per-
-fragment: `[u32 cid][u8 open_flags][u32 seq_len][seq bytes]`.
+The lock-free pre-phase does the local-dict hybrid decode (~tens of
+µs per call on dense pangenome inputs) and the wyhash + fnv1a (~tens
+of µs on a multi-thousand-color list). The locked phase is just the
+hashmap probe (microseconds) plus, on miss, the hybrid encode +
+sidecar offset write. On 50K, this brought `merge_wait` from 936 s
+to ~120 s and total bucket-process from 1156 s to 364 s.
 
-### 4.8 Auto-cap on concurrency (none today)
+After the merge, the worker remaps each unitig fragment's `cid`
+local → global and streams the fragment to the disk-backed
+`frag_unitig_writer`. Per-fragment: `[u32 cid][u8 open_flags][u32
+seq_len][seq bytes]`.
+
+Memory: per-thread merge buffer is `MERGE_BATCH × max-decoded-color-
+list`, a few MB at num_colors = 100K.
+
+### 4.8 Bucket-process profiling
+
+`bucket_process_prof` (in `util.hpp`) tracks phase-level wall-equiv
+time across worker threads:
+
+- `ns_load` — `bucket_reader` + LZ4 decompress + record intern + the
+  per-record k-mer hashmap roll into `kmer_info`.
+- `ns_resolve` — the rsid → local cid pass over `kmer_info`.
+- `ns_walk` — `classify_left_end` + `extend_and_emit`.
+- `ns_pre_decode`, `ns_pre_hash` — the lock-free half of §4.7.
+- `ns_merge_lock_wait`, `ns_merge` — wait for vs. work under
+  `global_mu`.
+
+Plus counts: `n_buckets`, `n_records`, `n_kmers`, `n_local_classes`,
+`n_unitigs`. Overhead is well under 1 % of bucket-process wall and is
+left enabled by default.
+
+### 4.9 Auto-cap on concurrency (none today)
 
 The user explicitly asks for `--threads N`. bucket-process spawns N
 worker threads; each pops the next bucket from a shared atomic
 counter. There is **no** auto-cap — if the per-thread walker state
 won't fit in `--max-ram / N`, the process simply runs over budget. A
 clean abort with a "lower --threads or raise --max-ram" message is
-listed as future work in §10.
+listed as future work in §11.
 
 ---
 
@@ -534,13 +596,16 @@ Bucket-process peak per in-flight thread:
 record_sets   (compact, hybrid-encoded)   ~10–30 MB / bucket
 local_dict    (compact, hybrid-encoded)   ~10–30 MB / bucket
 kmer_info     (per-k-mer rsid + phantom)  ~hundreds of MB / bucket on dense input
+merge batch   (decoded color lists, 32)   few MB at num_colors = 100K
 ```
 
 `record_sets` and `local_dict` were the dominant contributor with
 the live-vector dict (~280 MB each per bucket); the compact
 hybrid-encoded variant cut this 10–30×. The current bottleneck per
 in-flight thread is `kmer_info` (no easy compression — actively used
-during the chain walk).
+during the chain walk). The §4.7 batched merge keeps a small
+per-thread buffer (32 decoded classes) so the local-dict decode +
+hash work can run lock-free.
 
 Stitch peak: `frag_unitig_reader` index (~16 B per fragment) +
 `by_junction` + `adj` (8 B per fragment, packed). Mmap pages of seq
@@ -573,24 +638,30 @@ running concurrently with bucketing).
 
 ## 11. Known weaknesses and optimization surfaces
 
-### 11.1 bucket-write CPU dominance
+### 11.1 bucket-write disk-I/O dominance at scale
 
-bucket-write spends ~205 s of its 296 s wall in `flush` (139 s
-hashmap, 64 s spill+LZ4, 2 s lock_wait). At 16 threads, the hashmap
-cost is ~95 % of theoretical perfect parallelism, so it's already
-well-distributed — the cost is per-record CPU, not coordination.
+On 25K and 50K (with files in page cache from prior runs)
+bucket-write is CPU-bound and the per-thread profile sums close to
+wall. On 100K (cold cache, files on HDD) the per-thread profile sums
+to ~500 s wall-equiv but actual wall is 1964 s — the missing ~1465 s
+is mmap-fault wait reading 150 GB of compressed input. Software has
+limited room here; storage matters more than code.
 
-Realistic levers, ordered by experimental value over effort:
-- Try `mimalloc` / `jemalloc` via `LD_PRELOAD`. ~2 B std::string
-  allocations through bucket-write. Could buy 5–10 % wall.
-- Decouple gz-decode from minimizer-compute (separate thread pool).
-  Today gz-decode blocks on the same worker that does compute;
-  a producer/consumer split would let the 22 s of gz overlap.
-- Try a different hashmap (`folly::F14`, `phmap::flat_hash_map`).
-  Modest, ~10–20 % per find.
-- Vectorize `pack_2bit` (BMI2 `pext`) and `nthash_roll` (SIMD).
-  Modest; pack_2bit currently runs only on dedup'd records so the
-  amortized cost is small.
+Levers that *could* help (in the I/O-bound regime):
+- Pre-fetch input files in a producer pool of K threads while the
+  remaining T-K threads do compute on already-decompressed buffers.
+  Useful when CPU is partially idle waiting for disk.
+- Sort the input file list by inode/disk-position before processing
+  to reduce HDD seek time.
+
+In the CPU-bound regime (warm cache, SSD), the residual hot lines
+are `flush.hashmap` (per-record `m_dedup` find) and `compute`
+(ntHash + minimizer queue). Levers ordered by experimental value:
+- Different hashmap (`folly::F14`, `phmap::flat_hash_map`). Modest.
+- Vectorize `nthash_roll` and `canonical_mhash`. Modest; the
+  byte-by-byte loops were already auto-vectorized by gcc -O3 (a
+  dedicated SIMD ACGT/2-bit branch was tried and dropped because the
+  compiler had already done the same work).
 
 The architectural lever (GGCAT-style background compactor that
 removes dedup from the bucketing critical path) was tried on the
@@ -606,20 +677,33 @@ process runs over budget. The right behavior is a clean abort with a
 "lower --threads or raise --max-ram" message; this hasn't been
 implemented.
 
-### 11.3 Single-threaded stitch and emit
+### 11.3 bucket-process `load` at 100K
 
-Stitch is ~16 s on the 25K workload (small relative to the other
-phases) but would scale poorly if num_unitigs grew much further.
-Emit is ~4 s and IO-bound. Both are unparallelized today; not a
-priority.
+On 100K, `load` is 636 s wall-equiv = 56 % of bucket-process. It's
+26 B canonical-k-mer hashmap operations into a per-bucket
+`bucket_kmer_map` that grows to millions of entries. The probe cost
+is cache-miss-bound. Two avenues:
 
-### 11.4 No SIMD in the hot inner loops
+- Increase `num_buckets` so each bucket's map shrinks and fits more
+  into L2/L3. Free win if the per-bucket file overhead stays small.
+- Pre-sort each bucket's records by canonical k-mer at load time so
+  hashmap inserts go in (mostly) sorted order, replacing random
+  probes with sequential ones. More involved.
 
-`pack_2bit`, `nthash_roll`, `canonical_mhash` are all scalar.
-Realistic ~2–4× speedup with SSE/AVX/BMI2. Worth attempting once
-allocator and decoupled gz-decode wins are exhausted.
+`resolve` (340 s on 100K) is dominated by per-k-mer hashmap
+iteration over `kmer_info` plus per-rsid color-list decode in
+`record_sets.at`; we tried hash-skip and bit-copy variants on
+`claude/bucket-process-prof` but neither moved the needle, so the
+branch was reset to just the batched-merge commit.
 
-### 11.5 Per-bucket walker `kmer_info` is the largest residual
+### 11.4 Single-threaded stitch and emit
+
+Stitch is ~16 s / ~27 s / ~57 s on 25K / 50K / 100K. Scales sub-
+linearly with input size but would matter if num_unitigs grew much
+further. Emit is ~4–13 s and I/O-bound. Both are unparallelized
+today; not a priority.
+
+### 11.5 Per-bucket walker `kmer_info` is the largest RSS residual
 
 `compact_color_set_dict` cut `record_sets` and `local_dict` ~10×.
 What remains is `kmer_info`, which is the per-canonical-k-mer
@@ -635,13 +719,14 @@ fragment access can be a page fault. On NVMe SSDs ~50 µs per
 fragment; on HDD this would be orders of magnitude slower.
 Documented but not auto-detected.
 
-### 11.7 Wall-time gap to GGCAT (~17 % on 25K)
+### 11.7 Wall-time vs GGCAT
 
-We're slower than GGCAT on bucketing (296 s vs 81 s) but **faster**
-on bucket-process (419 s vs 532 s, GGCAT's `kmers merge`). Net gap
-is ~128 s. Closing it requires the background-compactor architecture
-plus the micro-optimizations above; current peak-RSS-and-cap
-behavior is already strong.
+On 25K we are now **faster** than GGCAT (~589 s vs ~620 s reported
+for the same dataset). The libdeflate gzip backend, the precomputed
+super-k-mer hash, and the batched + pre-hashed global merge each
+contributed. On larger inputs (50K, 100K) we have no apples-to-
+apples GGCAT number; the residual gap on 100K is dominated by
+bucket-write disk I/O, not bucket-process compute.
 
 ---
 
@@ -662,5 +747,5 @@ behavior is already strong.
 | `include/hybrid_color_sets.hpp`             | static `encode_one` (sparse/dense/complementary) |
 | `include/kmer.hpp`                          | 2-bit canonical k-mer encoding |
 | `include/minimizer.hpp`                     | canonical ntHash + sliding-window minimum |
-| `include/seq_reader.hpp`                    | gzip FASTA/FASTQ iterator (kseq.h) |
+| `include/seq_reader.hpp`                    | mmap + libdeflate FASTA/FASTQ iterator (kseq over mem_stream) |
 | `include/util.hpp`                          | timers, RSS, profiling counters, build_config |
