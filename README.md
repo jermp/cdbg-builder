@@ -50,22 +50,22 @@ The build produces a single executable, `cdgb-build`, in the `build/` directory.
 ## Usage
 
 ```
-cdgb-build -i <filenames_list> -k <k> -o <out_basename> [-t <num_threads>] [--max-ram <GiB>]
+cdgb-build -i <filenames_list> -k <k> -o <out_basename> [-t <num_threads>] [-g <GiB>]
 ```
 
 Options:
 
-| Flag                 | Description                                                       | Default |
-|----------------------|-------------------------------------------------------------------|---------|
-| `-i PATH`            | Text file with one input path per line (one color each)           | —       |
-| `-k INT`             | k-mer length (≤ 63)                                               | —       |
-| `-o NAME`            | Output basename; writes `NAME.fa`, `NAME.u2c`, and `NAME.color_sets` | —       |
-| `-t INT`             | Number of worker threads                                          | 1       |
-| `-m INT`             | Minimizer length used for bucketing                               | auto    |
-| `--buckets-log2 INT` | `2^N` minimizer-derived bucket files on disk                      | auto (derived from `--max-ram` if set, else 10) |
-| `--tmp-dir PATH`     | Scratch directory for the bucket files (created if missing; if it already exists it must be empty; removed on success) | mkdtemp |
-| `--max-ram FLOAT`    | Soft RAM budget in GiB. Tunes bucket count + spill thresholds and arms a runtime RSS watcher; peak is reported at the end (not a hard cap) | unset   |
-| `--verbose`          | Verbose output                                                    | off     |
+| Flag         | Description                                                       | Default |
+|--------------|-------------------------------------------------------------------|---------|
+| `-i PATH`    | Text file with one input path per line (one color each)           | —       |
+| `-k INT`     | k-mer length (≤ 63)                                               | —       |
+| `-o NAME`    | Output basename; writes `NAME.fa`, `NAME.u2c`, and `NAME.color_sets` | —    |
+| `-t INT`     | Number of worker threads                                          | 1       |
+| `-m INT`     | Minimizer length used for bucketing                               | auto    |
+| `-b INT`     | log2 of the bucket count (`2^N` bucket files on disk)             | auto (derived from `-g` if set, else 10) |
+| `-d PATH`    | Scratch directory for the bucket files (created if missing; if it already exists it must be empty; removed on success) | mkdtemp |
+| `-g FLOAT`   | Soft RAM budget in GiB. Tunes bucket count + spill thresholds and arms a runtime RSS watcher; peak is reported at the end (not a hard cap) | unset |
+| `--verbose`  | Verbose output                                                    | off     |
 
 The build pipeline is GGCAT-style: stream input → write super-k-mers
 into per-minimizer bucket files on disk → walk each bucket independently
@@ -100,14 +100,14 @@ and a 4 GiB soft RAM budget:
     -o ~/Salmonella_enterica/salmonella_4546 \
     -k 31 \
     -t 8 \
-    --max-ram 4 \
+    -g 4 \
     --verbose
 ```
 
-For larger pangenomes, scale `-t` to your core count and `--max-ram`
-to roughly half of available memory. The bucket-write phase auto-
-tunes the bucket count and per-bucket spill thresholds against
-`--max-ram` to keep peak RSS under that budget.
+For larger pangenomes, scale `-t` to your core count and `-g` to
+roughly half of available memory. The bucket-write phase auto-tunes
+the bucket count and per-bucket spill thresholds against `-g` to
+keep peak RSS under that budget.
 
 This produces:
 

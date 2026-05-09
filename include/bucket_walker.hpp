@@ -474,7 +474,7 @@ inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t nu
             std::vector<stitchable_unitig> bucket_unitigs;
             // Hybrid-encoded local dict: per-bucket footprint shrinks
             // ~10-30x vs the live-vector dict, so N threads in flight
-            // stay within the per-thread share of --max-ram on dense
+            // stay within the per-thread share of -g on dense
             // pangenome inputs.
             compact_color_set_dict local_dict(num_colors);
             try {

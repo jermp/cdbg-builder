@@ -35,7 +35,7 @@ maximal path with internal nodes of in-degree = out-degree = 1.
 
 The build runs in four sequential phases. Wall-time numbers below come
 from three reference benchmarks on bacterial pangenome inputs
-(k = 31, m = 12, `--max-ram` set to ~16 % of input size):
+(k = 31, m = 12, `-g` set to ~16 % of input size):
 
 | phase | 25K (16 t / 4 GB) | 50K (32 t / 16 GB) | 100K (32 t / 16 GB) | files written |
 |---|---|---|---|---|
@@ -164,7 +164,7 @@ proper compression ratio on the joint stream.
 ### 3.6 RSS pressure watcher
 
 A background thread polls live RSS via `/proc/self/status:VmRSS`
-every 100 ms. On HIGH (default 60 % of `--max-ram`), it sweeps every
+every 100 ms. On HIGH (default 60 % of `-g`), it sweeps every
 compactor and force-spills any with pending state. When RSS drops to
 LOW (default 45 %), pressure clears and ingest threads return to
 their normal `m_bytes`-based spill cadence. Hysteresis prevents the
@@ -385,8 +385,8 @@ left enabled by default.
 The user explicitly asks for `--threads N`. bucket-process spawns N
 worker threads; each pops the next bucket from a shared atomic
 counter. There is **no** auto-cap — if the per-thread walker state
-won't fit in `--max-ram / N`, the process simply runs over budget. A
-clean abort with a "lower --threads or raise --max-ram" message is
+won't fit in `-g / N`, the process simply runs over budget. A
+clean abort with a "lower --threads or raise -g" message is
 listed as future work in §11.
 
 ---
@@ -430,7 +430,7 @@ this is acceptable; on HDD it would be slow.
 `unitig_bucket_writer` (the stitch sink) partitions finished merged
 unitigs into K cid-range buckets: bucket `b` holds every unitig with
 `cid ∈ [b * S, (b+1) * S)` where `S = ceil(num_color_classes / K)`.
-K auto-scales with `--max-ram` (target: per-bucket peak ~10 % of
+K auto-scales with `-g` (target: per-bucket peak ~10 % of
 budget). Per-bucket file format:
 `[u32 cid][u32 seq_len][seq bytes]` repeated.
 
@@ -587,7 +587,7 @@ T * B * flush_bases * BUFFER_OVERHEAD       ← per-thread per-bucket buffers
 
 with `T = num_threads`, `B = num_buckets`, BUFFER_OVERHEAD = 2x,
 COMPACTOR_OVERHEAD = 7x. Auto-tune solves this for `flush_bases` and
-`spill_bytes` against `BUCKET_WRITE_SHARE × --max-ram`. The RSS
+`spill_bytes` against `BUCKET_WRITE_SHARE × -g`. The RSS
 pressure watcher provides a runtime safety net.
 
 Bucket-process peak per in-flight thread:
@@ -672,9 +672,9 @@ away.
 
 ### 11.2 No bucket-process concurrency cap
 
-If `--threads N` × per-bucket walker state exceeds `--max-ram`, the
+If `--threads N` × per-bucket walker state exceeds `-g`, the
 process runs over budget. The right behavior is a clean abort with a
-"lower --threads or raise --max-ram" message; this hasn't been
+"lower --threads or raise -g" message; this hasn't been
 implemented.
 
 ### 11.3 bucket-process `load` at 100K

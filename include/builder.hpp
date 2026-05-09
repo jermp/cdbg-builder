@@ -108,11 +108,11 @@ struct builder {
 
         auto writer = std::make_unique<bucket_writer>(tmp_dir, num_buckets, m_flush_bases,
                                                       m_spill_bytes);
-        // When --max-ram is set, arm a background RSS watcher with
+        // When -g is set, arm a background RSS watcher with
         // hysteresis. Bucket-write must leave room for what comes
         // after: bucket-process adds ~1 GiB on top on multi-thousand-
         // genome inputs, stitch adds ~300 MiB. We reserve those by
-        // budgeting bucket-write at 60% of --max-ram (HIGH) with a
+        // budgeting bucket-write at 60% of -g (HIGH) with a
         // release point at 45% (LOW). Once live RSS crosses HIGH, the
         // watcher trips pressure and sweeps all compactors once;
         // ingest threads then spill every batch until live RSS falls
@@ -215,7 +215,7 @@ struct builder {
 
         // Stitch streams each finished unitig into a cid-range
         // unitig_bucket_writer. The K bucket count auto-scales so
-        // per-bucket peak at emit stays under ~10% of --max-ram. We
+        // per-bucket peak at emit stays under ~10% of -g. We
         // size K up-front from a single index-only walk over the
         // mmap-backed frag spill (no seq bytes touched here).
         std::unique_ptr<unitig_bucket_writer> uwriter_ptr;
@@ -296,7 +296,7 @@ private:
     //   - color-bvb spill threshold (in bytes; 0 = never spill)
     // Tighter budgets push bucket_log2 toward 13 (8192 buckets, GGCAT's
     // upper end) and shrink the bvb spill threshold proportionally.
-    // The user-facing CLI override (--buckets-log2) takes precedence
+    // The user-facing CLI override (-b) takes precedence
     // over this auto-tune.
     static constexpr uint32_t MIN_BUCKETS_LOG2 = 10;
     static constexpr uint32_t MAX_BUCKETS_LOG2 = 13;
@@ -314,10 +314,10 @@ private:
             throw std::runtime_error("invalid m=" + std::to_string(m_cfg.m) +
                                      " (need 2 <= m <= k)");
         if (m_cfg.bucket_log2 == 0) {
-            // User didn't pin --buckets-log2. Auto-pick.
+            // User didn't pin -b. Auto-pick.
             m_cfg.bucket_log2 = auto_bucket_log2();
         } else if (m_cfg.bucket_log2 < MIN_BUCKETS_LOG2 || m_cfg.bucket_log2 > MAX_BUCKETS_LOG2) {
-            throw std::runtime_error("--buckets-log2 must be in [" +
+            throw std::runtime_error("-b must be in [" +
                                      std::to_string(MIN_BUCKETS_LOG2) + ", " +
                                      std::to_string(MAX_BUCKETS_LOG2) + "]");
         }
@@ -365,7 +365,7 @@ private:
     //
     // We compensate by dividing the effective budget that the auto-tune
     // sees by this constant. A value of 2.0 on macOS means the auto-
-    // tune behaves as if the user passed half their --max-ram (smaller
+    // tune behaves as if the user passed half their -g (smaller
     // flush_bases / spill_bytes / fewer buckets) so the resulting
     // structural footprint actually fits under the original cap once
     // platform overhead is added back. On Linux the constant is 1.0
@@ -381,7 +381,7 @@ private:
         1.0;
 #endif
 
-    // Fraction of --max-ram the bucket-write auto-tune is allowed to
+    // Fraction of -g the bucket-write auto-tune is allowed to
     // plan for (per-thread buffers + compactor + compressor). The
     // remainder absorbs the bucket-process working set, which on Mac
     // expands by ~1.75 GiB on the 4546-genome workload (k-mer rsids
@@ -422,7 +422,7 @@ private:
     // can stay at the target and each spill carries enough data that
     // dedup pays off).
     //
-    // No --max-ram set -> historical 1024 buckets.
+    // No -g set -> historical 1024 buckets.
     uint32_t auto_bucket_log2() const {
         if (m_cfg.max_ram_gb <= 0) return MIN_BUCKETS_LOG2;
         constexpr double SHARE = BUCKET_WRITE_SHARE;
@@ -442,7 +442,7 @@ private:
     }
 
     // Joint auto-tune of (flush_bases, spill_bytes) against a fixed
-    // share of --max-ram, given (num_threads, num_buckets).
+    // share of -g, given (num_threads, num_buckets).
     //
     // Bucket-write peak comes from three terms that we model as:
     //
@@ -469,12 +469,12 @@ private:
     // here is just a small constant for unmodelled per-bucket
     // bookkeeping.
     //
-    // Strategy: reserve a target share (default 50%) of --max-ram for
+    // Strategy: reserve a target share (default 50%) of -g for
     // bucket-write. Subtract the (small) compressor floor. Split what
     // remains evenly between per-thread buffers and compactor data,
     // then solve for flush_bases and spill_bytes.
     //
-    // No --max-ram set -> keep historical defaults (this keeps the
+    // No -g set -> keep historical defaults (this keeps the
     // small-input dev path identical and avoids surprising regressions
     // for users who don't care about a budget).
     void auto_tune_bucket_write_params() {
@@ -550,16 +550,16 @@ private:
         std::error_code ec;
         if (std::filesystem::exists(m_cfg.tmp_dir, ec)) {
             if (!std::filesystem::is_directory(m_cfg.tmp_dir, ec))
-                throw std::runtime_error("--tmp-dir " + m_cfg.tmp_dir +
+                throw std::runtime_error("-d " + m_cfg.tmp_dir +
                                          " exists but is not a directory");
             if (!std::filesystem::is_empty(m_cfg.tmp_dir, ec))
-                throw std::runtime_error("--tmp-dir " + m_cfg.tmp_dir +
+                throw std::runtime_error("-d " + m_cfg.tmp_dir +
                                          " is not empty (the tool will remove the directory on"
                                          " exit, so it must start empty)");
         } else {
             std::filesystem::create_directories(m_cfg.tmp_dir, ec);
             if (ec)
-                throw std::runtime_error("cannot create --tmp-dir " + m_cfg.tmp_dir + ": " +
+                throw std::runtime_error("cannot create -d " + m_cfg.tmp_dir + ": " +
                                          ec.message());
         }
         return m_cfg.tmp_dir;
@@ -573,16 +573,16 @@ private:
 
     // Pick the cid-range bucket count for the unitig spill, so the
     // peak in-RAM seq footprint at emit time -- one bucket loaded
-    // and sorted -- stays under a target fraction of --max-ram.
+    // and sorted -- stays under a target fraction of -g.
     //
     // Each bucket's records: roughly total_seq_bytes / K plus
     // ~2x overhead (std::string capacity slack + per-record book-
     // keeping in the sort vector). We size K so that target
-    // per-bucket footprint is <= 10% of --max-ram, leaving the
+    // per-bucket footprint is <= 10% of -g, leaving the
     // remaining 90% for whatever else is resident at emit time
     // (the streaming color-set dict's metadata, the FILE buffer,
     // the u2c bit_vector, etc.). Floor at MIN_K so we don't end
-    // up with one giant bucket when --max-ram is unset or huge,
+    // up with one giant bucket when -g is unset or huge,
     // ceiling at MAX_K to stay within RLIMIT_NOFILE headroom
     // (bucket-write's FDs are already closed when stitch starts,
     // so we have ~1024 FDs available).
