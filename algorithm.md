@@ -138,9 +138,12 @@ Each `bucket_compactor` (one per bucket) holds:
 uint64_t}` whose hasher returns the precomputed hash directly. The
 bases bytes are only re-read on a hash collision (then `string_eq`
 runs the byte compare against the stored `std::string`). On hit it
-appends the new color to the existing entry's `colors` vector; on
-miss it constructs the std::string and emplaces. Sort+unique on
-`colors` is deferred until spill.
+appends the new color to the existing entry's `colors` vector and
+AND-shrinks the flags (`e.flags &= r.flags`), so
+`IS_ACGT_BEGIN`/`IS_ACGT_END` survive on the deduped record only
+when *every* contributor agreed. On miss it constructs the
+std::string and emplaces. Sort+unique on `colors` is deferred until
+spill.
 
 ### 3.5 Spill: serialize, LZ4-compress, write a frame
 
@@ -409,12 +412,28 @@ in `adj` (one packed `uint64_t` per fragment, low/high u32 = LEFT/
 RIGHT side encoded as `(other_idx << 1) | other_side`, sentinel
 `UINT32_MAX` for "no link"). 8 bytes per fragment.
 
-**Pass 3 — walk chains**: for each unvisited fragment, start a
-chain at a free side. Repeatedly hop via `adj`, copying the next
-fragment's seq from the mmap (revcomped if the chain orientation
-flips). At each hop, append `seq[k-1..]` to the merged unitig (the
-shared k-1 prefix is already covered). Emit the merged unitig to the
-sink with its propagated `cid`.
+**Pass 3 — walk chains**, in three sub-passes:
+
+- **Pass 3a** scans fragments with `adj[i].LEFT == LINK_NONE` (a
+  free LEFT end); each is a chain head, walked forward
+  (`start_flipped=false`).
+- **Pass 3b** scans fragments with `adj[i].RIGHT == LINK_NONE`,
+  walked from the RIGHT end backwards (`start_flipped=true`). This
+  catches chains whose two endpoints are both on the RIGHT side
+  (per-fragment LEFT/RIGHT is per-orientation, not
+  per-chain-direction, so a chain *can* have two free-RIGHT
+  endpoints; pass 3b's second hit is harmless because the chain is
+  already `visited` from its first endpoint).
+- **Pass 3c** picks up anything still unvisited — pure cross-bucket
+  cycles with no free end. Any unvisited k-mer breaks the cycle.
+
+Within each sub-pass: start a chain at the claimed endpoint;
+repeatedly hop via `adj`, copying the next fragment's seq from the
+mmap (revcomped if the chain orientation flips). At each hop, append
+`seq[k-1..]` to the merged unitig (the shared k-1 prefix is already
+covered). Cycle closure stops the walk when `visited[nxt]` is
+already set. Emit the merged unitig to the sink with its propagated
+`cid`.
 
 mmap'd seq pages are accessed in chain order — random with respect
 to the on-disk layout. `MADV_RANDOM` tells the kernel to skip
@@ -441,9 +460,12 @@ budget). Per-bucket file format:
 1. Read all records (one bucket's worth fits in memory by design).
 2. Sort by `cid`.
 3. For each record: write `>cid\n<seq>\n` to `<out>.fa`.
-4. Track the running `cid` and a `bits::bit_vector::builder u2c_bvb`:
-   on each cid-group boundary, set `u2c_bvb.set(emitted - 1, 1)`
-   (the previous unitig was the last of its run).
+4. Track the running `cid` and a `bits::bit_vector::builder u2c_bvb`
+   constructed pre-sized to `num_unitigs` with `init=false` (one
+   `n_unitigs / 8`-byte allocation up front, no growth, no
+   zero-fill). On each cid-group boundary, set
+   `u2c_bvb.set(emitted - 1, 1)` (the previous unitig was the last
+   of its run).
 
 After all buckets: set the very last bit (closes the final run),
 build the bit_vector, `essentials::save` to `<out>.u2c`.
@@ -590,6 +612,13 @@ COMPACTOR_OVERHEAD = 7x. Auto-tune solves this for `flush_bases` and
 `spill_bytes` against `BUCKET_WRITE_SHARE × -g`. The RSS
 pressure watcher provides a runtime safety net.
 
+Independently of the RAM model, bucket-write also holds `B` open
+`FILE*` handles concurrently (one per bucket file). This is why
+`builder::ensure_fd_capacity_for_buckets_` raises `RLIMIT_NOFILE`
+to the largest value the OS allows before bucket-write starts and
+caps `bucket_log2` if the soft+hard limit can't accommodate
+`2^bucket_log2 + slack` descriptors.
+
 Bucket-process peak per in-flight thread:
 
 ```
@@ -672,10 +701,7 @@ away.
 
 ### 11.2 No bucket-process concurrency cap
 
-If `--threads N` × per-bucket walker state exceeds `-g`, the
-process runs over budget. The right behavior is a clean abort with a
-"lower --threads or raise -g" message; this hasn't been
-implemented.
+See §4.9.
 
 ### 11.3 bucket-process `load` at 100K
 
