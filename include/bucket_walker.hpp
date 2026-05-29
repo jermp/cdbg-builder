@@ -79,7 +79,7 @@ struct stitchable_unitig {
     // remaps it to a global cid as it merges each bucket's local_dict
     // into the shared global streaming_color_set_dict. By the time stitch_unitigs
     // and the FASTA emitter run, all cids are global.
-    uint32_t cid = UINT32_MAX;
+    uint64_t cid = UINT64_MAX;
     uint8_t open_flags = 0;  // bits from UNITIG_OPEN_*
 };
 
@@ -507,7 +507,7 @@ inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t nu
                 streaming_color_set_dict::precomputed_hash h;
             };
             std::vector<prepared_class> batch(MERGE_BATCH);
-            std::vector<uint32_t> local_to_global(local_dict.size());
+            std::vector<uint64_t> local_to_global(local_dict.size());
 
             for (uint32_t lc_start = 0; lc_start < local_dict.size();
                  lc_start += MERGE_BATCH) {

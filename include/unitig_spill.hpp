@@ -64,7 +64,7 @@ public:
     // num_color_classes is the final cid space (size of global_dict).
     // num_buckets controls how the cid range is partitioned. Picked
     // so per-bucket peak fits comfortably in the budget remainder.
-    unitig_bucket_writer(std::string dir, uint32_t num_color_classes, uint32_t num_buckets)
+    unitig_bucket_writer(std::string dir, uint64_t num_color_classes, uint32_t num_buckets)
         : m_dir(std::move(dir)),
           m_num_color_classes(num_color_classes),
           m_num_buckets(num_buckets == 0 ? 1 : num_buckets) {
@@ -98,7 +98,7 @@ public:
     void operator()(stitchable_unitig&& u) {
         const uint32_t b = bucket_for_cid(u.cid);
         std::FILE* f = m_files[b];
-        const uint32_t cid = u.cid;
+        const uint64_t cid = u.cid;
         const uint32_t seq_len = (uint32_t)u.seq.size();
         if (std::fwrite(&cid, sizeof(cid), 1, f) != 1)
             throw std::runtime_error("short write of unitig cid to bucket " + std::to_string(b));
@@ -116,7 +116,7 @@ public:
 
     uint64_t total_unitigs() const { return m_total_unitigs; }
     uint32_t num_buckets() const { return m_num_buckets; }
-    uint32_t num_color_classes() const { return m_num_color_classes; }
+    uint64_t num_color_classes() const { return m_num_color_classes; }
 
     std::string bucket_path(uint32_t b) const {
         return m_dir + "/unitig_bucket_" + std::to_string(b) + ".bin";
@@ -126,7 +126,7 @@ public:
     // and refilled. Records arrive in *write order* (which is stitch
     // order, NOT cid order) -- caller sorts.
     struct record {
-        uint32_t cid;
+        uint64_t cid;
         std::string seq;
     };
 
@@ -137,7 +137,8 @@ public:
         std::fflush(f);
         std::rewind(f);
         for (;;) {
-            uint32_t cid = 0, seq_len = 0;
+            uint64_t cid = 0;
+            uint32_t seq_len = 0;
             size_t got = std::fread(&cid, sizeof(cid), 1, f);
             if (got != 1) {
                 if (std::feof(f)) break;
@@ -170,20 +171,19 @@ public:
     }
 
 private:
-    uint32_t bucket_for_cid(uint32_t cid) const {
+    uint32_t bucket_for_cid(uint64_t cid) const {
         if (m_num_color_classes == 0 || m_num_buckets <= 1) return 0;
         // Cids in [b * S, (b+1) * S) live in bucket b, where
         // S = ceil(num_color_classes / num_buckets). Last bucket
         // mops up any rounding remainder.
-        const uint64_t S =
-            ((uint64_t)m_num_color_classes + m_num_buckets - 1) / m_num_buckets;
-        uint32_t b = (uint32_t)((uint64_t)cid / S);
+        const uint64_t S = (m_num_color_classes + m_num_buckets - 1) / m_num_buckets;
+        uint32_t b = (uint32_t)(cid / S);
         if (b >= m_num_buckets) b = m_num_buckets - 1;
         return b;
     }
 
     std::string m_dir;
-    uint32_t m_num_color_classes;
+    uint64_t m_num_color_classes;
     uint32_t m_num_buckets;
     std::vector<std::FILE*> m_files;
     uint64_t m_total_unitigs = 0;
@@ -231,7 +231,7 @@ public:
 
     void operator()(stitchable_unitig&& u) {
         std::lock_guard<std::mutex> lk(m_mu);
-        const uint32_t cid = u.cid;
+        const uint64_t cid = u.cid;
         const uint8_t flags = u.open_flags;
         const uint32_t seq_len = (uint32_t)u.seq.size();
         if (std::fwrite(&cid, sizeof(cid), 1, m_file) != 1 ||
@@ -362,11 +362,11 @@ public:
         // access -- kernel readahead handles the I/O cost.
         size_t off = 0;
         while (off < m_mmap_size) {
-            if (off + 4 + 1 + 4 > m_mmap_size)
+            if (off + 8 + 1 + 4 > m_mmap_size)
                 throw std::runtime_error("truncated frag spill header in " + m_path);
-            uint32_t cid;
-            std::memcpy(&cid, m_mmap_base + off, 4);
-            off += 4;
+            uint64_t cid;
+            std::memcpy(&cid, m_mmap_base + off, 8);
+            off += 8;
             uint8_t flags = m_mmap_base[off];
             off += 1;
             uint32_t seq_len;
@@ -399,7 +399,7 @@ public:
 
     // Source interface for stitch_unitigs_streaming.
     size_t size() const { return m_entries.size(); }
-    uint32_t cid(size_t i) const { return m_entries[i].cid; }
+    uint64_t cid(size_t i) const { return m_entries[i].cid; }
     uint8_t open_flags(size_t i) const {
         return (uint8_t)(m_entries[i].flags_and_len >> 30);
     }
@@ -410,17 +410,18 @@ public:
     }
 
 private:
-    // 16-byte packed entry: cid (4) + flags-and-len (4: 2 bits flags +
-    // 30 bits seq_len) + seq_offset (8). Saves 8 B/entry vs the
-    // natural-aligned 24-byte struct -- on 26.6 M fragments that's
-    // ~213 MB of index RAM.
+    // 24-byte entry: cid (8) + flags-and-len (4: 2 bits flags + 30 bits
+    // seq_len) + seq_offset (8), padded to 24. cid widened to 64-bit to
+    // support >4.29e9 color classes; costs +8 B/fragment of index RAM
+    // (e.g. ~46 GB extra at 5.7e9 fragments) -- revisit if the
+    // external-memory stitch redesign changes the reader.
     static constexpr uint32_t MAX_SEQ_LEN = (1u << 30) - 1;
     struct entry {
-        uint32_t cid;
+        uint64_t cid;
         uint32_t flags_and_len;  // top 2 bits: open_flags; bottom 30 bits: seq_len
         uint64_t seq_offset;
     };
-    static_assert(sizeof(entry) == 16, "frag_unitig_reader::entry must be 16 bytes");
+    static_assert(sizeof(entry) == 24, "frag_unitig_reader::entry must be 24 bytes");
 
     std::string m_path;
     int m_fd = -1;

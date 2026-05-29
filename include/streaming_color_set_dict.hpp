@@ -127,7 +127,7 @@ struct streaming_color_set_dict {
         return {wyhash_(v), fnv1a_(v)};
     }
 
-    uint32_t intern(std::vector<uint32_t>&& candidate) {
+    uint64_t intern(std::vector<uint32_t>&& candidate) {
         return intern_with_hashes(std::move(candidate), compute_hashes(candidate));
     }
 
@@ -137,7 +137,7 @@ struct streaming_color_set_dict {
     // bucket-process merge phase compute hashes outside the global
     // lock so threads only serialise on the actual hashmap-find +
     // encode work.
-    uint32_t intern_with_hashes(std::vector<uint32_t>&& candidate, precomputed_hash h) {
+    uint64_t intern_with_hashes(std::vector<uint32_t>&& candidate, precomputed_hash h) {
         auto it = m_index.find(hash_pair{h.primary, h.secondary});
         if (it != m_index.end()) return *it;
 
@@ -151,7 +151,7 @@ struct streaming_color_set_dict {
         if (std::fwrite(&bit_offset, sizeof(bit_offset), 1, m_offsets_file) != 1)
             throw std::runtime_error("short write of class offset to " + m_offsets_path);
 
-        uint32_t id = (uint32_t)m_classes.size();
+        uint64_t id = m_classes.size();
         m_classes.push_back({h.primary, h.secondary});
         m_index.insert(id);
         m_total_integers += candidate.size();
@@ -161,7 +161,7 @@ struct streaming_color_set_dict {
         return id;
     }
 
-    uint32_t size() const { return (uint32_t)m_classes.size(); }
+    uint64_t size() const { return m_classes.size(); }
     uint64_t total_integers() const { return m_total_integers; }
     uint64_t total_bits() const { return m_flushed_words * 64 + m_bvb.num_bits(); }
 
@@ -256,23 +256,23 @@ private:
         std::vector<hash_pair> const* classes;
         using is_transparent = void;
         using is_avalanching = void;
-        size_t operator()(uint32_t id) const noexcept { return (*classes)[id].primary; }
+        size_t operator()(uint64_t id) const noexcept { return (*classes)[id].primary; }
         size_t operator()(hash_pair const& h) const noexcept { return h.primary; }
     };
 
     struct key_eq {
         std::vector<hash_pair> const* classes;
         using is_transparent = void;
-        bool operator()(uint32_t a, uint32_t b) const noexcept {
+        bool operator()(uint64_t a, uint64_t b) const noexcept {
             auto const& ea = (*classes)[a];
             auto const& eb = (*classes)[b];
             return ea.primary == eb.primary && ea.secondary == eb.secondary;
         }
-        bool operator()(uint32_t a, hash_pair const& h) const noexcept {
+        bool operator()(uint64_t a, hash_pair const& h) const noexcept {
             auto const& ea = (*classes)[a];
             return ea.primary == h.primary && ea.secondary == h.secondary;
         }
-        bool operator()(hash_pair const& h, uint32_t a) const noexcept { return (*this)(a, h); }
+        bool operator()(hash_pair const& h, uint64_t a) const noexcept { return (*this)(a, h); }
     };
 
     // Forward-input iterator over a sequence of u64s on disk. Used at
@@ -351,7 +351,12 @@ private:
     bits::bit_vector::builder m_bvb;
     uint64_t m_flushed_words = 0;
     std::vector<hash_pair> m_classes;  // 16 B per class (dedup hashes only)
-    ankerl::unordered_dense::set<uint32_t, hasher, key_eq> m_index;
+    // bucket_type::big -> 64-bit internal value-index; the default
+    // standard bucket caps at 2^32 entries, which overflows past
+    // 4.29e9 color classes.
+    ankerl::unordered_dense::set<uint64_t, hasher, key_eq, std::allocator<uint64_t>,
+                                 ankerl::unordered_dense::bucket_type::big>
+        m_index;
     uint64_t m_total_integers = 0;
 
     std::FILE* m_file = nullptr;
