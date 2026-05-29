@@ -16,35 +16,39 @@
 //   exactly 1, neighbour elsewhere); by the per-bucket walk's OPEN
 //   invariant a (k-1) junction has AT MOST 2 open ends globally.
 //
-//   Round loop (until a round joins nothing):
-//     1. Each tig with >=1 open side is keyed by ONE chosen open side's
-//        canonical (k-1) junction and routed to bucket
-//        H(junction) % NUM_BUCKETS. Both-open tigs alternate which end
-//        they present across rounds (deterministic per-tig toggle) so
-//        each end eventually gets exposed -- this is what makes a chain
-//        of L fragments collapse in O(log L) expected rounds.
-//     2. Within each bucket, ends are grouped by junction. A junction
-//        with exactly 2 ends from 2 distinct tigs that are
-//        orientation-compatible AND share a cid is joined: the two tigs
-//        are concatenated (k-1 overlap dropped), the merged tig keyed by
-//        its remaining open end and emitted to the next round (or to the
-//        final sink if fully closed). Unpaired tigs are re-keyed (end
-//        toggled) and carried to the next round.
-//     3. A both-open tig whose two ends share the same junction is a
-//        pure cycle: emitted to the sink as a circular unitig (last base
-//        dropped), matching GGCAT.
+//   Up front, compute the JOINABLE junction set: the (k-1) junctions
+//   with exactly 2 open ends, equal cid, compatible orientation -- the
+//   in-RAM stitch's exact join predicate. This is invariant under
+//   merging, so it is computed once. An open end NOT at a joinable
+//   junction is a terminal unitig boundary.
+//
+//   Round loop (until the store drains):
+//     1. Each non-terminal tig presents ONE chosen open side and is
+//        routed to bucket H(junction) % NUM_BUCKETS. A both-open tig
+//        picks its presented end from a per-tig RNG, re-rolled each
+//        round it survives, so a chain of L fragments collapses in
+//        O(log L) expected rounds.
+//     2. Within each bucket, two tigs presenting the same joinable
+//        junction are concatenated (k-1 overlap dropped); the merged
+//        tig is sunk if now terminal, else carried to the next round.
+//     3. A tig all of whose open ends are terminal (non-joinable) is
+//        sunk immediately as a complete unitig. This is what guarantees
+//        termination: non-joinable ends never become joinable, so no
+//        tig dangles forever.
 //
 // DIFFERENCES from GGCAT (intentional, for our data model):
 //   - Key is the canonical (k-1)-mer junction, not the full boundary
-//     k-mer (our fragments overlap by k-1).
+//     k-mer (our fragments overlap by k-1). GGCAT's full-k-mer key makes
+//     dBG branches land in different buckets for free; our (k-1) key
+//     collides them, so we exclude non-joinable junctions explicitly via
+//     the precomputed set.
 //   - Join is gated on equal cid (our unitigs are monochromatic;
 //     GGCAT enforces this differently). GGCAT joins on k-mer adjacency
 //     alone.
 //
-// This header validates the join + doubling + cycle logic with an
-// IN-MEMORY round store (round_store_mem). The file-backed store that
-// makes it truly external-memory is a drop-in replacement for the store
-// and is added once this passes the test_stitch oracle.
+// Two stores share one round driver: round_store_mem (in-RAM rounds;
+// fast, used by tests/reference) and round_store_file (LZ4-framed files,
+// one bucket resident at a time; the production external-memory path).
 
 #include <array>
 #include <atomic>
@@ -67,13 +71,25 @@ namespace cdgb {
 
 namespace detail {
 
-// Set of (k-1) junctions that are dBG BRANCHES (3+ open ends share
-// them). Joins at these are forbidden. Computed once over all initial
-// fragments; the count is invariant under merging (see ext_seed_round0).
-// NOTE: in-RAM for now -- this is the one remaining unbounded structure
-// in the otherwise external-memory stitch; bucketing it to disk is a
+// Set of (k-1) junctions that are JOINABLE: exactly 2 open ends share
+// them, those ends have equal cid, and their side/orientation is
+// compatible -- i.e. precisely the in-RAM stitch's join predicate. Any
+// open end whose junction is NOT in this set is a terminal unitig
+// boundary (branch with 3+ ends, singleton, or 2-but-incompatible).
+//
+// All three properties are INVARIANT under merging: a junction's two
+// ends are always the same two original-fragment ends (merges only
+// relocate a tig's OTHER, outer end), so the predicate is computable
+// once over the initial fragments and never changes. This is the single
+// source of truth that fixes both failure modes seen earlier:
+//   - false joins (joining a count==2-but-incompatible junction), and
+//   - the hang (carrying forever a tig whose only open end is at a
+//     non-joinable junction -- it's actually terminal and must be sunk).
+//
+// NOTE: in-RAM for now -- the one remaining unbounded structure in the
+// otherwise external-memory stitch; bucketing it to disk is a
 // documented follow-up. Correctness first.
-using branch_set_t = ankerl::unordered_dense::set<kmer_int_t, kmer_hasher>;
+using joinable_set_t = ankerl::unordered_dense::set<kmer_int_t, kmer_hasher>;
 
 // A tig in the doubling loop. `rng` is a per-tig random state used to
 // pick which open end to present when both are open. It MUST vary
@@ -402,75 +418,92 @@ inline bool ext_route(ext_tig&& t, uint32_t k, Store& store, uint64_t& joined_co
 // round_store_file (same emit / take_input_bucket / advance interface).
 template <typename Store, typename Sink>
 inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets,
-                           branch_set_t const& branch, Sink&& sink,
+                           joinable_set_t const& joinable, Sink&& sink,
                            std::atomic<uint64_t>* done) {
-    for (;;) {
-        uint64_t joined_this_round = 0;
+    // Whether `side` of tig t sits at a joinable junction. A tig is
+    // TERMINAL (a complete unitig) iff none of its open ends is
+    // joinable; such a tig is sunk immediately. Because joinability is a
+    // fixed global property, a non-joinable open end never becomes
+    // joinable, so nothing dangles -- this is what makes the drain
+    // terminate (fixes the earlier hang).
+    auto end_joinable = [&](ext_tig const& t, uint8_t side) -> bool {
+        bool fwd;
+        kmer_int_t j = detail::side_junction_canonical(
+            std::string_view(t.seq.data(), t.seq.size()), k, side, fwd);
+        return joinable.find(j) != joinable.end();
+    };
+    auto is_terminal = [&](ext_tig const& t) -> bool {
+        if ((t.open_flags & UNITIG_OPEN_LEFT) && end_joinable(t, SIDE_LEFT)) return false;
+        if ((t.open_flags & UNITIG_OPEN_RIGHT) && end_joinable(t, SIDE_RIGHT)) return false;
+        return true;
+    };
+    auto sink_unitig = [&](ext_tig& t) {
+        if (done) done->fetch_add(1, std::memory_order_relaxed);
+        stitchable_unitig u;
+        u.cid = t.cid;
+        u.open_flags = 0;  // complete unitig
+        u.seq = std::move(t.seq);
+        sink(std::move(u));
+    };
+
+    // Loop until the store drains. Each round joins co-bucketed pairs at
+    // joinable junctions, sinks terminal tigs, and carries the rest
+    // (re-rolling which end a both-open tig presents). Termination: no
+    // tig is carried (store empty after advance) -- guaranteed because
+    // every join reduces the live tig count and terminal tigs leave the
+    // loop, while non-joinable ends are classified terminal up front.
+    constexpr uint32_t MAX_ROUNDS = 4096;  // safety net; O(log L) expected
+    for (uint32_t round_no = 0;; ++round_no) {
         uint64_t carried_this_round = 0;
 
         for (uint32_t b = 0; b < num_buckets; ++b) {
             std::vector<ext_tig> tigs = store.take_input_bucket(b);
             if (tigs.empty()) continue;
 
-            // Pass 1 (O(bucket)): compute each tig's chosen open end once
-            // and cache it; count ends per junction (capped at 3 to flag
-            // branches); record the first end seen per junction.
             const uint64_t NT = tigs.size();
             std::vector<ext_end> ends(NT);
             std::vector<uint8_t> has_end(NT, 0);
-            ankerl::unordered_dense::map<kmer_int_t, uint8_t, kmer_hasher> jcount;
-            ankerl::unordered_dense::map<kmer_int_t, uint64_t, kmer_hasher> jfirst;
-            jcount.reserve(NT);
-            jfirst.reserve(NT);
+            std::vector<uint8_t> consumed(NT, 0);
+            // Map each presented joinable-end junction to the first tig
+            // that presented it this round; the second arrival joins.
+            ankerl::unordered_dense::map<kmer_int_t, uint64_t, kmer_hasher> waiting;
+            waiting.reserve(NT);
+
             for (uint64_t i = 0; i < NT; ++i) {
                 uint8_t side;
-                if (!ext_choose_side(tigs[i], side)) continue;  // fully closed (shouldn't reach)
+                if (!ext_choose_side(tigs[i], side)) continue;  // closed (shouldn't reach)
                 bool fwd;
                 kmer_int_t j = detail::side_junction_canonical(
                     std::string_view(tigs[i].seq.data(), tigs[i].seq.size()), k, side, fwd);
                 ends[i] = ext_end{i, j, side, fwd};
                 has_end[i] = 1;
-                uint8_t& c = jcount[j];
-                if (c < 3) ++c;
-                auto it = jfirst.find(j);
-                if (it == jfirst.end()) jfirst.emplace(j, i);
             }
 
-            // Pass 2 (O(bucket)): join each exactly-2-end junction once.
-            // The first-stored tig at a junction triggers the join with
-            // the other tig that shares it; we find the partner via
-            // jfirst (which holds the first) and a single forward step.
-            std::vector<uint8_t> consumed(NT, 0);
+            // Pairing pass: a tig presenting a joinable junction either
+            // becomes the waiter or joins the existing waiter. The
+            // global `joinable` set already guarantees exactly-2-ends +
+            // equal-cid + compatible-orientation, so a present pair at a
+            // joinable junction is always a valid join.
             for (uint64_t i = 0; i < NT; ++i) {
                 if (consumed[i] || !has_end[i]) continue;
                 kmer_int_t j = ends[i].junction;
-                if (jcount[j] != 2) continue;  // <2 present this round; wait
-                // GLOBAL branch gate: never join at a junction that has
-                // 3+ open ends across all fragments, even if only 2 are
-                // present this round. This is what the per-round jcount
-                // alone cannot see.
-                if (branch.find(j) != branch.end()) continue;
-                uint64_t first = jfirst[j];
-                if (first == i) continue;  // wait for the partner to drive the join
-                uint64_t a_idx = first, b_idx = i;
-                if (consumed[a_idx]) continue;
-
-                if (tigs[a_idx].cid != tigs[b_idx].cid) continue;
-                if (!ext_pair_compatible(ends[a_idx], ends[b_idx])) continue;
-
-                ext_tig merged = ext_join(tigs[a_idx], ends[a_idx].side, tigs[b_idx],
-                                          ends[b_idx].side, k);
+                if (joinable.find(j) == joinable.end()) continue;  // terminal end
+                auto it = waiting.find(j);
+                if (it == waiting.end()) {
+                    waiting.emplace(j, i);
+                    continue;
+                }
+                uint64_t a_idx = it->second;
+                if (consumed[a_idx]) {  // stale; replace waiter
+                    it->second = i;
+                    continue;
+                }
+                ext_tig merged = ext_join(tigs[a_idx], ends[a_idx].side, tigs[i], ends[i].side, k);
                 consumed[a_idx] = 1;
-                consumed[b_idx] = 1;
-                ++joined_this_round;
-
-                if (merged.open_flags == 0) {
-                    if (done) done->fetch_add(1, std::memory_order_relaxed);
-                    stitchable_unitig u;
-                    u.cid = merged.cid;
-                    u.open_flags = 0;
-                    u.seq = std::move(merged.seq);
-                    sink(std::move(u));
+                consumed[i] = 1;
+                waiting.erase(it);
+                if (is_terminal(merged)) {
+                    sink_unitig(merged);
                 } else {
                     uint64_t dummy = 0;
                     detail::ext_route(std::move(merged), k, store, dummy);
@@ -478,13 +511,15 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets,
                 }
             }
 
-            // Carry survivors. A single-open-end tig with no partner this
-            // round may still find one in a later round (its junction
-            // count was 1 here only because the partner presented its
-            // other end); keep carrying. A both-open tig re-rolls which
-            // end it presents so both ends eventually get exposed.
+            // Survivors: sink terminal tigs; carry the rest (re-roll the
+            // presented end for both-open tigs so each end eventually
+            // meets its partner).
             for (uint64_t i = 0; i < NT; ++i) {
                 if (consumed[i]) continue;
+                if (is_terminal(tigs[i])) {
+                    sink_unitig(tigs[i]);
+                    continue;
+                }
                 ext_tig t = std::move(tigs[i]);
                 bool both = (t.open_flags & UNITIG_OPEN_LEFT) &&
                             (t.open_flags & UNITIG_OPEN_RIGHT);
@@ -493,27 +528,19 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets,
                 detail::ext_route(std::move(t), k, store, dummy);
                 ++carried_this_round;
             }
-            tigs.clear();
         }
 
         store.advance();
-        if (joined_this_round == 0) {
-            // No progress: flush all survivors to the sink as-is (their
-            // open ends have no partner anywhere).
+        if (carried_this_round == 0) break;  // store drained
+        if (round_no >= MAX_ROUNDS) {
+            std::cerr << "[ext-stitch] WARNING: round cap " << MAX_ROUNDS << " hit; flushing "
+                      << carried_this_round << " survivors\n";
             for (uint32_t b = 0; b < num_buckets; ++b) {
-                std::vector<ext_tig> tigs = store.take_input_bucket(b);
-                for (auto& t : tigs) {
-                    if (done) done->fetch_add(1, std::memory_order_relaxed);
-                    stitchable_unitig u;
-                    u.cid = t.cid;
-                    u.open_flags = t.open_flags;
-                    u.seq = std::move(t.seq);
-                    sink(std::move(u));
-                }
+                std::vector<ext_tig> rem = store.take_input_bucket(b);
+                for (auto& t : rem) sink_unitig(t);
             }
             break;
         }
-        (void)carried_this_round;
     }
 }
 
@@ -521,42 +548,56 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets,
 // closed fragments. Shared by the in-RAM and file-backed entry points.
 template <typename Source, typename Store, typename Sink>
 inline void ext_seed_round0(Source& frag, uint32_t k, Store& store, Sink&& sink,
-                            branch_set_t& branch, std::atomic<uint64_t>* done) {
+                            joinable_set_t& joinable, std::atomic<uint64_t>* done) {
     const uint64_t n = (uint64_t)frag.size();
 
-    // Branch detection: a (k-1) junction is a dBG BRANCH if 3+ fragment
-    // open ends share it (e.g. a predecessor's right + two successors'
-    // lefts). Such a junction must NEVER be joined -- doing so creates a
-    // unitig with an internal branch point. GGCAT gets this for free by
-    // keying on the full boundary k-mer (a branch's distinct k-mers land
-    // in different buckets); we key on the (k-1) junction so we must
-    // detect branches explicitly, exactly like the in-RAM stitch's
-    // count!=2 gate.
+    // Compute the JOINABLE junction set (the in-RAM stitch's exact join
+    // predicate, precomputed once). For each (k-1) junction, track its
+    // open ends: count (capped at 3), and -- for the first 2 -- their
+    // cid and side/orientation. A junction is joinable iff it has
+    // exactly 2 ends, equal cid, and ext_pair_compatible holds. Every
+    // other open end is a terminal unitig boundary.
     //
-    // The count is GLOBAL and computed once: merging tigs only removes
-    // the two joined ends (outer ends keep their original junctions), so
-    // a junction's open-end count never increases across rounds. A
-    // per-round count would undercount (both-open tigs present one
-    // randomized end per round) and let a 3-end branch transiently look
-    // like a joinable 2-end junction -- the false-join bug this fixes.
+    // Invariant under merging: a junction's two ends are always the same
+    // two original-fragment ends (merges relocate only a tig's OTHER,
+    // outer end), so this set is fixed for the whole run.
     {
-        ankerl::unordered_dense::map<kmer_int_t, uint8_t, kmer_hasher> jcount;
+        struct jinfo {
+            uint8_t count = 0;
+            uint64_t cid[2] = {0, 0};
+            uint8_t side[2] = {0, 0};
+            bool fwd[2] = {false, false};
+        };
+        ankerl::unordered_dense::map<kmer_int_t, jinfo, kmer_hasher> jmap;
         for (uint64_t i = 0; i < n; ++i) {
             uint8_t fl = frag.open_flags(i);
             if (fl == 0) continue;
             std::string_view sv = frag.seq_view(i);
             if ((uint32_t)sv.size() < k) continue;
+            uint64_t cid = frag.cid(i);
             for (uint8_t side : {SIDE_LEFT, SIDE_RIGHT}) {
                 uint8_t bit = (side == SIDE_LEFT) ? UNITIG_OPEN_LEFT : UNITIG_OPEN_RIGHT;
                 if (!(fl & bit)) continue;
                 bool fwd;
                 kmer_int_t j = side_junction_canonical(sv, k, side, fwd);
-                uint8_t& c = jcount[j];
-                if (c < 3) ++c;
+                jinfo& info = jmap[j];
+                if (info.count < 2) {
+                    info.cid[info.count] = cid;
+                    info.side[info.count] = side;
+                    info.fwd[info.count] = fwd;
+                }
+                if (info.count < 3) ++info.count;
             }
         }
-        for (auto const& kv : jcount)
-            if (kv.second >= 3) branch.insert(kv.first);
+        for (auto const& kv : jmap) {
+            jinfo const& info = kv.second;
+            if (info.count != 2) continue;
+            if (info.cid[0] != info.cid[1]) continue;
+            ext_end ea{0, kv.first, info.side[0], info.fwd[0]};
+            ext_end eb{0, kv.first, info.side[1], info.fwd[1]};
+            if (!ext_pair_compatible(ea, eb)) continue;
+            joinable.insert(kv.first);
+        }
     }
 
     for (uint64_t i = 0; i < n; ++i) {
@@ -593,9 +634,9 @@ inline void stitch_unitigs_extmem(Source& frag, uint32_t k, Sink&& sink,
                                   std::atomic<uint64_t>* done = nullptr) {
     if (num_buckets == 0) num_buckets = 256;
     detail::round_store_mem store(num_buckets);
-    detail::branch_set_t branch;
-    detail::ext_seed_round0(frag, k, store, sink, branch, done);
-    detail::ext_run_rounds(store, k, num_buckets, branch, sink, done);
+    detail::joinable_set_t joinable;
+    detail::ext_seed_round0(frag, k, store, sink, joinable, done);
+    detail::ext_run_rounds(store, k, num_buckets, joinable, sink, done);
 }
 
 // External-memory stitch with FILE-backed round storage. Peak RAM is one
@@ -608,9 +649,9 @@ inline void stitch_unitigs_extmem_file(Source& frag, uint32_t k, std::string con
                                        std::atomic<uint64_t>* done = nullptr) {
     if (num_buckets == 0) num_buckets = 1024;
     detail::round_store_file store(tmp_dir, num_buckets);
-    detail::branch_set_t branch;
-    detail::ext_seed_round0(frag, k, store, sink, branch, done);
-    detail::ext_run_rounds(store, k, num_buckets, branch, sink, done);
+    detail::joinable_set_t joinable;
+    detail::ext_seed_round0(frag, k, store, sink, joinable, done);
+    detail::ext_run_rounds(store, k, num_buckets, joinable, sink, done);
 }
 
 }  // namespace cdgb
