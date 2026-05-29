@@ -95,7 +95,7 @@ constexpr uint8_t SIDE_LEFT = 0;
 constexpr uint8_t SIDE_RIGHT = 1;
 
 struct end_ref {
-    uint32_t unitig_idx;
+    uint64_t unitig_idx;
     uint8_t side;
     bool is_canonical_fwd;
 };
@@ -124,29 +124,39 @@ inline kmer_int_t side_junction_canonical(std::string_view seq, uint32_t k, uint
     return rc;
 }
 
-// Adjacency is stored as one uint64_t per fragment, two packed
-// 32-bit "link" values (low 32 = LEFT, high 32 = RIGHT). Each link
-// is (other_idx << 1) | other_side; the all-ones sentinel
-// LINK_NONE = UINT32_MAX means "no link on this side". 8 bytes per
-// fragment vs 16 for the previous std::array<{u32,u8}, 2> layout
-// (which paid an 8-byte padding cost) -- saves ~213 MB on a 26.6 M
-// fragment workload.
-inline constexpr uint32_t LINK_NONE = UINT32_MAX;
+// Adjacency is stored as two 64-bit "link" values per fragment (one
+// per side) in an adj_entry. Each link is (other_idx << 1) |
+// other_side; the all-ones sentinel LINK_NONE = UINT64_MAX means "no
+// link on this side". 16 bytes per fragment.
+//
+// 64-bit indices are mandatory: fragment counts exceed 2^32 on large
+// collections (e.g. the Blackwell 661k pangenome emits ~5.7e9
+// fragments). The previous layout packed two 32-bit links into one
+// uint64_t (8 B/fragment) and silently overflowed past 4.29e9
+// fragments. The 8 B saving is not worth the correctness ceiling;
+// the external-memory stitch redesign removes the per-fragment
+// in-RAM array entirely anyway.
+inline constexpr uint64_t LINK_NONE = UINT64_MAX;
 
-inline uint32_t pack_link(uint32_t other, uint8_t other_side) {
+inline uint64_t pack_link(uint64_t other, uint8_t other_side) {
     return (other << 1) | (other_side & 1u);
 }
-inline uint32_t link_other(uint32_t packed) { return packed >> 1; }
-inline uint8_t link_side(uint32_t packed) { return (uint8_t)(packed & 1u); }
+inline uint64_t link_other(uint64_t packed) { return packed >> 1; }
+inline uint8_t link_side(uint64_t packed) { return (uint8_t)(packed & 1u); }
 
-inline uint32_t adj_get(uint64_t e, uint8_t side) {
-    return side == SIDE_LEFT ? (uint32_t)e : (uint32_t)(e >> 32);
+struct adj_entry {
+    uint64_t left = LINK_NONE;
+    uint64_t right = LINK_NONE;
+};
+
+inline uint64_t adj_get(adj_entry const& e, uint8_t side) {
+    return side == SIDE_LEFT ? e.left : e.right;
 }
-inline void adj_set(uint64_t& e, uint8_t side, uint32_t packed) {
+inline void adj_set(adj_entry& e, uint8_t side, uint64_t packed) {
     if (side == SIDE_LEFT)
-        e = (e & 0xFFFFFFFF00000000ULL) | (uint64_t)packed;
+        e.left = packed;
     else
-        e = (e & 0x00000000FFFFFFFFULL) | ((uint64_t)packed << 32);
+        e.right = packed;
 }
 
 }  // namespace detail
@@ -174,6 +184,7 @@ inline void stitch_unitigs_streaming(Source& frag, uint32_t k, Sink&& sink,
     using detail::SIDE_RIGHT;
     using detail::end_ref;
     using detail::junction_ends;
+    using detail::adj_entry;
     using detail::LINK_NONE;
     using detail::adj_get;
     using detail::adj_set;
@@ -181,8 +192,10 @@ inline void stitch_unitigs_streaming(Source& frag, uint32_t k, Sink&& sink,
     using detail::link_other;
     using detail::link_side;
 
+    const uint64_t n_frags = (uint64_t)frag.size();
+
     if (k < 2) {
-        for (size_t i = 0; i < frag.size(); ++i) {
+        for (uint64_t i = 0; i < n_frags; ++i) {
             if (done) done->fetch_add(1, std::memory_order_relaxed);
             stitchable_unitig u;
             u.cid = frag.cid(i);
@@ -195,9 +208,20 @@ inline void stitch_unitigs_streaming(Source& frag, uint32_t k, Sink&& sink,
     }
 
     // 1) Index every open end by its canonical (k-1)-mer junction.
-    std::cerr << "[stitch] indexing " << frag.size() << " fragments...\n";
-    ankerl::unordered_dense::map<kmer_int_t, junction_ends, kmer_hasher> by_junction;
-    by_junction.reserve(frag.size() * 2);
+    //
+    // The map uses bucket_type::big so its internal value-index is
+    // 64-bit -- the default (standard) bucket caps at 2^32 entries,
+    // which overflows on large collections (billions of open-end
+    // junctions). NOTE: this whole in-RAM map is the structure the
+    // external-memory stitch redesign replaces; it does not fit for
+    // multi-billion-fragment inputs regardless of the index width.
+    std::cerr << "[stitch] indexing " << n_frags << " fragments...\n";
+    using junction_map_t =
+        ankerl::unordered_dense::map<kmer_int_t, junction_ends, kmer_hasher,
+                                     std::equal_to<kmer_int_t>,
+                                     std::allocator<std::pair<kmer_int_t, junction_ends>>,
+                                     ankerl::unordered_dense::bucket_type::big>;
+    junction_map_t by_junction;
     auto add_end = [&](kmer_int_t key, end_ref ref) {
         auto& je = by_junction[key];
         if (je.count == 0)
@@ -208,7 +232,7 @@ inline void stitch_unitigs_streaming(Source& frag, uint32_t k, Sink&& sink,
         // step below sees the overflow.
         if (je.count < 3) ++je.count;
     };
-    for (uint32_t i = 0; i < (uint32_t)frag.size(); ++i) {
+    for (uint64_t i = 0; i < n_frags; ++i) {
         std::string_view sv = frag.seq_view(i);
         if (sv.size() < k) continue;
         const uint8_t flags = frag.open_flags(i);
@@ -224,12 +248,11 @@ inline void stitch_unitigs_streaming(Source& frag, uint32_t k, Sink&& sink,
         }
     }
 
-    // 2) Build adjacency. adj[u] is a uint64_t holding two packed
-    //    32-bit links (low 32 bits = LEFT side, high 32 bits = RIGHT
+    // 2) Build adjacency. adj[u] holds two 64-bit links (one per
     //    side). Each link encodes (other_unitig << 1) | other_side;
-    //    LINK_NONE means "no link on that side." 8 bytes / fragment.
+    //    LINK_NONE means "no link on that side." 16 bytes / fragment.
     std::cerr << "[stitch] building adjacency over " << by_junction.size() << " junctions...\n";
-    std::vector<uint64_t> adj(frag.size(), ~uint64_t(0));
+    std::vector<adj_entry> adj(n_frags);
 
     auto pair_compatible = [](end_ref const& a, end_ref const& b) {
         // (R,L) or (L,R) with same is_canonical_fwd, OR same side with
@@ -254,25 +277,25 @@ inline void stitch_unitigs_streaming(Source& frag, uint32_t k, Sink&& sink,
     // 3) Walk chains.
     by_junction = {};  // free now; we only need adj from here on
     std::cerr << "[stitch] walking chains...\n";
-    std::vector<uint8_t> visited(frag.size(), 0);
+    std::vector<uint8_t> visited(n_frags, 0);
 
     // Always copy from source: source seq is either a vector entry's
     // string (move would invalidate it for re-access) or a mmap'd
     // region (can't be moved). Per-chain transient cost; the merged
     // seq is later moved into the sink.
-    auto take_seq = [&](uint32_t idx, bool flipped) -> std::string {
+    auto take_seq = [&](uint64_t idx, bool flipped) -> std::string {
         std::string_view sv = frag.seq_view(idx);
         std::string s(sv.data(), sv.size());
         if (flipped) s = detail::revcomp_string(s);
         return s;
     };
 
-    auto open_at_side = [&](uint32_t idx, uint8_t side_own) -> bool {
+    auto open_at_side = [&](uint64_t idx, uint8_t side_own) -> bool {
         uint8_t bit = (side_own == SIDE_LEFT) ? UNITIG_OPEN_LEFT : UNITIG_OPEN_RIGHT;
         return (frag.open_flags(idx) & bit) != 0;
     };
 
-    auto walk_chain = [&](uint32_t start_idx, bool start_flipped) {
+    auto walk_chain = [&](uint64_t start_idx, bool start_flipped) {
         stitchable_unitig merged;
         // Inherit cid; chain members have equal cids by construction (the
         // adjacency build only links pairs with matching cid).
@@ -286,18 +309,18 @@ inline void stitch_unitigs_streaming(Source& frag, uint32_t k, Sink&& sink,
         uint8_t left_side_own = start_flipped ? SIDE_RIGHT : SIDE_LEFT;
         if (open_at_side(start_idx, left_side_own)) merged.open_flags |= UNITIG_OPEN_LEFT;
 
-        uint32_t cur = start_idx;
+        uint64_t cur = start_idx;
         bool f_cur = start_flipped;
 
         for (;;) {
             // The own-frame side of cur exposed at merged-RIGHT.
             uint8_t exit_side_own = f_cur ? SIDE_LEFT : SIDE_RIGHT;
-            uint32_t lnk = adj_get(adj[cur], exit_side_own);
+            uint64_t lnk = adj_get(adj[cur], exit_side_own);
             if (lnk == LINK_NONE) {
                 if (open_at_side(cur, exit_side_own)) merged.open_flags |= UNITIG_OPEN_RIGHT;
                 break;
             }
-            uint32_t nxt = link_other(lnk);
+            uint64_t nxt = link_other(lnk);
             if (visited[nxt]) {
                 // Cycle closure: stop here. The cycle's k-mers have all
                 // already been emitted via earlier appends; we must NOT
@@ -321,19 +344,19 @@ inline void stitch_unitigs_streaming(Source& frag, uint32_t k, Sink&& sink,
     };
 
     // Pass A: start at unitigs with a free own-LEFT side.
-    for (uint32_t i = 0; i < frag.size(); ++i) {
+    for (uint64_t i = 0; i < n_frags; ++i) {
         if (visited[i]) continue;
         if (adj_get(adj[i], SIDE_LEFT) == LINK_NONE) { walk_chain(i, /*start_flipped=*/false); }
     }
     // Pass B: start at unitigs with a free own-RIGHT side (and own-LEFT
     // already linked, otherwise pass A would have caught it).
-    for (uint32_t i = 0; i < frag.size(); ++i) {
+    for (uint64_t i = 0; i < n_frags; ++i) {
         if (visited[i]) continue;
         if (adj_get(adj[i], SIDE_RIGHT) == LINK_NONE) { walk_chain(i, /*start_flipped=*/true); }
     }
     // Pass C: pure cross-bucket cycles (both sides linked but the chain
     // closes on itself).
-    for (uint32_t i = 0; i < frag.size(); ++i) {
+    for (uint64_t i = 0; i < n_frags; ++i) {
         if (visited[i]) continue;
         walk_chain(i, /*start_flipped=*/false);
     }
