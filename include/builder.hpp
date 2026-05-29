@@ -62,6 +62,7 @@
 #include "bucket_walker.hpp"
 #include "minimizer.hpp"
 #include "stitch.hpp"
+#include "stitch_extmem.hpp"
 #include "streaming_color_set_dict.hpp"
 #include "unitig_spill.hpp"
 #include "util.hpp"
@@ -240,7 +241,19 @@ struct builder {
 
                 std::atomic<uint64_t> done{0};
                 progress prog("stitch", done, frag_reader.size());
-                stitch_unitigs_streaming(frag_reader, m_cfg.k, std::ref(*uwriter_ptr), &done);
+                // External-memory iterative-doubling stitch: per-round
+                // tigs are bucketed to LZ4-framed files under tmp_dir,
+                // one bucket resident at a time, so peak RAM is bounded
+                // by the bucket count rather than the fragment count
+                // (the in-RAM stitch's by_junction + adj + visited were
+                // hundreds of GB on the 661k pangenome). num_buckets is
+                // sized so one bucket's tigs fit a share of -g; with no
+                // -g a fixed default keeps small inputs fast.
+                const uint32_t stitch_buckets =
+                    pick_stitch_bucket_count_(total_frag_seq_bytes, m_cfg.max_ram_gb);
+                std::cout << "  stitch buckets: " << stitch_buckets << "\n";
+                stitch_unitigs_extmem_file(frag_reader, m_cfg.k, tmp_dir,
+                                           std::ref(*uwriter_ptr), stitch_buckets, &done);
                 prog.stop();
                 std::cout << "  unitigs after stitching: " << uwriter_ptr->total_unitigs() << "\n";
                 // frag_reader destroyed here -- mmap unmapped, index freed.
@@ -621,6 +634,31 @@ private:
         if (k > MAX_K) k = MAX_K;
         if (k > num_color_classes) k = num_color_classes;
         return (uint32_t)k;
+    }
+
+    // Pick the hash fan-out for the external-memory stitch. Peak RAM is
+    // ~one round-bucket's tigs at a time, so we want each bucket to hold
+    // at most a share of -g worth of (sequence + per-tig overhead)
+    // bytes. More buckets -> smaller per-bucket resident set but more
+    // round files; fewer buckets -> larger resident set. With no -g a
+    // fixed default keeps small inputs in a handful of rounds.
+    static uint32_t pick_stitch_bucket_count_(uint64_t total_frag_seq_bytes, double max_ram_gb) {
+        constexpr uint32_t MIN_BUCKETS = 64;
+        constexpr uint32_t MAX_BUCKETS = 1u << 20;  // 1M files cap
+        constexpr uint32_t DEFAULT_BUCKETS = 1024;
+        constexpr double OVERHEAD = 3.0;  // tig record + decode vector + maps
+        constexpr double SHARE = 0.50;    // stitch's share of -g per resident bucket
+
+        if (max_ram_gb <= 0 || total_frag_seq_bytes == 0) return DEFAULT_BUCKETS;
+        const uint64_t per_bucket_budget =
+            (uint64_t)(max_ram_gb * 1024.0 * 1024.0 * 1024.0 * SHARE);
+        if (per_bucket_budget == 0) return DEFAULT_BUCKETS;
+        const uint64_t needed = (uint64_t)((double)total_frag_seq_bytes * OVERHEAD);
+        // Round up to a count where needed/count <= per_bucket_budget.
+        uint64_t count = (needed + per_bucket_budget - 1) / per_bucket_budget;
+        if (count < MIN_BUCKETS) count = MIN_BUCKETS;
+        if (count > MAX_BUCKETS) count = MAX_BUCKETS;
+        return (uint32_t)count;
     }
 
     // FASTA emit. Hand-rolled 1 MiB buffer + std::to_chars for the
