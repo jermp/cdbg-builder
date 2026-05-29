@@ -91,5 +91,11 @@ add_executable(cdgb-build src/main.cpp)
 target_link_libraries(cdgb-build PRIVATE Threads::Threads lz4_static libdeflate_static)
 target_include_directories(cdgb-build PRIVATE ${LIBDEFLATE_DIR})
 
+# Per-phase correctness / scaling tests on synthetic data.
+option(CDGB_BUILD_TESTS "Build the per-phase test executables" ON)
+if(CDGB_BUILD_TESTS)
+    add_subdirectory(test)
+endif()
+
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "C++ flags: ${CMAKE_CXX_FLAGS}")

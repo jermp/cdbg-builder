@@ -1,0 +1,159 @@
+// Correctness + scaling test for the stitch phase.
+//
+// Oracle (generate-by-construction): build K random "true" unitigs,
+// each with a distinct color-class id. Split each into overlapping
+// fragments (overlap k-1; internal boundaries OPEN, endpoints CLOSED),
+// randomly reverse-complement individual fragments, shuffle them all,
+// and feed them to stitch. A correct stitch must reconstruct exactly
+// the K true unitigs (modulo orientation), each with its original cid
+// and both ends closed.
+//
+// Distinct cids guarantee no cross-unitig gluing. Junction (k-1)-mers
+// are random 30-mers, so collisions between distinct unitigs are
+// astronomically unlikely (~n^2 / 4^30) and don't occur in practice
+// for the sizes here.
+//
+// Exit code 0 = all pass; non-zero = at least one failure.
+
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <map>
+#include <random>
+#include <string>
+#include <vector>
+
+#include "gen.hpp"
+#include "stitch.hpp"
+
+using cdgb::stitchable_unitig;
+using cdgb_test::canonical;
+using cdgb_test::random_dna;
+using cdgb_test::split_unitig;
+
+namespace {
+
+// (canonical-seq, cid) multiset, as a map<key,count>.
+using multiset_t = std::map<std::pair<std::string, uint32_t>, uint64_t>;
+
+multiset_t to_multiset(std::vector<stitchable_unitig> const& v) {
+    multiset_t m;
+    for (auto const& u : v) ++m[{canonical(u.seq), u.cid}];
+    return m;
+}
+
+// Run one randomized correctness case. Returns true on pass.
+bool run_case(uint32_t seed, uint32_t k, uint32_t num_unitigs, uint32_t max_len,
+              uint32_t max_frags) {
+    std::mt19937_64 rng(seed);
+
+    std::vector<stitchable_unitig> truth;  // the K true unitigs (closed both ends)
+    std::vector<stitchable_unitig> frags;  // shuffled fragments fed to stitch
+    truth.reserve(num_unitigs);
+
+    for (uint32_t u = 0; u < num_unitigs; ++u) {
+        const size_t len = k + (rng() % (max_len - k + 1));
+        std::string S = random_dna(len, rng);
+        const uint32_t cid = u;  // distinct -> no cross-unitig gluing
+        const uint32_t nf = 1 + (uint32_t)(rng() % max_frags);
+        auto parts = split_unitig(S, k, cid, nf, rng);
+        for (auto& p : parts) frags.push_back(std::move(p));
+
+        stitchable_unitig t;
+        t.seq = std::move(S);
+        t.cid = cid;
+        t.open_flags = 0;
+        truth.push_back(std::move(t));
+    }
+
+    std::shuffle(frags.begin(), frags.end(), rng);
+
+    std::vector<stitchable_unitig> out;
+    cdgb::stitch_unitigs(frags, k, out);
+
+    // 1) Multiset of (canonical seq, cid) must match the truth exactly.
+    multiset_t want = to_multiset(truth);
+    multiset_t got = to_multiset(out);
+    bool ok = (want == got);
+
+    // 2) Every reconstructed unitig should be fully closed (both true
+    //    endpoints were closed).
+    uint64_t open_outputs = 0;
+    for (auto const& o : out)
+        if (o.open_flags != 0) ++open_outputs;
+
+    if (!ok || open_outputs != 0) {
+        std::fprintf(stderr,
+                     "[FAIL] seed=%u k=%u unitigs=%u: want %zu distinct, got %zu distinct, "
+                     "out_count=%zu open_outputs=%llu\n",
+                     seed, k, num_unitigs, want.size(), got.size(), out.size(),
+                     (unsigned long long)open_outputs);
+        return false;
+    }
+    return true;
+}
+
+// Larger case: report timing + fragment/unitig counts, plus the same
+// correctness check. Single-thread in-RAM stitch; this is the baseline
+// the external-memory redesign must match.
+bool run_scale(uint32_t seed, uint32_t k, uint32_t num_unitigs) {
+    std::mt19937_64 rng(seed);
+    std::vector<stitchable_unitig> truth;
+    std::vector<stitchable_unitig> frags;
+    for (uint32_t u = 0; u < num_unitigs; ++u) {
+        const size_t len = k + (rng() % 2000);
+        std::string S = random_dna(len, rng);
+        auto parts = split_unitig(S, k, u, 1 + (uint32_t)(rng() % 16), rng);
+        for (auto& p : parts) frags.push_back(std::move(p));
+        stitchable_unitig t;
+        t.seq = std::move(S);
+        t.cid = u;
+        truth.push_back(std::move(t));
+    }
+    std::shuffle(frags.begin(), frags.end(), rng);
+    const size_t n_frags = frags.size();
+
+    auto t0 = std::chrono::steady_clock::now();
+    std::vector<stitchable_unitig> out;
+    cdgb::stitch_unitigs(frags, k, out);
+    auto t1 = std::chrono::steady_clock::now();
+    double ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+
+    bool ok = (to_multiset(truth) == to_multiset(out));
+    std::fprintf(stderr,
+                 "[scale] unitigs=%u frags=%zu out=%zu time=%.0fms %s\n", num_unitigs,
+                 n_frags, out.size(), ms, ok ? "OK" : "MISMATCH");
+    return ok;
+}
+
+}  // namespace
+
+int main() {
+    const uint32_t k = 31;
+    int failures = 0;
+
+    // 50 randomized correctness cases, varied sizes.
+    for (uint32_t seed = 1; seed <= 50; ++seed) {
+        std::mt19937_64 meta(seed * 2654435761u);
+        const uint32_t num_unitigs = 1 + (uint32_t)(meta() % 300);
+        const uint32_t max_len = 40 + (uint32_t)(meta() % 800);
+        const uint32_t max_frags = 1 + (uint32_t)(meta() % 12);
+        if (!run_case(seed, k, num_unitigs, max_len, max_frags)) ++failures;
+    }
+
+    // A couple of fixed edge cases.
+    if (!run_case(1001, k, 1, k, 1)) ++failures;       // single k-length unitig, 1 frag
+    if (!run_case(1002, k, 1, k + 5, 6)) ++failures;   // 1 unitig, many frags
+    if (!run_case(1003, k, 500, 60, 10)) ++failures;   // many short unitigs
+
+    // Medium scale (correctness + timing).
+    if (!run_scale(9001, k, 50000)) ++failures;
+
+    if (failures == 0) {
+        std::fprintf(stderr, "[test_stitch] ALL PASS\n");
+        return 0;
+    }
+    std::fprintf(stderr, "[test_stitch] %d FAILURE(S)\n", failures);
+    return 1;
+}
