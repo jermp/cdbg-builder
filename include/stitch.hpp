@@ -169,7 +169,7 @@ inline void adj_set(adj_entry& e, uint8_t side, uint64_t packed) {
 //
 // `Source` is a generic frag accessor with the interface:
 //   size_t size() const
-//   uint32_t cid(size_t i) const
+//   uint64_t cid(size_t i) const
 //   uint8_t  open_flags(size_t i) const
 //   std::string_view seq_view(size_t i) const
 //
@@ -370,7 +370,7 @@ struct vector_frag_source {
     std::vector<stitchable_unitig> const& v;
     explicit vector_frag_source(std::vector<stitchable_unitig> const& vec) : v(vec) {}
     size_t size() const { return v.size(); }
-    uint32_t cid(size_t i) const { return v[i].cid; }
+    uint64_t cid(size_t i) const { return v[i].cid; }
     uint8_t open_flags(size_t i) const { return v[i].open_flags; }
     std::string_view seq_view(size_t i) const {
         return std::string_view(v[i].seq.data(), v[i].seq.size());

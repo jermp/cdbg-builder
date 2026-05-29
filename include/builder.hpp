@@ -666,7 +666,7 @@ private:
 
         bits::bit_vector::builder u2c_bvb((uint64_t)m_num_unitigs, /*init=*/false);
         size_t emitted = 0;
-        uint32_t prev_cid = 0;
+        uint64_t prev_cid = 0;
 
         std::vector<unitig_bucket_writer::record> records;
         for (uint32_t b = 0; b < uwriter.num_buckets(); ++b) {
@@ -685,9 +685,9 @@ private:
                 prev_cid = r.cid;
                 ++emitted;
 
-                reserve(12);
+                reserve(22);  // '>' + up to 20 digits (uint64_t) + '\n'
                 buf[pos++] = '>';
-                auto rr = std::to_chars(buf.data() + pos, buf.data() + pos + 11, r.cid);
+                auto rr = std::to_chars(buf.data() + pos, buf.data() + pos + 20, r.cid);
                 pos = (size_t)(rr.ptr - buf.data());
                 buf[pos++] = '\n';
                 size_t s_pos = 0;
