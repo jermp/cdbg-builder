@@ -67,6 +67,14 @@ namespace cdgb {
 
 namespace detail {
 
+// Set of (k-1) junctions that are dBG BRANCHES (3+ open ends share
+// them). Joins at these are forbidden. Computed once over all initial
+// fragments; the count is invariant under merging (see ext_seed_round0).
+// NOTE: in-RAM for now -- this is the one remaining unbounded structure
+// in the otherwise external-memory stitch; bucketing it to disk is a
+// documented follow-up. Correctness first.
+using branch_set_t = ankerl::unordered_dense::set<kmer_int_t, kmer_hasher>;
+
 // A tig in the doubling loop. `rng` is a per-tig random state used to
 // pick which open end to present when both are open. It MUST vary
 // between tigs (we seed it from sequence content) so two both-open tigs
@@ -393,7 +401,8 @@ inline bool ext_route(ext_tig&& t, uint32_t k, Store& store, uint64_t& joined_co
 // circular unitigs. Works for both round_store_mem and
 // round_store_file (same emit / take_input_bucket / advance interface).
 template <typename Store, typename Sink>
-inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&& sink,
+inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets,
+                           branch_set_t const& branch, Sink&& sink,
                            std::atomic<uint64_t>* done) {
     for (;;) {
         uint64_t joined_this_round = 0;
@@ -435,7 +444,12 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
             for (uint64_t i = 0; i < NT; ++i) {
                 if (consumed[i] || !has_end[i]) continue;
                 kmer_int_t j = ends[i].junction;
-                if (jcount[j] != 2) continue;  // branch or singleton
+                if (jcount[j] != 2) continue;  // <2 present this round; wait
+                // GLOBAL branch gate: never join at a junction that has
+                // 3+ open ends across all fragments, even if only 2 are
+                // present this round. This is what the per-round jcount
+                // alone cannot see.
+                if (branch.find(j) != branch.end()) continue;
                 uint64_t first = jfirst[j];
                 if (first == i) continue;  // wait for the partner to drive the join
                 uint64_t a_idx = first, b_idx = i;
@@ -507,8 +521,44 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
 // closed fragments. Shared by the in-RAM and file-backed entry points.
 template <typename Source, typename Store, typename Sink>
 inline void ext_seed_round0(Source& frag, uint32_t k, Store& store, Sink&& sink,
-                            std::atomic<uint64_t>* done) {
+                            branch_set_t& branch, std::atomic<uint64_t>* done) {
     const uint64_t n = (uint64_t)frag.size();
+
+    // Branch detection: a (k-1) junction is a dBG BRANCH if 3+ fragment
+    // open ends share it (e.g. a predecessor's right + two successors'
+    // lefts). Such a junction must NEVER be joined -- doing so creates a
+    // unitig with an internal branch point. GGCAT gets this for free by
+    // keying on the full boundary k-mer (a branch's distinct k-mers land
+    // in different buckets); we key on the (k-1) junction so we must
+    // detect branches explicitly, exactly like the in-RAM stitch's
+    // count!=2 gate.
+    //
+    // The count is GLOBAL and computed once: merging tigs only removes
+    // the two joined ends (outer ends keep their original junctions), so
+    // a junction's open-end count never increases across rounds. A
+    // per-round count would undercount (both-open tigs present one
+    // randomized end per round) and let a 3-end branch transiently look
+    // like a joinable 2-end junction -- the false-join bug this fixes.
+    {
+        ankerl::unordered_dense::map<kmer_int_t, uint8_t, kmer_hasher> jcount;
+        for (uint64_t i = 0; i < n; ++i) {
+            uint8_t fl = frag.open_flags(i);
+            if (fl == 0) continue;
+            std::string_view sv = frag.seq_view(i);
+            if ((uint32_t)sv.size() < k) continue;
+            for (uint8_t side : {SIDE_LEFT, SIDE_RIGHT}) {
+                uint8_t bit = (side == SIDE_LEFT) ? UNITIG_OPEN_LEFT : UNITIG_OPEN_RIGHT;
+                if (!(fl & bit)) continue;
+                bool fwd;
+                kmer_int_t j = side_junction_canonical(sv, k, side, fwd);
+                uint8_t& c = jcount[j];
+                if (c < 3) ++c;
+            }
+        }
+        for (auto const& kv : jcount)
+            if (kv.second >= 3) branch.insert(kv.first);
+    }
+
     for (uint64_t i = 0; i < n; ++i) {
         ext_tig t;
         t.cid = frag.cid(i);
@@ -543,8 +593,9 @@ inline void stitch_unitigs_extmem(Source& frag, uint32_t k, Sink&& sink,
                                   std::atomic<uint64_t>* done = nullptr) {
     if (num_buckets == 0) num_buckets = 256;
     detail::round_store_mem store(num_buckets);
-    detail::ext_seed_round0(frag, k, store, sink, done);
-    detail::ext_run_rounds(store, k, num_buckets, sink, done);
+    detail::branch_set_t branch;
+    detail::ext_seed_round0(frag, k, store, sink, branch, done);
+    detail::ext_run_rounds(store, k, num_buckets, branch, sink, done);
 }
 
 // External-memory stitch with FILE-backed round storage. Peak RAM is one
@@ -557,8 +608,9 @@ inline void stitch_unitigs_extmem_file(Source& frag, uint32_t k, std::string con
                                        std::atomic<uint64_t>* done = nullptr) {
     if (num_buckets == 0) num_buckets = 1024;
     detail::round_store_file store(tmp_dir, num_buckets);
-    detail::ext_seed_round0(frag, k, store, sink, done);
-    detail::ext_run_rounds(store, k, num_buckets, sink, done);
+    detail::branch_set_t branch;
+    detail::ext_seed_round0(frag, k, store, sink, branch, done);
+    detail::ext_run_rounds(store, k, num_buckets, branch, sink, done);
 }
 
 }  // namespace cdgb
