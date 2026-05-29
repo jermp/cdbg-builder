@@ -1,0 +1,12 @@
+[submodule "external/bits"]
+	path = external/bits
+	url = https://github.com/jermp/bits
+[submodule "external/cmd_line_parser"]
+	path = external/cmd_line_parser
+	url = https://github.com/jermp/cmd_line_parser
+[submodule "external/lz4"]
+	path = external/lz4
+	url = https://github.com/lz4/lz4.git
+[submodule "external/libdeflate"]
+	path = external/libdeflate
+	url = https://github.com/ebiggers/libdeflate.git
