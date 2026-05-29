@@ -26,6 +26,7 @@
 
 #include "gen.hpp"
 #include "stitch.hpp"
+#include "stitch_extmem.hpp"
 
 using cdgb::stitchable_unitig;
 using cdgb_test::canonical;
@@ -43,9 +44,26 @@ multiset_t to_multiset(std::vector<stitchable_unitig> const& v) {
     return m;
 }
 
-// Run one randomized correctness case. Returns true on pass.
-bool run_case(uint64_t seed, uint32_t k, uint64_t num_unitigs, uint64_t max_len,
-              uint64_t max_frags) {
+enum class which_stitch { in_ram, ext_mem };
+
+// Run the selected stitch implementation on `frags`, collecting output.
+void run_stitch(which_stitch w, std::vector<stitchable_unitig>& frags, uint32_t k,
+                std::vector<stitchable_unitig>& out) {
+    out.clear();
+    if (w == which_stitch::in_ram) {
+        cdgb::stitch_unitigs(frags, k, out);
+    } else {
+        auto sink = [&](stitchable_unitig&& u) { out.push_back(std::move(u)); };
+        cdgb::vector_frag_source src(frags);
+        // Small bucket count exercises multi-round doubling on tiny
+        // inputs; 0 would pick the production default.
+        cdgb::stitch_unitigs_extmem(src, k, sink, /*num_buckets=*/16);
+    }
+}
+
+// Run one randomized correctness case against the chosen stitcher.
+bool run_case_impl(which_stitch w, uint64_t seed, uint32_t k, uint64_t num_unitigs,
+                   uint64_t max_len, uint64_t max_frags) {
     std::mt19937_64 rng(seed);
 
     std::vector<stitchable_unitig> truth;  // the K true unitigs (closed both ends)
@@ -70,7 +88,7 @@ bool run_case(uint64_t seed, uint32_t k, uint64_t num_unitigs, uint64_t max_len,
     std::shuffle(frags.begin(), frags.end(), rng);
 
     std::vector<stitchable_unitig> out;
-    cdgb::stitch_unitigs(frags, k, out);
+    run_stitch(w, frags, k, out);
 
     // 1) Multiset of (canonical seq, cid) must match the truth exactly.
     multiset_t want = to_multiset(truth);
@@ -85,13 +103,22 @@ bool run_case(uint64_t seed, uint32_t k, uint64_t num_unitigs, uint64_t max_len,
 
     if (!ok || open_outputs != 0) {
         std::fprintf(stderr,
-                     "[FAIL] seed=%llu k=%u unitigs=%llu: want %zu distinct, got %zu distinct, "
-                     "out_count=%zu open_outputs=%llu\n",
+                     "[FAIL %s] seed=%llu k=%u unitigs=%llu: want %zu distinct, got %zu "
+                     "distinct, out_count=%zu open_outputs=%llu\n",
+                     w == which_stitch::in_ram ? "in_ram" : "ext_mem",
                      (unsigned long long)seed, k, (unsigned long long)num_unitigs, want.size(),
                      got.size(), out.size(), (unsigned long long)open_outputs);
         return false;
     }
     return true;
+}
+
+// Run a case against BOTH stitchers.
+bool run_case(uint64_t seed, uint32_t k, uint64_t num_unitigs, uint64_t max_len,
+              uint64_t max_frags) {
+    bool a = run_case_impl(which_stitch::in_ram, seed, k, num_unitigs, max_len, max_frags);
+    bool b = run_case_impl(which_stitch::ext_mem, seed, k, num_unitigs, max_len, max_frags);
+    return a && b;
 }
 
 // Larger case: report timing + fragment/unitig counts, plus the same
@@ -113,17 +140,22 @@ bool run_scale(uint64_t seed, uint32_t k, uint64_t num_unitigs) {
     }
     std::shuffle(frags.begin(), frags.end(), rng);
     const uint64_t n_frags = frags.size();
+    const multiset_t want = to_multiset(truth);
 
-    auto t0 = std::chrono::steady_clock::now();
     std::vector<stitchable_unitig> out;
-    cdgb::stitch_unitigs(frags, k, out);
-    auto t1 = std::chrono::steady_clock::now();
-    double ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-
-    bool ok = (to_multiset(truth) == to_multiset(out));
-    std::fprintf(stderr, "[scale] unitigs=%llu frags=%llu out=%zu time=%.0fms %s\n",
-                 (unsigned long long)num_unitigs, (unsigned long long)n_frags, out.size(), ms,
-                 ok ? "OK" : "MISMATCH");
+    bool ok = true;
+    for (which_stitch w : {which_stitch::in_ram, which_stitch::ext_mem}) {
+        auto t0 = std::chrono::steady_clock::now();
+        run_stitch(w, frags, k, out);
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+        bool this_ok = (want == to_multiset(out));
+        ok = ok && this_ok;
+        std::fprintf(stderr, "[scale %s] unitigs=%llu frags=%llu out=%zu time=%.0fms %s\n",
+                     w == which_stitch::in_ram ? "in_ram" : "ext_mem",
+                     (unsigned long long)num_unitigs, (unsigned long long)n_frags, out.size(),
+                     ms, this_ok ? "OK" : "MISMATCH");
+    }
     return ok;
 }
 
