@@ -48,10 +48,15 @@
 
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
+#include <lz4.h>
 #include <unordered_dense/unordered_dense.h>
 
 #include "bucket_walker.hpp"  // stitchable_unitig, UNITIG_OPEN_*
@@ -182,7 +187,14 @@ struct round_store_mem {
 
     void emit(uint32_t b, ext_tig&& t) { m_out[b].push_back(std::move(t)); }
 
-    std::vector<ext_tig>& input_bucket(uint32_t b) { return m_in[b]; }
+    // Move and return input bucket b (caller consumes it; storage is
+    // freed). Matches the file store's take-by-value semantics so the
+    // driver is store-agnostic.
+    std::vector<ext_tig> take_input_bucket(uint32_t b) {
+        std::vector<ext_tig> v = std::move(m_in[b]);
+        m_in[b].clear();
+        return v;
+    }
 
     // Move this round's output to be the next round's input.
     void advance() {
@@ -190,16 +202,174 @@ struct round_store_mem {
         for (auto& v : m_out) v.clear();
     }
 
-    bool output_empty() const {
-        for (auto const& v : m_out)
-            if (!v.empty()) return false;
-        return true;
-    }
-
 private:
     std::vector<std::vector<ext_tig>> m_in;
     std::vector<std::vector<ext_tig>> m_out;
     uint32_t m_num_buckets;
+};
+
+// ext_tig (de)serialization for the file-backed round store. Layout:
+//   [u64 cid][u8 open_flags][u64 rng][u32 seq_len][seq_len bytes ACGT]
+inline void ext_tig_serialize(ext_tig const& t, std::vector<uint8_t>& out) {
+    auto put = [&](void const* p, size_t n) {
+        uint8_t const* b = (uint8_t const*)p;
+        out.insert(out.end(), b, b + n);
+    };
+    put(&t.cid, sizeof(t.cid));
+    put(&t.open_flags, sizeof(t.open_flags));
+    put(&t.rng, sizeof(t.rng));
+    uint32_t len = (uint32_t)t.seq.size();
+    put(&len, sizeof(len));
+    put(t.seq.data(), len);
+}
+
+// Returns bytes consumed, 0 on malformed/EOF.
+inline size_t ext_tig_deserialize(uint8_t const* buf, size_t buf_len, ext_tig& t) {
+    constexpr size_t HDR = sizeof(uint64_t) + 1 + sizeof(uint64_t) + sizeof(uint32_t);
+    if (buf_len < HDR) return 0;
+    size_t p = 0;
+    std::memcpy(&t.cid, buf + p, sizeof(t.cid));
+    p += sizeof(t.cid);
+    t.open_flags = buf[p];
+    p += 1;
+    std::memcpy(&t.rng, buf + p, sizeof(t.rng));
+    p += sizeof(t.rng);
+    uint32_t len;
+    std::memcpy(&len, buf + p, sizeof(len));
+    p += sizeof(len);
+    if (buf_len < p + len) return 0;
+    t.seq.assign((char const*)buf + p, len);
+    p += len;
+    return p;
+}
+
+// File-backed round store: one LZ4-framed file per bucket per round.
+// emit() appends to per-bucket write batches (flushed as frames at a
+// size threshold). take_input_bucket() decodes one bucket's file fully
+// into a vector, then deletes it -- so peak RAM is ONE bucket's tigs
+// plus the per-bucket write batches, not the whole round. Frame format
+// matches bucket_io.hpp: [u32 uncompressed][u32 compressed][bytes],
+// terminated by [u32 0].
+class round_store_file {
+public:
+    round_store_file(std::string dir, uint32_t num_buckets)
+        : m_dir(std::move(dir)), m_num_buckets(num_buckets), m_batch(num_buckets),
+          m_files(num_buckets, nullptr) {
+        open_round_files(/*round=*/0);
+    }
+
+    ~round_store_file() {
+        for (auto* f : m_files)
+            if (f) std::fclose(f);
+    }
+
+    round_store_file(round_store_file const&) = delete;
+    round_store_file& operator=(round_store_file const&) = delete;
+
+    uint32_t num_buckets() const { return m_num_buckets; }
+
+    void emit(uint32_t b, ext_tig&& t) {
+        ext_tig_serialize(t, m_batch[b]);
+        if (m_batch[b].size() >= FRAME_BUDGET) flush_frame(b, /*output=*/true);
+    }
+
+    // Decode input bucket b fully into a vector; delete its file.
+    std::vector<ext_tig> take_input_bucket(uint32_t b) {
+        std::vector<ext_tig> out;
+        std::string path = bucket_path(m_in_round, b);
+        std::FILE* f = std::fopen(path.c_str(), "rb");
+        if (!f) return out;  // empty bucket: no file was created
+        std::vector<uint8_t> comp, raw;
+        for (;;) {
+            uint32_t u = 0;
+            if (std::fread(&u, sizeof(u), 1, f) != 1) break;
+            if (u == 0) break;
+            uint32_t c = 0;
+            if (std::fread(&c, sizeof(c), 1, f) != 1) break;
+            if (comp.size() < c) comp.resize(c);
+            if (std::fread(comp.data(), 1, c, f) != c) break;
+            size_t base = raw.size();
+            raw.resize(base + u);
+            int decoded = LZ4_decompress_safe((char const*)comp.data(), (char*)raw.data() + base,
+                                              (int)c, (int)u);
+            if (decoded < 0 || (uint32_t)decoded != u)
+                throw std::runtime_error("ext-stitch round bucket LZ4 decode failed: " + path);
+        }
+        std::fclose(f);
+        std::remove(path.c_str());
+        size_t pos = 0;
+        while (pos < raw.size()) {
+            ext_tig t;
+            size_t got = ext_tig_deserialize(raw.data() + pos, raw.size() - pos, t);
+            if (got == 0) break;
+            pos += got;
+            out.push_back(std::move(t));
+        }
+        return out;
+    }
+
+    // Finish the output round (flush + EOF-mark all bucket files), then
+    // make it the next round's input and open fresh output files.
+    void advance() {
+        for (uint32_t b = 0; b < m_num_buckets; ++b) {
+            if (!m_batch[b].empty()) flush_frame(b, /*output=*/true);
+            if (m_files[b]) {
+                uint32_t eof = 0;
+                std::fwrite(&eof, sizeof(eof), 1, m_files[b]);
+                std::fclose(m_files[b]);
+                m_files[b] = nullptr;
+            }
+        }
+        m_in_round = m_out_round;
+        m_out_round = m_in_round + 1;
+        open_round_files(m_out_round);
+    }
+
+private:
+    static constexpr size_t FRAME_BUDGET = 4u * 1024 * 1024;
+
+    std::string bucket_path(uint32_t round, uint32_t b) const {
+        return m_dir + "/stitch_r" + std::to_string(round) + "_b" + std::to_string(b) + ".bin";
+    }
+
+    void open_round_files(uint32_t round) {
+        m_out_round = round;
+        for (uint32_t b = 0; b < m_num_buckets; ++b) m_files[b] = nullptr;
+        // Lazily open on first emit to avoid creating num_buckets empty
+        // files every round (most buckets are empty in late rounds).
+    }
+
+    void flush_frame(uint32_t b, bool /*output*/) {
+        auto& batch = m_batch[b];
+        if (batch.empty()) return;
+        if (!m_files[b]) {
+            std::string path = bucket_path(m_out_round, b);
+            m_files[b] = std::fopen(path.c_str(), "wb");
+            if (!m_files[b])
+                throw std::runtime_error("cannot open stitch round file: " + path + ": " +
+                                         std::strerror(errno));
+        }
+        int src = (int)batch.size();
+        int bound = LZ4_compressBound(src);
+        if (m_out.size() < (size_t)bound) m_out.resize((size_t)bound);
+        int comp = LZ4_compress_default((char const*)batch.data(), (char*)m_out.data(), src,
+                                        (int)m_out.size());
+        if (comp <= 0) throw std::runtime_error("ext-stitch LZ4 compress failed");
+        uint32_t u = (uint32_t)src, c = (uint32_t)comp;
+        std::FILE* f = m_files[b];
+        if (std::fwrite(&u, sizeof(u), 1, f) != 1 || std::fwrite(&c, sizeof(c), 1, f) != 1 ||
+            std::fwrite(m_out.data(), 1, (size_t)comp, f) != (size_t)comp)
+            throw std::runtime_error("short write to stitch round file");
+        batch.clear();
+    }
+
+    std::string m_dir;
+    uint32_t m_num_buckets;
+    std::vector<std::vector<uint8_t>> m_batch;  // per-bucket pending output bytes
+    std::vector<std::FILE*> m_files;            // per-bucket OUTPUT file handles
+    std::vector<uint8_t> m_out;                 // LZ4 scratch
+    uint32_t m_in_round = 0;
+    uint32_t m_out_round = 0;
 };
 
 // Route a tig to a round-output bucket by its chosen open end's
@@ -218,65 +388,19 @@ inline bool ext_route(ext_tig&& t, uint32_t k, Store& store, uint64_t& joined_co
     return true;
 }
 
-}  // namespace detail
-
-// External-memory stitch. Same Source/Sink interface as
-// stitch_unitigs_streaming so the test oracle and builder can call
-// either. `Source` provides size(), cid(i), open_flags(i), seq_view(i).
-// `num_buckets` controls the hash fan-out (peak RAM ~ one bucket's
-// tigs). 0 picks a default.
-template <typename Source, typename Sink>
-inline void stitch_unitigs_extmem(Source& frag, uint32_t k, Sink&& sink,
-                                  uint32_t num_buckets = 0,
-                                  std::atomic<uint64_t>* done = nullptr) {
-    using detail::ext_tig;
-    using detail::ext_end;
-    using detail::ext_choose_side;
-    using detail::ext_pair_compatible;
-    using detail::ext_join;
-    using detail::round_store_mem;
-    using detail::SIDE_LEFT;
-    using detail::SIDE_RIGHT;
-
-    const uint64_t n = (uint64_t)frag.size();
-    if (num_buckets == 0) {
-        // A few buckets per thread-ish; small but >1 so the loop is
-        // exercised. Real driver will size this from -g.
-        num_buckets = 256;
-    }
-
-    round_store_mem store(num_buckets);
-
-    // Seed round 0: every fragment is a tig. Fully-closed fragments go
-    // straight to the sink; open ones are routed to a bucket.
-    for (uint64_t i = 0; i < n; ++i) {
-        ext_tig t;
-        t.cid = frag.cid(i);
-        t.open_flags = frag.open_flags(i);
-        std::string_view sv = frag.seq_view(i);
-        t.seq.assign(sv.data(), sv.size());
-        t.rng = detail::ext_seed_from_seq(t.seq);
-        if (k < 2 || t.open_flags == 0) {
-            if (done) done->fetch_add(1, std::memory_order_relaxed);
-            stitchable_unitig u;
-            u.cid = t.cid;
-            u.open_flags = t.open_flags;
-            u.seq = std::move(t.seq);
-            sink(std::move(u));
-            continue;
-        }
-        uint64_t dummy = 0;
-        detail::ext_route(std::move(t), k, store, dummy);
-    }
-    store.advance();  // round-0 emissions become round-1 input
-
-    // Round loop.
+// Store-templated round loop. `store` is seeded (round-0 input ready);
+// runs doubling rounds until none join, sinking finished/maximal/
+// circular unitigs. Works for both round_store_mem and
+// round_store_file (same emit / take_input_bucket / advance interface).
+template <typename Store, typename Sink>
+inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&& sink,
+                           std::atomic<uint64_t>* done) {
     for (;;) {
         uint64_t joined_this_round = 0;
         uint64_t carried_this_round = 0;
 
         for (uint32_t b = 0; b < num_buckets; ++b) {
-            auto& tigs = store.input_bucket(b);
+            std::vector<ext_tig> tigs = store.take_input_bucket(b);
             if (tigs.empty()) continue;
 
             // Pass 1 (O(bucket)): compute each tig's chosen open end once
@@ -363,7 +487,7 @@ inline void stitch_unitigs_extmem(Source& frag, uint32_t k, Sink&& sink,
             // No progress: flush all survivors to the sink as-is (their
             // open ends have no partner anywhere).
             for (uint32_t b = 0; b < num_buckets; ++b) {
-                auto& tigs = store.input_bucket(b);
+                std::vector<ext_tig> tigs = store.take_input_bucket(b);
                 for (auto& t : tigs) {
                     if (done) done->fetch_add(1, std::memory_order_relaxed);
                     stitchable_unitig u;
@@ -372,12 +496,69 @@ inline void stitch_unitigs_extmem(Source& frag, uint32_t k, Sink&& sink,
                     u.seq = std::move(t.seq);
                     sink(std::move(u));
                 }
-                tigs.clear();
             }
             break;
         }
         (void)carried_this_round;
     }
+}
+
+// Seed round 0 from the fragment source into `store`, sinking already-
+// closed fragments. Shared by the in-RAM and file-backed entry points.
+template <typename Source, typename Store, typename Sink>
+inline void ext_seed_round0(Source& frag, uint32_t k, Store& store, Sink&& sink,
+                            std::atomic<uint64_t>* done) {
+    const uint64_t n = (uint64_t)frag.size();
+    for (uint64_t i = 0; i < n; ++i) {
+        ext_tig t;
+        t.cid = frag.cid(i);
+        t.open_flags = frag.open_flags(i);
+        std::string_view sv = frag.seq_view(i);
+        t.seq.assign(sv.data(), sv.size());
+        t.rng = ext_seed_from_seq(t.seq);
+        if (k < 2 || t.open_flags == 0) {
+            if (done) done->fetch_add(1, std::memory_order_relaxed);
+            stitchable_unitig u;
+            u.cid = t.cid;
+            u.open_flags = t.open_flags;
+            u.seq = std::move(t.seq);
+            sink(std::move(u));
+            continue;
+        }
+        uint64_t dummy = 0;
+        ext_route(std::move(t), k, store, dummy);
+    }
+    store.advance();  // round-0 emissions become round-1 input
+}
+
+}  // namespace detail
+
+// External-memory stitch with IN-RAM round storage. Fast; used by tests
+// and as the reference. Same Source/Sink interface as
+// stitch_unitigs_streaming. `num_buckets` controls hash fan-out; 0 picks
+// a default.
+template <typename Source, typename Sink>
+inline void stitch_unitigs_extmem(Source& frag, uint32_t k, Sink&& sink,
+                                  uint32_t num_buckets = 0,
+                                  std::atomic<uint64_t>* done = nullptr) {
+    if (num_buckets == 0) num_buckets = 256;
+    detail::round_store_mem store(num_buckets);
+    detail::ext_seed_round0(frag, k, store, sink, done);
+    detail::ext_run_rounds(store, k, num_buckets, sink, done);
+}
+
+// External-memory stitch with FILE-backed round storage. Peak RAM is one
+// bucket's tigs at a time (plus per-bucket write batches), independent
+// of fragment count. Round files live under `tmp_dir`. This is the
+// production path for inputs too large for the in-RAM stitch.
+template <typename Source, typename Sink>
+inline void stitch_unitigs_extmem_file(Source& frag, uint32_t k, std::string const& tmp_dir,
+                                       Sink&& sink, uint32_t num_buckets,
+                                       std::atomic<uint64_t>* done = nullptr) {
+    if (num_buckets == 0) num_buckets = 1024;
+    detail::round_store_file store(tmp_dir, num_buckets);
+    detail::ext_seed_round0(frag, k, store, sink, done);
+    detail::ext_run_rounds(store, k, num_buckets, sink, done);
 }
 
 }  // namespace cdgb

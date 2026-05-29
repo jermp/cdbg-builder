@@ -24,9 +24,16 @@
 #include <string>
 #include <vector>
 
+#include <filesystem>
+#include <unistd.h>
+
 #include "gen.hpp"
 #include "stitch.hpp"
 #include "stitch_extmem.hpp"
+
+namespace {
+uint64_t g_tmp_counter = 0;
+}
 
 using cdgb::stitchable_unitig;
 using cdgb_test::canonical;
@@ -44,20 +51,39 @@ multiset_t to_multiset(std::vector<stitchable_unitig> const& v) {
     return m;
 }
 
-enum class which_stitch { in_ram, ext_mem };
+enum class which_stitch { in_ram, ext_mem, ext_file };
+
+char const* stitch_name(which_stitch w) {
+    switch (w) {
+        case which_stitch::in_ram:
+            return "in_ram";
+        case which_stitch::ext_mem:
+            return "ext_mem";
+        default:
+            return "ext_file";
+    }
+}
 
 // Run the selected stitch implementation on `frags`, collecting output.
 void run_stitch(which_stitch w, std::vector<stitchable_unitig>& frags, uint32_t k,
                 std::vector<stitchable_unitig>& out) {
     out.clear();
+    auto sink = [&](stitchable_unitig&& u) { out.push_back(std::move(u)); };
     if (w == which_stitch::in_ram) {
         cdgb::stitch_unitigs(frags, k, out);
-    } else {
-        auto sink = [&](stitchable_unitig&& u) { out.push_back(std::move(u)); };
+    } else if (w == which_stitch::ext_mem) {
         cdgb::vector_frag_source src(frags);
         // Small bucket count exercises multi-round doubling on tiny
         // inputs; 0 would pick the production default.
         cdgb::stitch_unitigs_extmem(src, k, sink, /*num_buckets=*/16);
+    } else {
+        cdgb::vector_frag_source src(frags);
+        std::string dir = std::filesystem::temp_directory_path().string() +
+                          "/cdgb_stitch_test_" + std::to_string(::getpid()) + "_" +
+                          std::to_string(g_tmp_counter++);
+        std::filesystem::create_directories(dir);
+        cdgb::stitch_unitigs_extmem_file(src, k, dir, sink, /*num_buckets=*/16);
+        std::filesystem::remove_all(dir);
     }
 }
 
@@ -105,7 +131,7 @@ bool run_case_impl(which_stitch w, uint64_t seed, uint32_t k, uint64_t num_uniti
         std::fprintf(stderr,
                      "[FAIL %s] seed=%llu k=%u unitigs=%llu: want %zu distinct, got %zu "
                      "distinct, out_count=%zu open_outputs=%llu\n",
-                     w == which_stitch::in_ram ? "in_ram" : "ext_mem",
+                     stitch_name(w),
                      (unsigned long long)seed, k, (unsigned long long)num_unitigs, want.size(),
                      got.size(), out.size(), (unsigned long long)open_outputs);
         return false;
@@ -118,7 +144,8 @@ bool run_case(uint64_t seed, uint32_t k, uint64_t num_unitigs, uint64_t max_len,
               uint64_t max_frags) {
     bool a = run_case_impl(which_stitch::in_ram, seed, k, num_unitigs, max_len, max_frags);
     bool b = run_case_impl(which_stitch::ext_mem, seed, k, num_unitigs, max_len, max_frags);
-    return a && b;
+    bool c = run_case_impl(which_stitch::ext_file, seed, k, num_unitigs, max_len, max_frags);
+    return a && b && c;
 }
 
 // Larger case: report timing + fragment/unitig counts, plus the same
@@ -144,7 +171,8 @@ bool run_scale(uint64_t seed, uint32_t k, uint64_t num_unitigs) {
 
     std::vector<stitchable_unitig> out;
     bool ok = true;
-    for (which_stitch w : {which_stitch::in_ram, which_stitch::ext_mem}) {
+    for (which_stitch w :
+         {which_stitch::in_ram, which_stitch::ext_mem, which_stitch::ext_file}) {
         auto t0 = std::chrono::steady_clock::now();
         run_stitch(w, frags, k, out);
         auto t1 = std::chrono::steady_clock::now();
@@ -152,7 +180,7 @@ bool run_scale(uint64_t seed, uint32_t k, uint64_t num_unitigs) {
         bool this_ok = (want == to_multiset(out));
         ok = ok && this_ok;
         std::fprintf(stderr, "[scale %s] unitigs=%llu frags=%llu out=%zu time=%.0fms %s\n",
-                     w == which_stitch::in_ram ? "in_ram" : "ext_mem",
+                     stitch_name(w),
                      (unsigned long long)num_unitigs, (unsigned long long)n_frags, out.size(),
                      ms, this_ok ? "OK" : "MISMATCH");
     }
