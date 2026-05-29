@@ -53,43 +53,51 @@ inline std::string random_dna(uint64_t len, std::mt19937_64& rng) {
 }
 
 // Split a true unitig `S` into `num_frags` overlapping fragments (each
-// adjacent pair overlaps by exactly k-1 bases -- the shared junction
-// (k-1)-mer that stitch glues on). Internal split boundaries are
-// marked OPEN; the true unitig's two endpoints are CLOSED. Each
-// fragment is independently, randomly reverse-complemented (with its
-// open-flag sides swapped) so the test exercises both orientations.
+// adjacent pair overlaps by exactly k bases -- the shared boundary
+// k-mer that stitch glues on, GGCAT's k-base super-k-mer overlap).
+// Internal split boundaries are marked OPEN; the true unitig's two
+// endpoints are CLOSED. Each fragment is independently, randomly
+// reverse-complemented (with its open-flag sides swapped) so the test
+// exercises both orientations.
 //
-// `num_frags` is clamped to the number of k-mers in S (you can't have
-// more fragments than k-mers). All fragments are >= k bases.
+// Model in k-mer space: S has M = L-k+1 k-mers (indices 0..M-1).
+// Fragment f covers an inclusive k-mer range [start_kmer, end_kmer];
+// the boundary k-mer splits[f] is the LAST k-mer of fragment f and the
+// FIRST k-mer of fragment f+1, so both fragments physically contain all
+// k bases of it -> k-base overlap. `num_frags` is clamped so every
+// fragment has >= 2 k-mers (the interior split indices live in
+// [1, M-2], giving at most M-1 fragments).
 inline std::vector<cdgb::stitchable_unitig> split_unitig(std::string const& S, uint32_t k,
                                                          uint32_t cid, uint64_t num_frags,
                                                          std::mt19937_64& rng) {
     using cdgb::stitchable_unitig;
     const uint64_t L = S.size();
-    const uint64_t max_frags = std::max<uint64_t>(1, L >= k ? (L - k + 1) : 1);
+    const uint64_t M = (L >= k) ? (L - k + 1) : 1;  // number of k-mers
+    const uint64_t max_frags = std::max<uint64_t>(1, (M >= 2) ? (M - 1) : 1);
     if (num_frags < 1) num_frags = 1;
     if (num_frags > max_frags) num_frags = max_frags;
 
-    // Internal boundaries: num_frags-1 strictly-increasing positions in
-    // [k, L-1]. Fragment f spans [start_f, end_f); start_{f+1} =
-    // end_f - (k-1) so consecutive fragments share a (k-1)-mer.
-    std::vector<uint64_t> bounds;
+    // num_frags-1 distinct strictly-increasing split k-mer indices in
+    // [1, M-2]. Each splits[f] is the boundary k-mer shared (in full) by
+    // fragments f and f+1.
+    std::vector<uint64_t> splits;
     if (num_frags > 1) {
         std::vector<uint64_t> cand;
-        for (uint64_t b = k; b + 1 <= L; ++b) cand.push_back(b);  // [k, L-1]
+        for (uint64_t j = 1; j + 1 <= M - 1; ++j) cand.push_back(j);  // [1, M-2]
         std::shuffle(cand.begin(), cand.end(), rng);
         cand.resize(num_frags - 1);
         std::sort(cand.begin(), cand.end());
-        bounds = std::move(cand);
+        splits = std::move(cand);
     }
 
     std::vector<stitchable_unitig> frags;
     frags.reserve(num_frags);
-    uint64_t start = 0;
     for (uint64_t f = 0; f < num_frags; ++f) {
-        const uint64_t end = (f + 1 < num_frags) ? bounds[f] : L;
+        // Inclusive k-mer range; sequence spans [start_kmer, end_kmer+k).
+        const uint64_t start_kmer = (f == 0) ? 0 : splits[f - 1];
+        const uint64_t end_kmer = (f + 1 < num_frags) ? splits[f] : (M - 1);
         stitchable_unitig u;
-        u.seq = S.substr(start, end - start);
+        u.seq = S.substr(start_kmer, (end_kmer + k) - start_kmer);
         u.cid = cid;
         uint8_t flags = 0;
         if (f > 0) flags |= cdgb::UNITIG_OPEN_LEFT;               // internal left boundary
@@ -104,7 +112,6 @@ inline std::vector<cdgb::stitchable_unitig> split_unitig(std::string const& S, u
         }
         u.open_flags = flags;
         frags.push_back(std::move(u));
-        start = end - (k - 1);  // next fragment overlaps by k-1
     }
     return frags;
 }
