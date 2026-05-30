@@ -98,7 +98,7 @@ inline std::vector<cdgb::stitchable_unitig> split_unitig(std::string const& S, u
         const uint64_t end_kmer = (f + 1 < num_frags) ? splits[f] : (M - 1);
         stitchable_unitig u;
         u.seq = S.substr(start_kmer, (end_kmer + k) - start_kmer);
-        u.cid = cid;
+        u.set_mono(cid, k);
         uint8_t flags = 0;
         if (f > 0) flags |= cdgb::UNITIG_OPEN_LEFT;               // internal left boundary
         if (f + 1 < num_frags) flags |= cdgb::UNITIG_OPEN_RIGHT;  // internal right boundary
@@ -165,7 +165,7 @@ inline void gen_shared_cid_branch(uint32_t k, uint32_t cid, std::mt19937_64& rng
         std::string const& S = *unitigs[i];
         stitchable_unitig t;
         t.seq = S;
-        t.cid = cid;
+        t.set_mono(cid, k);
         t.open_flags = 0;
         truth_out.push_back(std::move(t));
 

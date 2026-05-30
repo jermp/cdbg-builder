@@ -48,7 +48,7 @@ using multiset_t = std::map<std::pair<std::string, uint32_t>, uint64_t>;
 
 multiset_t to_multiset(std::vector<stitchable_unitig> const& v) {
     multiset_t m;
-    for (auto const& u : v) ++m[{canonical(u.seq), u.cid}];
+    for (auto const& u : v) ++m[{canonical(u.seq), (uint32_t)u.mono_cid()}];
     return m;
 }
 
@@ -107,7 +107,7 @@ bool run_case_impl(which_stitch w, uint64_t seed, uint32_t k, uint64_t num_uniti
 
         stitchable_unitig t;
         t.seq = std::move(S);
-        t.cid = cid;
+        t.set_mono(cid, k);
         t.open_flags = 0;
         truth.push_back(std::move(t));
     }
@@ -206,7 +206,7 @@ bool run_scale(uint64_t seed, uint32_t k, uint64_t num_unitigs) {
         for (auto& p : parts) frags.push_back(std::move(p));
         stitchable_unitig t;
         t.seq = std::move(S);
-        t.cid = (uint32_t)u;
+        t.set_mono((uint32_t)u, k);
         truth.push_back(std::move(t));
     }
     std::shuffle(frags.begin(), frags.end(), rng);

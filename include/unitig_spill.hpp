@@ -96,9 +96,9 @@ public:
 
     // The sink callable used by stitch_unitigs_streaming.
     void operator()(stitchable_unitig&& u) {
-        const uint32_t b = bucket_for_cid(u.cid);
+        const uint64_t cid = u.mono_cid();  // post-split: monochromatic
+        const uint32_t b = bucket_for_cid(cid);
         std::FILE* f = m_files[b];
-        const uint64_t cid = u.cid;
         const uint32_t seq_len = (uint32_t)u.seq.size();
         if (std::fwrite(&cid, sizeof(cid), 1, f) != 1)
             throw std::runtime_error("short write of unitig cid to bucket " + std::to_string(b));
@@ -231,12 +231,18 @@ public:
 
     void operator()(stitchable_unitig&& u) {
         std::lock_guard<std::mutex> lk(m_mu);
-        const uint64_t cid = u.cid;
         const uint8_t flags = u.open_flags;
+        const uint32_t nruns = (uint32_t)u.runs.size();
         const uint32_t seq_len = (uint32_t)u.seq.size();
-        if (std::fwrite(&cid, sizeof(cid), 1, m_file) != 1 ||
-            std::fwrite(&flags, sizeof(flags), 1, m_file) != 1 ||
-            std::fwrite(&seq_len, sizeof(seq_len), 1, m_file) != 1)
+        if (std::fwrite(&flags, sizeof(flags), 1, m_file) != 1 ||
+            std::fwrite(&nruns, sizeof(nruns), 1, m_file) != 1)
+            throw std::runtime_error("short write to " + m_path);
+        for (auto const& r : u.runs) {
+            if (std::fwrite(&r.cid, sizeof(r.cid), 1, m_file) != 1 ||
+                std::fwrite(&r.num_kmers, sizeof(r.num_kmers), 1, m_file) != 1)
+                throw std::runtime_error("short write to " + m_path);
+        }
+        if (std::fwrite(&seq_len, sizeof(seq_len), 1, m_file) != 1)
             throw std::runtime_error("short write to " + m_path);
         if (seq_len > 0 &&
             std::fwrite(u.seq.data(), 1, seq_len, m_file) != (size_t)seq_len)
@@ -269,22 +275,32 @@ public:
         std::FILE* f = std::fopen(m_path.c_str(), "rb");
         if (!f) throw std::runtime_error("cannot reopen frag spill: " + m_path);
         for (;;) {
-            uint32_t cid = 0;
-            size_t got = std::fread(&cid, sizeof(cid), 1, f);
+            uint8_t flags = 0;
+            size_t got = std::fread(&flags, sizeof(flags), 1, f);
             if (got != 1) {
                 if (std::feof(f)) break;
                 std::fclose(f);
-                throw std::runtime_error("short read of cid from " + m_path);
+                throw std::runtime_error("short read of flags from " + m_path);
             }
-            uint8_t flags = 0;
-            uint32_t seq_len = 0;
-            if (std::fread(&flags, sizeof(flags), 1, f) != 1 ||
-                std::fread(&seq_len, sizeof(seq_len), 1, f) != 1) {
+            uint32_t nruns = 0;
+            if (std::fread(&nruns, sizeof(nruns), 1, f) != 1) {
                 std::fclose(f);
-                throw std::runtime_error("short read of header from " + m_path);
+                throw std::runtime_error("short read of nruns from " + m_path);
             }
             stitchable_unitig u;
-            u.cid = cid;
+            u.runs.resize(nruns);
+            for (uint32_t r = 0; r < nruns; ++r) {
+                if (std::fread(&u.runs[r].cid, sizeof(uint64_t), 1, f) != 1 ||
+                    std::fread(&u.runs[r].num_kmers, sizeof(uint32_t), 1, f) != 1) {
+                    std::fclose(f);
+                    throw std::runtime_error("short read of run from " + m_path);
+                }
+            }
+            uint32_t seq_len = 0;
+            if (std::fread(&seq_len, sizeof(seq_len), 1, f) != 1) {
+                std::fclose(f);
+                throw std::runtime_error("short read of seq_len from " + m_path);
+            }
             u.open_flags = flags;
             u.seq.resize(seq_len);
             if (seq_len > 0 &&
@@ -362,13 +378,18 @@ public:
         // access -- kernel readahead handles the I/O cost.
         size_t off = 0;
         while (off < m_mmap_size) {
-            if (off + 8 + 1 + 4 > m_mmap_size)
+            if (off + 1 + 4 > m_mmap_size)
                 throw std::runtime_error("truncated frag spill header in " + m_path);
-            uint64_t cid;
-            std::memcpy(&cid, m_mmap_base + off, 8);
-            off += 8;
             uint8_t flags = m_mmap_base[off];
             off += 1;
+            uint64_t runs_off = off;  // points at [u32 nruns][runs...]
+            uint32_t nruns;
+            std::memcpy(&nruns, m_mmap_base + off, 4);
+            off += 4;
+            constexpr size_t RUN = sizeof(uint64_t) + sizeof(uint32_t);
+            if (off + (size_t)nruns * RUN + 4 > m_mmap_size)
+                throw std::runtime_error("truncated frag spill runs in " + m_path);
+            off += (size_t)nruns * RUN;
             uint32_t seq_len;
             std::memcpy(&seq_len, m_mmap_base + off, 4);
             off += 4;
@@ -377,7 +398,7 @@ public:
             if (seq_len > MAX_SEQ_LEN)
                 throw std::runtime_error("seq_len exceeds 30-bit cap in " + m_path);
             entry e;
-            e.cid = cid;
+            e.runs_offset = runs_off;
             e.flags_and_len = ((uint32_t)flags << 30) | (seq_len & MAX_SEQ_LEN);
             e.seq_offset = off;
             m_entries.push_back(e);
@@ -399,7 +420,20 @@ public:
 
     // Source interface for stitch_unitigs_streaming.
     size_t size() const { return m_entries.size(); }
-    uint64_t cid(size_t i) const { return m_entries[i].cid; }
+    std::vector<color_run> runs(size_t i) const {
+        uint64_t off = m_entries[i].runs_offset;
+        uint32_t nruns;
+        std::memcpy(&nruns, m_mmap_base + off, 4);
+        off += 4;
+        std::vector<color_run> out(nruns);
+        for (uint32_t r = 0; r < nruns; ++r) {
+            std::memcpy(&out[r].cid, m_mmap_base + off, sizeof(uint64_t));
+            off += sizeof(uint64_t);
+            std::memcpy(&out[r].num_kmers, m_mmap_base + off, sizeof(uint32_t));
+            off += sizeof(uint32_t);
+        }
+        return out;
+    }
     uint8_t open_flags(size_t i) const {
         return (uint8_t)(m_entries[i].flags_and_len >> 30);
     }
@@ -410,14 +444,13 @@ public:
     }
 
 private:
-    // 24-byte entry: cid (8) + flags-and-len (4: 2 bits flags + 30 bits
-    // seq_len) + seq_offset (8), padded to 24. cid widened to 64-bit to
-    // support >4.29e9 color classes; costs +8 B/fragment of index RAM
-    // (e.g. ~46 GB extra at 5.7e9 fragments) -- revisit if the
-    // external-memory stitch redesign changes the reader.
+    // 24-byte entry: runs_offset (8, into the mmap at this frag's [u32 nruns]
+    // [runs...] blob) + flags-and-len (4: 2 bits flags + 30 bits seq_len) +
+    // seq_offset (8), padded to 24. Replaces the former inline cid: a
+    // colorless tig carries an RLE color-run sequence, decoded on access.
     static constexpr uint32_t MAX_SEQ_LEN = (1u << 30) - 1;
     struct entry {
-        uint64_t cid;
+        uint64_t runs_offset;
         uint32_t flags_and_len;  // top 2 bits: open_flags; bottom 30 bits: seq_len
         uint64_t seq_offset;
     };

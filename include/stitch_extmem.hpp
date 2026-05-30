@@ -11,7 +11,8 @@
 //
 // ALGORITHM (faithful to GGCAT v2 extend_unitigs, adapted to our model):
 //
-//   A "tig" is a (partially) merged fragment: { cid, open_flags, seq }.
+//   A "tig" is a (partially) merged fragment: { runs, open_flags, seq },
+//   where `runs` is the RLE color-run sequence over the tig's k-mers.
 //   An OPEN side means the unitig continues into another bucket. With the
 //   k-base super-k-mer overlap, the two fragments that meet there share
 //   their FULL boundary k-mer (it is physically present in both buckets),
@@ -24,9 +25,12 @@
 //        survives, so a chain of L fragments collapses in O(log L)
 //        expected rounds.
 //     2. Within each bucket, two tigs presenting the same boundary k-mer
-//        with equal cid and compatible orientation are concatenated (the
-//        shared boundary k-mer, k bases, dropped); the merged tig is sunk
-//        if now closed, else carried to the next round.
+//        with compatible orientation are concatenated (the shared boundary
+//        k-mer, k bases, dropped); the merged tig is sunk if now closed,
+//        else carried to the next round. The join is COLORLESS (topology
+//        only, like GGCAT): each tig carries an RLE color-run sequence that
+//        is concatenated at the seam and cut into monochromatic unitigs at
+//        emit. No cid gate -- that would strand color-boundary ends.
 //     3. A tig with no open end is sunk immediately as a complete unitig.
 //
 //   Branch separation is structural: the per-bucket walker (step 3)
@@ -36,9 +40,10 @@
 //   so they never false-join -- this is why the (k-1)-keyed stitch's
 //   precomputed joinable set (a global O(num_junctions) map) is gone.
 //
-// DIFFERENCE from GGCAT (intentional): the join is additionally gated on
-// equal cid -- our unitigs are monochromatic; GGCAT joins on k-mer
-// adjacency alone (it has no colors at this stage).
+// FAITHFUL to GGCAT: the join is colorless (k-mer adjacency only). Colors
+// ride along as a per-tig RLE color-run sequence (GGCAT's UnitigColorData),
+// joined at each merge; the ONE extra step GGCAT does not need is the
+// monochromatic split at emit (cdbg output unitigs are monochromatic).
 //
 // Two stores share one round driver: round_store_mem (in-RAM rounds;
 // fast, used by tests/reference) and round_store_file (LZ4-framed files,
@@ -73,11 +78,60 @@ namespace detail {
 // terminate. Randomized selection is what gives O(log L) expected
 // rounds (GGCAT does the same).
 struct ext_tig {
-    uint64_t cid;
+    std::vector<color_run> runs;  // RLE color sequence over this tig's k-mers
     uint8_t open_flags;
     uint64_t rng;
     std::string seq;
 };
+
+// Split a colorless (topological) tig into monochromatic unitigs at its
+// color-run boundaries and feed each to `emit`. This is the only step GGCAT
+// does not need (its unitigs stay topological with a color sequence); we cut
+// at run boundaries because cdbg output unitigs are monochromatic. Run i
+// covers num_kmers consecutive k-mers; the piece spanning them is
+// seq[base_off .. base_off + num_kmers + k - 1), and consecutive pieces share
+// only k-1 bases (no shared k-mer), so every k-mer lands in exactly one piece.
+template <typename Emit>
+inline void ext_split_monochromatic(ext_tig& t, uint32_t k, uint8_t open_flags, Emit&& emit) {
+    size_t base_off = 0;
+    const size_t nruns = t.runs.size();
+    for (size_t i = 0; i < nruns; ++i) {
+        const uint32_t m = t.runs[i].num_kmers;
+        stitchable_unitig u;
+        u.seq = t.seq.substr(base_off, (size_t)m + k - 1);
+        u.runs.push_back({t.runs[i].cid, m});
+        // OPEN flags only survive on the two extremal pieces (a split tig is
+        // only ever sunk when fully closed, so open_flags is 0 in practice).
+        uint8_t of = 0;
+        if (i == 0) of |= (open_flags & UNITIG_OPEN_LEFT);
+        if (i + 1 == nruns) of |= (open_flags & UNITIG_OPEN_RIGHT);
+        u.open_flags = of;
+        emit(std::move(u));
+        base_off += m;
+    }
+}
+
+// Reverse a run sequence in place (reverse-complementing a tig reverses the
+// k-mer order; color sets are orientation-independent so cids are unchanged).
+inline void ext_reverse_runs(std::vector<color_run>& runs) {
+    std::reverse(runs.begin(), runs.end());
+}
+
+// Append `b` runs onto `a`, dropping b's first k-mer (the shared boundary
+// k-mer, already counted as a's last k-mer) and merging the seam run if the
+// two abutting runs carry the same cid.
+inline void ext_concat_runs(std::vector<color_run>& a, std::vector<color_run> b) {
+    if (b.empty()) return;
+    // Drop the shared boundary k-mer from b's front.
+    if (--b.front().num_kmers == 0) b.erase(b.begin());
+    if (b.empty()) return;
+    size_t bi = 0;
+    if (!a.empty() && a.back().cid == b.front().cid) {
+        a.back().num_kmers += b.front().num_kmers;
+        bi = 1;
+    }
+    for (; bi < b.size(); ++bi) a.push_back(b[bi]);
+}
 
 // xorshift step; returns the next state.
 inline uint64_t ext_rng_next(uint64_t& s) {
@@ -171,7 +225,13 @@ inline ext_tig ext_join(ext_tig const& a, uint8_t a_side, ext_tig const& b, uint
     std::string bs = (b_side == SIDE_LEFT) ? b.seq : revcomp_string(b.seq);
 
     ext_tig m;
-    m.cid = a.cid;
+    // Orient each parent's run sequence to match its oriented bases, then
+    // concatenate (dropping the shared boundary k-mer from b's front).
+    m.runs = a.runs;
+    if (a_side != SIDE_RIGHT) ext_reverse_runs(m.runs);  // as = revcomp(a) when a_side==LEFT
+    std::vector<color_run> b_runs = b.runs;
+    if (b_side != SIDE_LEFT) ext_reverse_runs(b_runs);   // bs = revcomp(b) when b_side==RIGHT
+    ext_concat_runs(m.runs, std::move(b_runs));
     m.seq.reserve(as.size() + bs.size() - k);
     m.seq = as;
     // Drop the full shared boundary k-mer (k bases), not k-1.
@@ -231,15 +291,21 @@ private:
 };
 
 // ext_tig (de)serialization for the file-backed round store. Layout:
-//   [u64 cid][u8 open_flags][u64 rng][u32 seq_len][seq_len bytes ACGT]
+//   [u8 open_flags][u64 rng][u32 nruns]{[u64 cid][u32 num_kmers]}*
+//   [u32 seq_len][seq_len bytes ACGT]
 inline void ext_tig_serialize(ext_tig const& t, std::vector<uint8_t>& out) {
     auto put = [&](void const* p, size_t n) {
         uint8_t const* b = (uint8_t const*)p;
         out.insert(out.end(), b, b + n);
     };
-    put(&t.cid, sizeof(t.cid));
     put(&t.open_flags, sizeof(t.open_flags));
     put(&t.rng, sizeof(t.rng));
+    uint32_t nruns = (uint32_t)t.runs.size();
+    put(&nruns, sizeof(nruns));
+    for (auto const& r : t.runs) {
+        put(&r.cid, sizeof(r.cid));
+        put(&r.num_kmers, sizeof(r.num_kmers));
+    }
     uint32_t len = (uint32_t)t.seq.size();
     put(&len, sizeof(len));
     put(t.seq.data(), len);
@@ -247,15 +313,25 @@ inline void ext_tig_serialize(ext_tig const& t, std::vector<uint8_t>& out) {
 
 // Returns bytes consumed, 0 on malformed/EOF.
 inline size_t ext_tig_deserialize(uint8_t const* buf, size_t buf_len, ext_tig& t) {
-    constexpr size_t HDR = sizeof(uint64_t) + 1 + sizeof(uint64_t) + sizeof(uint32_t);
+    constexpr size_t HDR = 1 + sizeof(uint64_t) + sizeof(uint32_t);
     if (buf_len < HDR) return 0;
     size_t p = 0;
-    std::memcpy(&t.cid, buf + p, sizeof(t.cid));
-    p += sizeof(t.cid);
     t.open_flags = buf[p];
     p += 1;
     std::memcpy(&t.rng, buf + p, sizeof(t.rng));
     p += sizeof(t.rng);
+    uint32_t nruns;
+    std::memcpy(&nruns, buf + p, sizeof(nruns));
+    p += sizeof(nruns);
+    constexpr size_t RUN = sizeof(uint64_t) + sizeof(uint32_t);
+    if (buf_len < p + (size_t)nruns * RUN + sizeof(uint32_t)) return 0;
+    t.runs.resize(nruns);
+    for (uint32_t i = 0; i < nruns; ++i) {
+        std::memcpy(&t.runs[i].cid, buf + p, sizeof(uint64_t));
+        p += sizeof(uint64_t);
+        std::memcpy(&t.runs[i].num_kmers, buf + p, sizeof(uint32_t));
+        p += sizeof(uint32_t);
+    }
     uint32_t len;
     std::memcpy(&len, buf + p, sizeof(len));
     p += sizeof(len);
@@ -426,17 +502,17 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
     // will, in a later round when its partner co-buckets) a unique mate.
     auto is_terminal = [&](ext_tig const& t) -> bool { return t.open_flags == 0; };
     auto sink_unitig = [&](ext_tig& t) {
-        if (done) done->fetch_add(1, std::memory_order_relaxed);
-        stitchable_unitig u;
-        u.cid = t.cid;
-        u.open_flags = 0;  // complete unitig
-        u.seq = std::move(t.seq);
-        sink(std::move(u));
+        // Cut the finished topological tig at its color-run boundaries into
+        // monochromatic output unitigs (verify.py requires monochromaticity).
+        ext_split_monochromatic(t, k, t.open_flags, [&](stitchable_unitig&& u) {
+            if (done) done->fetch_add(1, std::memory_order_relaxed);
+            sink(std::move(u));
+        });
     };
 
     // Loop until the store drains. Each round joins co-bucketed pairs that
-    // present the same full boundary k-mer with compatible orientation and
-    // equal cid; carries the rest (re-rolling which end a both-open tig
+    // present the same full boundary k-mer with compatible orientation
+    // (colorless); carries the rest (re-rolling which end a both-open tig
     // presents). Termination: every join strictly reduces the live tig
     // count, and a tig that finds no partner this round eventually
     // co-buckets with its unique mate (both key the same canonical k-mer,
@@ -473,9 +549,8 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
             // a boundary k-mer either becomes the waiter or joins the
             // existing waiter. The full-k-mer key makes branches route
             // elsewhere, so a colliding pair is a genuine adjacency -- we
-            // still gate the join on equal cid (our unitigs are
-            // monochromatic; GGCAT has no colors here) and on compatible
-            // orientation. A pair that fails the gate is a real terminus on
+            // gate the join on compatible orientation only (colorless, like
+            // GGCAT). A pair that fails the gate is a real terminus on
             // that end: drop the waiter's claim and let the later survivor
             // pass treat each as terminal-on-this-end (carried, re-rolled,
             // or sunk if its other end also fails to join).
@@ -492,13 +567,17 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
                     it->second = i;
                     continue;
                 }
-                // cid + orientation gate, evaluated locally (no global map).
-                bool ok = (tigs[a_idx].cid == tigs[i].cid) &&
-                          ext_pair_compatible(ends[a_idx], ends[i]);
+                // Colorless gate (GGCAT): orientation only -- NO color check.
+                // The full-k-mer key already separated branches, so a colliding
+                // compatible pair is a genuine topological adjacency that always
+                // joins; the color difference (if any) is recorded as a run
+                // boundary inside the merged tig and cut apart at emit. This is
+                // what makes every open end have a unique partner and the loop
+                // terminate (a cid gate here would strand color-boundary ends).
+                bool ok = ext_pair_compatible(ends[a_idx], ends[i]);
                 if (!ok) {
-                    // Not a real join (color boundary or 3rd end at a
-                    // branch). Keep the earlier waiter; this tig will be
-                    // handled as a survivor.
+                    // Incompatible orientation at a shared k-mer (palindromic /
+                    // branch remnant): keep the waiter; handle this as survivor.
                     continue;
                 }
                 ext_tig merged = ext_join(tigs[a_idx], ends[a_idx].side, tigs[i], ends[i].side, k);
@@ -556,7 +635,7 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
 //
 // No precomputed joinable set: full-k-mer keying separates branches
 // structurally (the boundary k-mers differ), and the per-bucket pairing
-// gates each join on equal cid + compatible orientation locally. This
+// gates each join on compatible orientation locally (colorless). This
 // deletes the one global O(num_junctions) map the (k-1)-keyed stitch
 // needed -- the round loop now streams only one bucket's tigs at a time.
 template <typename Source, typename Store, typename Sink>
@@ -566,18 +645,17 @@ inline void ext_seed_round0(Source& frag, uint32_t k, Store& store, Sink&& sink,
 
     for (uint64_t i = 0; i < n; ++i) {
         ext_tig t;
-        t.cid = frag.cid(i);
+        t.runs = frag.runs(i);
         t.open_flags = frag.open_flags(i);
         std::string_view sv = frag.seq_view(i);
         t.seq.assign(sv.data(), sv.size());
         t.rng = ext_seed_from_seq(t.seq);
         if (k < 2 || t.open_flags == 0) {
-            if (done) done->fetch_add(1, std::memory_order_relaxed);
-            stitchable_unitig u;
-            u.cid = t.cid;
-            u.open_flags = t.open_flags;
-            u.seq = std::move(t.seq);
-            sink(std::move(u));
+            // Already closed: split at color-run boundaries and sink.
+            ext_split_monochromatic(t, k, t.open_flags, [&](stitchable_unitig&& u) {
+                if (done) done->fetch_add(1, std::memory_order_relaxed);
+                sink(std::move(u));
+            });
             continue;
         }
         uint64_t dummy = 0;

@@ -198,7 +198,7 @@ inline void stitch_unitigs_streaming(Source& frag, uint32_t k, Sink&& sink,
         for (uint64_t i = 0; i < n_frags; ++i) {
             if (done) done->fetch_add(1, std::memory_order_relaxed);
             stitchable_unitig u;
-            u.cid = frag.cid(i);
+            u.runs = frag.runs(i);
             u.open_flags = frag.open_flags(i);
             std::string_view sv = frag.seq_view(i);
             u.seq.assign(sv.data(), sv.size());
@@ -266,8 +266,8 @@ inline void stitch_unitigs_streaming(Source& frag, uint32_t k, Sink&& sink,
         if (je.count != 2) continue;  // skip empty / singleton / overflow
         end_ref const& e1 = je.a;
         end_ref const& e2 = je.b;
-        // O(1) color-class comparison (cid was assigned by main before stitch).
-        if (frag.cid(e1.unitig_idx) != frag.cid(e2.unitig_idx)) continue;
+        // O(1) color-class comparison (legacy monochromatic gate).
+        if (frag.mono_cid(e1.unitig_idx) != frag.mono_cid(e2.unitig_idx)) continue;
         if (!pair_compatible(e1, e2)) continue;
         // Both directions of the link.
         adj_set(adj[e1.unitig_idx], e1.side, pack_link(e2.unitig_idx, e2.side));
@@ -297,9 +297,10 @@ inline void stitch_unitigs_streaming(Source& frag, uint32_t k, Sink&& sink,
 
     auto walk_chain = [&](uint64_t start_idx, bool start_flipped) {
         stitchable_unitig merged;
-        // Inherit cid; chain members have equal cids by construction (the
-        // adjacency build only links pairs with matching cid).
-        merged.cid = frag.cid(start_idx);
+        // Inherit runs from the start fragment. (Legacy in-RAM stitcher:
+        // the colorless run model is fully carried only by the external
+        // stitch; this test-only path keeps the start fragment's runs.)
+        merged.runs = frag.runs(start_idx);
         merged.seq = take_seq(start_idx, start_flipped);
         visited[start_idx] = 1;
         if (done) done->fetch_add(1, std::memory_order_relaxed);
@@ -370,7 +371,8 @@ struct vector_frag_source {
     std::vector<stitchable_unitig> const& v;
     explicit vector_frag_source(std::vector<stitchable_unitig> const& vec) : v(vec) {}
     size_t size() const { return v.size(); }
-    uint64_t cid(size_t i) const { return v[i].cid; }
+    std::vector<color_run> runs(size_t i) const { return v[i].runs; }
+    uint64_t mono_cid(size_t i) const { return v[i].mono_cid(); }
     uint8_t open_flags(size_t i) const { return v[i].open_flags; }
     std::string_view seq_view(size_t i) const {
         return std::string_view(v[i].seq.data(), v[i].seq.size());

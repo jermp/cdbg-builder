@@ -72,15 +72,36 @@ struct kmer_entry {
 inline constexpr uint8_t UNITIG_OPEN_LEFT = 1u << 0;
 inline constexpr uint8_t UNITIG_OPEN_RIGHT = 1u << 1;
 
+// A run of consecutive k-mers along a tig that share one color class.
+// num_kmers counts k-mers (a length-L tig of L = seq.size()-k+1 k-mers has
+// runs summing to L). This is the RLE color sequence GGCAT carries on a
+// topological unitig (UnitigColorData); the monochromatic split at emit
+// time cuts a tig at its run boundaries.
+struct color_run {
+    uint64_t cid;        // local during process_bucket, global after remap
+    uint32_t num_kmers;  // number of k-mers covered by this run (>= 1)
+};
+
 struct stitchable_unitig {
     std::string seq;  // ACGT characters
-    // Color-class id. While process_bucket is emitting unitigs, this is
-    // a *local* cid into that bucket's local_dict; process_buckets then
-    // remaps it to a global cid as it merges each bucket's local_dict
-    // into the shared global streaming_color_set_dict. By the time stitch_unitigs
-    // and the FASTA emitter run, all cids are global.
-    uint64_t cid = UINT64_MAX;
+    // Colorless/topological tig: extension follows graph topology only
+    // (GGCAT hashmap.rs:230), never breaking on color. The per-k-mer color
+    // classes ride along as an RLE run sequence, joined at each stitch merge
+    // and cut into monochromatic unitigs at emit. `runs` covers exactly the
+    // tig's k-mers in 5'->3' order; while process_bucket emits, the cids are
+    // *local* (into the bucket's local_dict) and process_buckets remaps each
+    // to a global cid. For a monochromatic tig `runs` has a single element.
+    std::vector<color_run> runs;
     uint8_t open_flags = 0;  // bits from UNITIG_OPEN_*
+
+    // Convenience: a freshly walked or post-split tig is monochromatic.
+    uint64_t mono_cid() const { return runs.empty() ? UINT64_MAX : runs.front().cid; }
+    // Set a single color run covering all of this tig's k-mers (seq must
+    // already be assigned). Used by tests that build monochromatic frags.
+    void set_mono(uint64_t cid, uint32_t k) {
+        uint32_t nk = (seq.size() >= k) ? (uint32_t)(seq.size() - k + 1) : 1;
+        runs.assign(1, color_run{cid, nk});
+    }
 };
 
 namespace detail {
@@ -339,8 +360,7 @@ struct left_end_check {
     uint8_t prepend_base;  // walking-orientation leading base of the boundary k-mer
 };
 inline left_end_check classify_left_end(
-    kmer_int_t can, bool rc, uint32_t cid, uint32_t k, bucket_kmer_map const& m,
-    ankerl::unordered_dense::map<kmer_int_t, uint32_t, kmer_hasher> const& cid_of) {
+    kmer_int_t can, bool rc, uint32_t k, bucket_kmer_map const& m) {
     auto it = m.find(can);
     uint8_t phantom = it->second.phantom;
     side_degree bd = back_degree(can, rc, k, m, phantom);
@@ -365,7 +385,8 @@ inline left_end_check classify_left_end(
     }
     // The single back edge is an owned interior predecessor: continue the
     // straight-line check -- its forward in walking orientation must also be
-    // degree 1 and color-match, else `can` is a (closed) left end.
+    // degree 1, else `can` is a (closed) left end. Colorless: no color-match
+    // check -- a color change is recorded as a run boundary, not a unitig end.
     uint8_t nt = (uint8_t)__builtin_ctz(bd.owned_nib);
     auto sr = bstep(can, !rc, k, nt);
     kmer_int_t pred_can = sr.next_can;
@@ -374,8 +395,6 @@ inline left_end_check classify_left_end(
     if (pit == m.end()) return {true, false, false, 0};  // shouldn't happen
     side_degree pfd = fwd_degree(pred_can, pred_rc, k, m, pit->second.phantom);
     if (pfd.total != 1) return {true, false, false, 0};
-    auto cit = cid_of.find(pred_can);
-    if (cit == cid_of.end() || cit->second != cid) return {true, false, false, 0};
     return {false, false, false, 0};
 }
 
@@ -474,7 +493,16 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
     ankerl::unordered_dense::map<kmer_int_t, uint8_t, kmer_hasher> visited;
     visited.reserve(kmer_info.size());
 
-    auto extend_and_emit = [&](kmer_int_t start_can, bool start_rc, uint32_t cid, bool open_left,
+    // Append one k-mer's cid to the RLE run sequence, merging with the back
+    // run if equal. This is GGCAT's extend_forward (colors/managers/multiple.rs).
+    auto push_cid = [](std::vector<color_run>& runs, uint64_t cid) {
+        if (!runs.empty() && runs.back().cid == cid)
+            runs.back().num_kmers += 1;
+        else
+            runs.push_back({cid, 1});
+    };
+
+    auto extend_and_emit = [&](kmer_int_t start_can, bool start_rc, bool open_left,
                                bool prepend, uint8_t prepend_base) {
         stitchable_unitig u;
         kmer_int_t cur = start_rc ? reverse_complement(start_can, k) : start_can;
@@ -483,12 +511,9 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
         // ignored boundary k-mer's leading base so the fragment's first k
         // bases equal that shared boundary k-mer (full-k-mer stitch key).
         if (prepend) u.seq.insert(u.seq.begin(), twobit_to_nuc(prepend_base));
-        // Local cid; process_buckets remaps to global after merging the
-        // local_dict into the shared global dict. The actual color list
-        // lives in out_local_dict and is moved into the global dict
-        // there -- we never copy a color vector into the unitig.
-        u.cid = cid;
         if (open_left) u.open_flags |= UNITIG_OPEN_LEFT;
+        // First k-mer's color. Local cid; process_buckets remaps to global.
+        push_cid(u.runs, cid_of[start_can]);
 
         kmer_int_t can = start_can;
         bool rc = start_rc;
@@ -498,7 +523,7 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
             auto it = kmer_info.find(can);
             uint8_t phantom = it->second.phantom;
             side_degree fd = fwd_degree(can, rc, k, kmer_info, phantom);
-            if (fd.total != 1) break;  // closed (branch / dead end)
+            if (fd.total != 1) break;  // closed (branch / dead end): topology only
             if (fd.owned == 0) {
                 // The single forward continuation is a foreign crossing into
                 // the adjacent bucket: open-right. Include the boundary
@@ -523,17 +548,19 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
             }
             uint8_t nt = (uint8_t)__builtin_ctz(fd.owned_nib);
             auto sr = bstep(can, rc, k, nt);
-            // Successor must (a) have back-side degree exactly 1 in walking
-            // orientation (no incoming branch) and (b) carry the same cid.
+            // Successor must have back-side degree exactly 1 in walking
+            // orientation (no incoming branch). Colorless: we do NOT break on
+            // color -- the cid change is recorded as a run boundary and the
+            // walk continues (GGCAT hashmap.rs:230, count==1 only).
             auto nit = kmer_info.find(sr.next_can);
             if (nit == kmer_info.end()) break;
             uint8_t next_phantom = nit->second.phantom;
             side_degree nbd = back_degree(sr.next_can, sr.next_rc, k, kmer_info, next_phantom);
             if (nbd.total != 1) break;
-            if (cid_of[sr.next_can] != cid) break;
             if (visited.find(sr.next_can) != visited.end()) break;  // cycle closure
             visited[sr.next_can] = 1;
             u.seq.push_back(twobit_to_nuc(nt));
+            push_cid(u.runs, cid_of[sr.next_can]);
             can = sr.next_can;
             rc = sr.next_rc;
         }
@@ -547,10 +574,9 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
         // is walked in the owning bucket. (They are also never in cid_of.)
         if (!kv.second.owned) continue;
         if (visited.find(can) != visited.end()) continue;
-        uint32_t cid = cid_of[can];
         // Try both orientations.
-        auto le_f = classify_left_end(can, false, cid, k, kmer_info, cid_of);
-        auto le_r = classify_left_end(can, true, cid, k, kmer_info, cid_of);
+        auto le_f = classify_left_end(can, false, k, kmer_info);
+        auto le_r = classify_left_end(can, true, k, kmer_info);
         left_end_check le;
         bool start_rc;
         if (le_f.is_left_end) {
@@ -561,7 +587,7 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
             le = le_r;
         } else
             continue;
-        extend_and_emit(can, start_rc, cid, le.open_left, le.prepend, le.prepend_base);
+        extend_and_emit(can, start_rc, le.open_left, le.prepend, le.prepend_base);
     }
 
     // Second pass: anything still unvisited is on a pure cycle inside the
@@ -571,7 +597,7 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
         kmer_int_t can = kv.first;
         if (!kv.second.owned) continue;  // never start from an ignored node
         if (visited.find(can) != visited.end()) continue;
-        extend_and_emit(can, false, cid_of[can], /*open_left=*/false,
+        extend_and_emit(can, false, /*open_left=*/false,
                         /*prepend=*/false, /*prepend_base=*/0);
     }
     prof.ns_walk.fetch_add(bucket_process_prof::since(t_walk), std::memory_order_relaxed);
@@ -692,7 +718,7 @@ inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t nu
                                                   std::memory_order_relaxed);
             }
             for (auto& u : bucket_unitigs) {
-                u.cid = local_to_global[u.cid];
+                for (auto& r : u.runs) r.cid = local_to_global[r.cid];
                 sink(std::move(u));
             }
             process_prof().n_buckets.fetch_add(1, std::memory_order_relaxed);
