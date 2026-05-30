@@ -338,9 +338,11 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
         std::vector<uint32_t> rsids_scratch;
         std::vector<uint32_t> merged_scratch;
         for (auto& kv : kmer_info) {
-            // Every k-mer (including cross-bucket boundary k-mers) is colored
-            // from the super(s) it occurs in; the global dict reconciles the
-            // two bucket-local copies of each boundary k-mer on its content.
+            // Only PRIMARY k-mers carry color (an rsid); foreign overlap copies
+            // have no rsid and get no cid -- their colored copy lives in the
+            // adjacent bucket. Skipping them also avoids indexing rsid_to_cid
+            // with NO_RSID. The walk never reads cid_of for a foreign k-mer.
+            if (!kv.second.primary) continue;
             kmer_entry& e = kv.second.colors;
             uint32_t cid;
             if (e.rest.empty()) {
