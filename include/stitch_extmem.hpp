@@ -12,39 +12,33 @@
 // ALGORITHM (faithful to GGCAT v2 extend_unitigs, adapted to our model):
 //
 //   A "tig" is a (partially) merged fragment: { cid, open_flags, seq }.
-//   An OPEN side means the unitig continues into another bucket (degree
-//   exactly 1, neighbour elsewhere); by the per-bucket walk's OPEN
-//   invariant a (k-1) junction has AT MOST 2 open ends globally.
-//
-//   Up front, compute the JOINABLE junction set: the (k-1) junctions
-//   with exactly 2 open ends, equal cid, compatible orientation -- the
-//   in-RAM stitch's exact join predicate. This is invariant under
-//   merging, so it is computed once. An open end NOT at a joinable
-//   junction is a terminal unitig boundary.
+//   An OPEN side means the unitig continues into another bucket. With the
+//   k-base super-k-mer overlap, the two fragments that meet there share
+//   their FULL boundary k-mer (it is physically present in both buckets),
+//   so we key the join on that canonical k-mer -- no global joinable map.
 //
 //   Round loop (until the store drains):
-//     1. Each non-terminal tig presents ONE chosen open side and is
-//        routed to bucket H(junction) % NUM_BUCKETS. A both-open tig
-//        picks its presented end from a per-tig RNG, re-rolled each
-//        round it survives, so a chain of L fragments collapses in
-//        O(log L) expected rounds.
-//     2. Within each bucket, two tigs presenting the same joinable
-//        junction are concatenated (k-1 overlap dropped); the merged
-//        tig is sunk if now terminal, else carried to the next round.
-//     3. A tig all of whose open ends are terminal (non-joinable) is
-//        sunk immediately as a complete unitig. This is what guarantees
-//        termination: non-joinable ends never become joinable, so no
-//        tig dangles forever.
+//     1. Each non-closed tig presents ONE chosen open side and is routed
+//        to bucket H(boundary_kmer) % NUM_BUCKETS. A both-open tig picks
+//        its presented end from a per-tig RNG, re-rolled each round it
+//        survives, so a chain of L fragments collapses in O(log L)
+//        expected rounds.
+//     2. Within each bucket, two tigs presenting the same boundary k-mer
+//        with equal cid and compatible orientation are concatenated (the
+//        shared boundary k-mer, k bases, dropped); the merged tig is sunk
+//        if now closed, else carried to the next round.
+//     3. A tig with no open end is sunk immediately as a complete unitig.
 //
-// DIFFERENCES from GGCAT (intentional, for our data model):
-//   - Key is the canonical (k-1)-mer junction, not the full boundary
-//     k-mer (our fragments overlap by k-1). GGCAT's full-k-mer key makes
-//     dBG branches land in different buckets for free; our (k-1) key
-//     collides them, so we exclude non-joinable junctions explicitly via
-//     the precomputed set.
-//   - Join is gated on equal cid (our unitigs are monochromatic;
-//     GGCAT enforces this differently). GGCAT joins on k-mer adjacency
-//     alone.
+//   Branch separation is structural: the per-bucket walker (step 3)
+//   leaves an end OPEN only on a degree-1 cross-bucket simple-path edge,
+//   which has exactly one partner. Real branches and dead ends are
+//   CLOSED, and their distinct boundary k-mers route to different slots,
+//   so they never false-join -- this is why the (k-1)-keyed stitch's
+//   precomputed joinable set (a global O(num_junctions) map) is gone.
+//
+// DIFFERENCE from GGCAT (intentional): the join is additionally gated on
+// equal cid -- our unitigs are monochromatic; GGCAT joins on k-mer
+// adjacency alone (it has no colors at this stage).
 //
 // Two stores share one round driver: round_store_mem (in-RAM rounds;
 // fast, used by tests/reference) and round_store_file (LZ4-framed files,
@@ -70,26 +64,6 @@
 namespace cdgb {
 
 namespace detail {
-
-// Set of (k-1) junctions that are JOINABLE: exactly 2 open ends share
-// them, those ends have equal cid, and their side/orientation is
-// compatible -- i.e. precisely the in-RAM stitch's join predicate. Any
-// open end whose junction is NOT in this set is a terminal unitig
-// boundary (branch with 3+ ends, singleton, or 2-but-incompatible).
-//
-// All three properties are INVARIANT under merging: a junction's two
-// ends are always the same two original-fragment ends (merges only
-// relocate a tig's OTHER, outer end), so the predicate is computable
-// once over the initial fragments and never changes. This is the single
-// source of truth that fixes both failure modes seen earlier:
-//   - false joins (joining a count==2-but-incompatible junction), and
-//   - the hang (carrying forever a tig whose only open end is at a
-//     non-joinable junction -- it's actually terminal and must be sunk).
-//
-// NOTE: in-RAM for now -- the one remaining unbounded structure in the
-// otherwise external-memory stitch; bucketing it to disk is a
-// documented follow-up. Correctness first.
-using joinable_set_t = ankerl::unordered_dense::set<kmer_int_t, kmer_hasher>;
 
 // A tig in the doubling loop. `rng` is a per-tig random state used to
 // pick which open end to present when both are open. It MUST vary
@@ -124,12 +98,34 @@ inline uint64_t ext_seed_from_seq(std::string const& seq) {
     return h ? h : 0x9e3779b97f4a7c15ull;  // never zero (xorshift fixed point)
 }
 
+// Canonical full boundary k-mer at one side of a fragment (GGCAT
+// final_executor.rs:147-174 / extremal.rs:25-43). SIDE_LEFT keys the
+// first k bases, SIDE_RIGHT the last k bases. Replaces the (k-1) junction
+// key: because adjacent k-overlap fragments share their FULL boundary
+// k-mer, two ends that should glue present equal canonical k-mers, while
+// distinct k-mers at a dBG branch differ and never collide -- so no
+// global joinable map is needed to separate branches. Requires
+// seq.size() >= k (always true for an open fragment).
+inline kmer_int_t side_kmer_canonical(std::string_view seq, uint32_t k, uint8_t side,
+                                      bool& is_canonical_fwd) {
+    char const* p = (side == SIDE_LEFT) ? seq.data() : seq.data() + (seq.size() - k);
+    kmer_int_t fwd = 0;
+    for (uint32_t i = 0; i < k; ++i) fwd = (fwd << 2) | (kmer_int_t)nuc_to_2bit(p[i]);
+    kmer_int_t rc = reverse_complement(fwd, k);
+    if (fwd <= rc) {
+        is_canonical_fwd = true;
+        return fwd;
+    }
+    is_canonical_fwd = false;
+    return rc;
+}
+
 // One chosen open end of a tig, in the current round's bucket.
 struct ext_end {
     uint64_t tig_idx;       // index into the round-bucket's tig vector
-    kmer_int_t junction;    // canonical (k-1)-mer
+    kmer_int_t junction;    // canonical full boundary k-mer
     uint8_t side;           // SIDE_LEFT / SIDE_RIGHT of the keyed end
-    bool is_canonical_fwd;  // junction-in-own-frame == canonical
+    bool is_canonical_fwd;  // boundary-k-mer-in-own-frame == canonical
 };
 
 // Pick the open side a tig presents this round. For a both-open tig the
@@ -161,11 +157,12 @@ inline bool ext_pair_compatible(ext_end const& a, ext_end const& b) {
     return a.is_canonical_fwd != b.is_canonical_fwd;
 }
 
-// Join two tigs at a shared, compatible junction. Orient `a` so its
-// keyed end (a_side) is at the RIGHT and `b` so its keyed end (b_side)
-// is at the LEFT, then merged = a_oriented + b_oriented[k-1..]. The two
-// (k-1) overlaps are guaranteed equal by ext_pair_compatible (verified
-// for all four side/orientation cases). Returns the merged tig.
+// Join two tigs at a shared, compatible full boundary k-mer. Orient `a`
+// so its keyed end (a_side) is at the RIGHT and `b` so its keyed end
+// (b_side) is at the LEFT, then merged = a_oriented + b_oriented[k..].
+// The two k-base overlaps (the shared boundary k-mer) are guaranteed
+// equal by ext_pair_compatible (verified for all four side/orientation
+// cases). Returns the merged tig.
 inline ext_tig ext_join(ext_tig const& a, uint8_t a_side, ext_tig const& b, uint8_t b_side,
                         uint32_t k) {
     // a oriented with keyed end at RIGHT.
@@ -175,9 +172,10 @@ inline ext_tig ext_join(ext_tig const& a, uint8_t a_side, ext_tig const& b, uint
 
     ext_tig m;
     m.cid = a.cid;
-    m.seq.reserve(as.size() + bs.size() - (k - 1));
+    m.seq.reserve(as.size() + bs.size() - k);
     m.seq = as;
-    m.seq.append(bs.begin() + (k - 1), bs.end());
+    // Drop the full shared boundary k-mer (k bases), not k-1.
+    m.seq.append(bs.begin() + k, bs.end());
     // Mix both parents' rng so the merged tig gets a fresh stream.
     m.rng = a.rng ^ (b.rng * 0x9e3779b97f4a7c15ull);
     if (m.rng == 0) m.rng = 0x9e3779b97f4a7c15ull;
@@ -405,8 +403,7 @@ inline bool ext_route(ext_tig&& t, uint32_t k, Store& store, uint64_t& joined_co
     uint8_t side;
     if (!ext_choose_side(t, side)) return false;  // fully closed
     bool fwd;
-    kmer_int_t j = side_junction_canonical(std::string_view(t.seq.data(), t.seq.size()), k, side,
-                                           fwd);
+    kmer_int_t j = side_kmer_canonical(std::string_view(t.seq.data(), t.seq.size()), k, side, fwd);
     uint32_t b = (uint32_t)((kmer_hasher{}(j) >> 1) % store.num_buckets());
     store.emit(b, std::move(t));
     return true;
@@ -417,26 +414,17 @@ inline bool ext_route(ext_tig&& t, uint32_t k, Store& store, uint64_t& joined_co
 // circular unitigs. Works for both round_store_mem and
 // round_store_file (same emit / take_input_bucket / advance interface).
 template <typename Store, typename Sink>
-inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets,
-                           joinable_set_t const& joinable, Sink&& sink,
+inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&& sink,
                            std::atomic<uint64_t>* done) {
-    // Whether `side` of tig t sits at a joinable junction. A tig is
-    // TERMINAL (a complete unitig) iff none of its open ends is
-    // joinable; such a tig is sunk immediately. Because joinability is a
-    // fixed global property, a non-joinable open end never becomes
-    // joinable, so nothing dangles -- this is what makes the drain
-    // terminate (fixes the earlier hang).
-    auto end_joinable = [&](ext_tig const& t, uint8_t side) -> bool {
-        bool fwd;
-        kmer_int_t j = detail::side_junction_canonical(
-            std::string_view(t.seq.data(), t.seq.size()), k, side, fwd);
-        return joinable.find(j) != joinable.end();
-    };
-    auto is_terminal = [&](ext_tig const& t) -> bool {
-        if ((t.open_flags & UNITIG_OPEN_LEFT) && end_joinable(t, SIDE_LEFT)) return false;
-        if ((t.open_flags & UNITIG_OPEN_RIGHT) && end_joinable(t, SIDE_RIGHT)) return false;
-        return true;
-    };
+    // Full-k-mer keying (GGCAT extend_unitigs.rs:410-481) needs no global
+    // joinable map. An end is OPEN only because the step-3 walker found a
+    // degree-1 cross-bucket simple-path edge, which by construction has
+    // exactly one partner fragment sharing the full boundary k-mer. Real
+    // branches and dead ends are CLOSED by the walker, so a distinct k-mer
+    // at a branch routes to a different slot and never collides. A tig is
+    // TERMINAL iff it has no open end at all; an open end always has (or
+    // will, in a later round when its partner co-buckets) a unique mate.
+    auto is_terminal = [&](ext_tig const& t) -> bool { return t.open_flags == 0; };
     auto sink_unitig = [&](ext_tig& t) {
         if (done) done->fetch_add(1, std::memory_order_relaxed);
         stitchable_unitig u;
@@ -446,12 +434,14 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets,
         sink(std::move(u));
     };
 
-    // Loop until the store drains. Each round joins co-bucketed pairs at
-    // joinable junctions, sinks terminal tigs, and carries the rest
-    // (re-rolling which end a both-open tig presents). Termination: no
-    // tig is carried (store empty after advance) -- guaranteed because
-    // every join reduces the live tig count and terminal tigs leave the
-    // loop, while non-joinable ends are classified terminal up front.
+    // Loop until the store drains. Each round joins co-bucketed pairs that
+    // present the same full boundary k-mer with compatible orientation and
+    // equal cid; carries the rest (re-rolling which end a both-open tig
+    // presents). Termination: every join strictly reduces the live tig
+    // count, and a tig that finds no partner this round eventually
+    // co-buckets with its unique mate (both key the same canonical k-mer,
+    // so both route to the same bucket whenever they present that end) --
+    // O(log L) expected rounds.
     constexpr uint32_t MAX_ROUNDS = 4096;  // safety net; O(log L) expected
     for (uint32_t round_no = 0;; ++round_no) {
         uint64_t carried_this_round = 0;
@@ -464,8 +454,8 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets,
             std::vector<ext_end> ends(NT);
             std::vector<uint8_t> has_end(NT, 0);
             std::vector<uint8_t> consumed(NT, 0);
-            // Map each presented joinable-end junction to the first tig
-            // that presented it this round; the second arrival joins.
+            // Map each presented boundary k-mer to the first tig that
+            // presented it this round; the second compatible arrival joins.
             ankerl::unordered_dense::map<kmer_int_t, uint64_t, kmer_hasher> waiting;
             waiting.reserve(NT);
 
@@ -473,21 +463,25 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets,
                 uint8_t side;
                 if (!ext_choose_side(tigs[i], side)) continue;  // closed (shouldn't reach)
                 bool fwd;
-                kmer_int_t j = detail::side_junction_canonical(
+                kmer_int_t j = detail::side_kmer_canonical(
                     std::string_view(tigs[i].seq.data(), tigs[i].seq.size()), k, side, fwd);
                 ends[i] = ext_end{i, j, side, fwd};
                 has_end[i] = 1;
             }
 
-            // Pairing pass: a tig presenting a joinable junction either
-            // becomes the waiter or joins the existing waiter. The
-            // global `joinable` set already guarantees exactly-2-ends +
-            // equal-cid + compatible-orientation, so a present pair at a
-            // joinable junction is always a valid join.
+            // Pairing pass (GGCAT first-come/second-come): a tig presenting
+            // a boundary k-mer either becomes the waiter or joins the
+            // existing waiter. The full-k-mer key makes branches route
+            // elsewhere, so a colliding pair is a genuine adjacency -- we
+            // still gate the join on equal cid (our unitigs are
+            // monochromatic; GGCAT has no colors here) and on compatible
+            // orientation. A pair that fails the gate is a real terminus on
+            // that end: drop the waiter's claim and let the later survivor
+            // pass treat each as terminal-on-this-end (carried, re-rolled,
+            // or sunk if its other end also fails to join).
             for (uint64_t i = 0; i < NT; ++i) {
                 if (consumed[i] || !has_end[i]) continue;
                 kmer_int_t j = ends[i].junction;
-                if (joinable.find(j) == joinable.end()) continue;  // terminal end
                 auto it = waiting.find(j);
                 if (it == waiting.end()) {
                     waiting.emplace(j, i);
@@ -496,6 +490,15 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets,
                 uint64_t a_idx = it->second;
                 if (consumed[a_idx]) {  // stale; replace waiter
                     it->second = i;
+                    continue;
+                }
+                // cid + orientation gate, evaluated locally (no global map).
+                bool ok = (tigs[a_idx].cid == tigs[i].cid) &&
+                          ext_pair_compatible(ends[a_idx], ends[i]);
+                if (!ok) {
+                    // Not a real join (color boundary or 3rd end at a
+                    // branch). Keep the earlier waiter; this tig will be
+                    // handled as a survivor.
                     continue;
                 }
                 ext_tig merged = ext_join(tigs[a_idx], ends[a_idx].side, tigs[i], ends[i].side, k);
@@ -511,8 +514,8 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets,
                 }
             }
 
-            // Survivors: sink terminal tigs; carry the rest (re-roll the
-            // presented end for both-open tigs so each end eventually
+            // Survivors: sink fully-closed tigs; carry the rest (re-roll
+            // the presented end for both-open tigs so each end eventually
             // meets its partner).
             for (uint64_t i = 0; i < NT; ++i) {
                 if (consumed[i]) continue;
@@ -546,59 +549,16 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets,
 
 // Seed round 0 from the fragment source into `store`, sinking already-
 // closed fragments. Shared by the in-RAM and file-backed entry points.
+//
+// No precomputed joinable set: full-k-mer keying separates branches
+// structurally (the boundary k-mers differ), and the per-bucket pairing
+// gates each join on equal cid + compatible orientation locally. This
+// deletes the one global O(num_junctions) map the (k-1)-keyed stitch
+// needed -- the round loop now streams only one bucket's tigs at a time.
 template <typename Source, typename Store, typename Sink>
 inline void ext_seed_round0(Source& frag, uint32_t k, Store& store, Sink&& sink,
-                            joinable_set_t& joinable, std::atomic<uint64_t>* done) {
+                            std::atomic<uint64_t>* done) {
     const uint64_t n = (uint64_t)frag.size();
-
-    // Compute the JOINABLE junction set (the in-RAM stitch's exact join
-    // predicate, precomputed once). For each (k-1) junction, track its
-    // open ends: count (capped at 3), and -- for the first 2 -- their
-    // cid and side/orientation. A junction is joinable iff it has
-    // exactly 2 ends, equal cid, and ext_pair_compatible holds. Every
-    // other open end is a terminal unitig boundary.
-    //
-    // Invariant under merging: a junction's two ends are always the same
-    // two original-fragment ends (merges relocate only a tig's OTHER,
-    // outer end), so this set is fixed for the whole run.
-    {
-        struct jinfo {
-            uint8_t count = 0;
-            uint64_t cid[2] = {0, 0};
-            uint8_t side[2] = {0, 0};
-            bool fwd[2] = {false, false};
-        };
-        ankerl::unordered_dense::map<kmer_int_t, jinfo, kmer_hasher> jmap;
-        for (uint64_t i = 0; i < n; ++i) {
-            uint8_t fl = frag.open_flags(i);
-            if (fl == 0) continue;
-            std::string_view sv = frag.seq_view(i);
-            if ((uint32_t)sv.size() < k) continue;
-            uint64_t cid = frag.cid(i);
-            for (uint8_t side : {SIDE_LEFT, SIDE_RIGHT}) {
-                uint8_t bit = (side == SIDE_LEFT) ? UNITIG_OPEN_LEFT : UNITIG_OPEN_RIGHT;
-                if (!(fl & bit)) continue;
-                bool fwd;
-                kmer_int_t j = side_junction_canonical(sv, k, side, fwd);
-                jinfo& info = jmap[j];
-                if (info.count < 2) {
-                    info.cid[info.count] = cid;
-                    info.side[info.count] = side;
-                    info.fwd[info.count] = fwd;
-                }
-                if (info.count < 3) ++info.count;
-            }
-        }
-        for (auto const& kv : jmap) {
-            jinfo const& info = kv.second;
-            if (info.count != 2) continue;
-            if (info.cid[0] != info.cid[1]) continue;
-            ext_end ea{0, kv.first, info.side[0], info.fwd[0]};
-            ext_end eb{0, kv.first, info.side[1], info.fwd[1]};
-            if (!ext_pair_compatible(ea, eb)) continue;
-            joinable.insert(kv.first);
-        }
-    }
 
     for (uint64_t i = 0; i < n; ++i) {
         ext_tig t;
@@ -634,9 +594,8 @@ inline void stitch_unitigs_extmem(Source& frag, uint32_t k, Sink&& sink,
                                   std::atomic<uint64_t>* done = nullptr) {
     if (num_buckets == 0) num_buckets = 256;
     detail::round_store_mem store(num_buckets);
-    detail::joinable_set_t joinable;
-    detail::ext_seed_round0(frag, k, store, sink, joinable, done);
-    detail::ext_run_rounds(store, k, num_buckets, joinable, sink, done);
+    detail::ext_seed_round0(frag, k, store, sink, done);
+    detail::ext_run_rounds(store, k, num_buckets, sink, done);
 }
 
 // External-memory stitch with FILE-backed round storage. Peak RAM is one
@@ -649,9 +608,8 @@ inline void stitch_unitigs_extmem_file(Source& frag, uint32_t k, std::string con
                                        std::atomic<uint64_t>* done = nullptr) {
     if (num_buckets == 0) num_buckets = 1024;
     detail::round_store_file store(tmp_dir, num_buckets);
-    detail::joinable_set_t joinable;
-    detail::ext_seed_round0(frag, k, store, sink, joinable, done);
-    detail::ext_run_rounds(store, k, num_buckets, joinable, sink, done);
+    detail::ext_seed_round0(frag, k, store, sink, done);
+    detail::ext_run_rounds(store, k, num_buckets, sink, done);
 }
 
 }  // namespace cdgb
