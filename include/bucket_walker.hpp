@@ -128,6 +128,16 @@ inline bool is_contig_break(uint8_t flags) {
 struct bucket_kmer_info {
     kmer_entry colors;
     uint8_t flags = 0;
+    // GGCAT primary/foreign distinction. A canonical k-mer is PRIMARY in the
+    // bucket of its own minimizer, where every occurrence routes that is not a
+    // begin-ignored overlap copy; there it is colored (full union over all its
+    // occurrences/genomes) and walk-seeded. In an ADJACENT bucket it appears
+    // only as the begin-ignored idx-0 overlap copy of the next super -- FOREIGN:
+    // a node (for the walk to find the boundary and carry the full k-mer at an
+    // open end) but NOT colored and NOT seeded. At a stitch join the primary
+    // side's colored copy is kept and the foreign side's copy is dropped, so the
+    // boundary k-mer is colored exactly once with its union color.
+    bool primary = false;
 };
 
 using bucket_kmer_map = ankerl::unordered_dense::map<kmer_int_t, bucket_kmer_info, kmer_hasher>;
@@ -197,7 +207,15 @@ inline void load_bucket(std::string const& path, uint32_t k, bucket_kmer_map& ou
 
             bucket_kmer_info& info = out[can];
             info.flags |= contrib;
-            info.colors.add(rsid);
+            // Color (and mark primary) every occurrence EXCEPT a begin-ignored
+            // idx-0 overlap copy, whose primary lives in the adjacent bucket.
+            // If the same canonical k-mer also occurs primary in this bucket via
+            // another super, primary/color win (OR-accumulated, order-free).
+            const bool begin_ignored = (!begin_incl && idx == 0);
+            if (!begin_ignored) {
+                info.colors.add(rsid);
+                info.primary = true;
+            }
         }
     }
 }
@@ -447,7 +465,11 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
             } else {
                 u.seq.push_back(twobit_to_nuc((uint8_t)(walk_kmer(p) & 3)));
             }
-            push_cid(u.runs, cid_of[p.first]);
+            // Foreign boundary k-mers (only ever at an open end) are part of the
+            // sequence (the full-k-mer stitch key) but carry no color run -- the
+            // join keeps the partner's primary, colored copy and drops this one,
+            // so total runs == primary k-mers and seq/runs realign after the cut.
+            if (kmer_info.find(p.first)->second.primary) push_cid(u.runs, cid_of[p.first]);
         };
         for (auto it = bw.rbegin(); it != bw.rend(); ++it) append_kmer(*it);
         append_kmer({seed, false});
@@ -458,9 +480,12 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
         out_local.emplace_back(std::move(u));
     };
 
-    // Seed every k-mer once. Unvisited k-mers on a pure cycle are torn at an
-    // arbitrary seed; both their ends come out CLOSED (no boundary reached).
+    // Seed every PRIMARY k-mer once (foreign overlap copies are never seeded;
+    // they are pulled in only at the open end of a primary's walk). Unvisited
+    // primary k-mers on a pure cycle are torn at an arbitrary seed; both ends
+    // come out CLOSED (no boundary reached).
     for (auto& kv : kmer_info) {
+        if (!kv.second.primary) continue;
         if (visited.find(kv.first) != visited.end()) continue;
         emit_from_seed(kv.first);
     }
