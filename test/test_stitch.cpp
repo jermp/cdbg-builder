@@ -37,6 +37,7 @@ uint64_t g_tmp_counter = 0;
 
 using cdgb::stitchable_unitig;
 using cdgb_test::canonical;
+using cdgb_test::gen_shared_cid_branch;
 using cdgb_test::random_dna;
 using cdgb_test::split_unitig;
 
@@ -148,6 +149,49 @@ bool run_case(uint64_t seed, uint32_t k, uint64_t num_unitigs, uint64_t max_len,
     return a && b && c;
 }
 
+// Shared-cid branchy correctness case. Builds `num_clusters` branch
+// clusters; each cluster is 3 true unitigs that share ONE cid and meet at
+// a dBG branch (see gen_shared_cid_branch). A correct stitch must
+// reproduce every true unitig exactly -- it must NOT glue same-cid
+// unitigs across the branch, and must keep different-cid clusters apart.
+bool run_branch_case_impl(which_stitch w, uint64_t seed, uint32_t k, uint64_t num_clusters) {
+    std::mt19937_64 rng(seed);
+    std::vector<stitchable_unitig> truth;  // 3 unitigs per cluster
+    std::vector<stitchable_unitig> frags;  // shuffled fragments fed to stitch
+    for (uint64_t c = 0; c < num_clusters; ++c) {
+        gen_shared_cid_branch(k, (uint32_t)c, rng, frags, truth);
+    }
+    std::shuffle(frags.begin(), frags.end(), rng);
+
+    std::vector<stitchable_unitig> out;
+    run_stitch(w, frags, k, out);
+
+    multiset_t want = to_multiset(truth);
+    multiset_t got = to_multiset(out);
+    bool ok = (want == got);
+    uint64_t open_outputs = 0;
+    for (auto const& o : out)
+        if (o.open_flags != 0) ++open_outputs;
+
+    if (!ok || open_outputs != 0) {
+        std::fprintf(stderr,
+                     "[FAIL branch %s] seed=%llu k=%u clusters=%llu: want %zu distinct, got %zu "
+                     "distinct, out_count=%zu open_outputs=%llu\n",
+                     stitch_name(w), (unsigned long long)seed, k,
+                     (unsigned long long)num_clusters, want.size(), got.size(), out.size(),
+                     (unsigned long long)open_outputs);
+        return false;
+    }
+    return true;
+}
+
+bool run_branch_case(uint64_t seed, uint32_t k, uint64_t num_clusters) {
+    bool a = run_branch_case_impl(which_stitch::in_ram, seed, k, num_clusters);
+    bool b = run_branch_case_impl(which_stitch::ext_mem, seed, k, num_clusters);
+    bool c = run_branch_case_impl(which_stitch::ext_file, seed, k, num_clusters);
+    return a && b && c;
+}
+
 // Larger case: report timing + fragment/unitig counts, plus the same
 // correctness check. Single-thread in-RAM stitch; this is the baseline
 // the external-memory redesign must match.
@@ -206,6 +250,13 @@ int main() {
     if (!run_case(1001, k, 1, k, 1)) ++failures;       // single k-length unitig, 1 frag
     if (!run_case(1002, k, 1, k + 5, 6)) ++failures;   // 1 unitig, many frags
     if (!run_case(1003, k, 500, 60, 10)) ++failures;   // many short unitigs
+
+    // Shared-cid branchy cases: catch same-cid false joins at dBG
+    // branches (the distinct-cid oracle above cannot).
+    for (uint64_t seed = 2001; seed <= 2010; ++seed) {
+        const uint64_t clusters = 1 + (seed % 8);
+        if (!run_branch_case(seed, k, clusters)) ++failures;
+    }
 
     // Medium scale (correctness + timing).
     if (!run_scale(9001, k, 50000)) ++failures;

@@ -116,4 +116,64 @@ inline std::vector<cdgb::stitchable_unitig> split_unitig(std::string const& S, u
     return frags;
 }
 
+// Shared-cid branchy oracle.
+//
+// The distinct-cid oracle above structurally cannot catch same-cid false
+// joins: with a unique cid per true unitig the cid gate alone forbids any
+// cross-unitig glue. This builds the adversarial case instead -- THREE
+// true unitigs that all share ONE cid and meet at a de Bruijn branch:
+//
+//   stem ........B]              (B = stem's last k-mer; out-degree 2)
+//                 \--[Bsuf+x.... ua
+//                  \-[Bsuf+y.... ub
+//
+// At the branch the three meeting ends share their (k-1) junction
+// (B[1:] == Bsuf == first k-1 bases of ua/ub's first k-mer) but NOT their
+// full boundary k-mer (B != Bsuf+x != Bsuf+y). The meeting ends are
+// CLOSED (a branch is a real unitig terminus), so a correct full-k-mer
+// stitcher that honors closed ends keeps all three separate. A (k-1)-keyed
+// stitcher -- or one that ignores the cid/closed gate -- would falsely
+// glue stem onto ua and/or ub. Each unitig is split into k-overlap
+// fragments (randomly RC'd) and appended to `frags_out`; the three whole
+// unitigs (closed both ends, shared cid) are appended to `truth_out`.
+inline void gen_shared_cid_branch(uint32_t k, uint32_t cid, std::mt19937_64& rng,
+                                  std::vector<cdgb::stitchable_unitig>& frags_out,
+                                  std::vector<cdgb::stitchable_unitig>& truth_out) {
+    using cdgb::stitchable_unitig;
+    static const char bases[4] = {'A', 'C', 'G', 'T'};
+
+    // Stem long enough to carry a real interior; its last k bases are B.
+    const uint64_t stem_len = 2 * (uint64_t)k + (rng() % (3 * (uint64_t)k));
+    std::string stem = random_dna(stem_len, rng);
+    const std::string Bsuf = stem.substr(stem.size() - (k - 1));  // B[1:], length k-1
+
+    // Two distinct first bases for the two successor unitigs -> out-degree 2.
+    char x = bases[rng() & 3u];
+    char y = bases[rng() & 3u];
+    while (y == x) y = bases[rng() & 3u];
+
+    // Successor unitig: first k-mer is (Bsuf + base), then a random tail.
+    auto make_branch = [&](char base) -> std::string {
+        const uint64_t tail = (uint64_t)k + (rng() % (2 * (uint64_t)k));
+        return Bsuf + base + random_dna(tail, rng);
+    };
+    std::string ua = make_branch(x);
+    std::string ub = make_branch(y);
+
+    std::string* unitigs[3] = {&stem, &ua, &ub};
+    for (uint64_t i = 0; i < 3; ++i) {
+        std::string const& S = *unitigs[i];
+        stitchable_unitig t;
+        t.seq = S;
+        t.cid = cid;
+        t.open_flags = 0;
+        truth_out.push_back(std::move(t));
+
+        const uint64_t M = (S.size() >= k) ? (S.size() - k + 1) : 1;
+        const uint64_t nf = 1 + (rng() % std::max<uint64_t>(1, M - 1));
+        auto parts = split_unitig(S, k, cid, nf, rng);
+        for (auto& p : parts) frags_out.push_back(std::move(p));
+    }
+}
+
 }  // namespace cdgb_test
