@@ -534,6 +534,10 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
         }
 
         store.advance();
+#ifdef CDGB_STITCH_DEBUG
+        std::cerr << "[ext-stitch round " << round_no << "] carried=" << carried_this_round
+                  << "\n";
+#endif
         if (carried_this_round == 0) break;  // store drained
         if (round_no >= MAX_ROUNDS) {
             std::cerr << "[ext-stitch] WARNING: round cap " << MAX_ROUNDS << " hit; flushing "

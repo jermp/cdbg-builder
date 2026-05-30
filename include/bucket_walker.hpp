@@ -211,6 +211,7 @@ inline bool node_is_ignored(kmer_int_t can, bucket_kmer_map const& m) {
 
 // 8-bit local extension mask, bits 0..3 = forward-side successors of `can`,
 // bits 4..7 = back-side predecessors (= forward-side successors of rc(can)).
+// Counts EVERY neighbor present in the map (owned or ignored).
 inline uint8_t local_ext_mask(kmer_int_t can, uint32_t k, bucket_kmer_map const& m) {
     uint8_t out = 0;
     kmer_int_t fwd = can;
@@ -220,6 +221,29 @@ inline uint8_t local_ext_mask(kmer_int_t can, uint32_t k, bucket_kmer_map const&
         if (m.find(canonical(ext_f, k)) != m.end()) out |= (uint8_t)(1u << nt);
         kmer_int_t ext_r = shift_append(rev, nt, k);
         if (m.find(canonical(ext_r, k)) != m.end()) out |= (uint8_t)(1u << (4 + nt));
+    }
+    return out;
+}
+
+// Like local_ext_mask but only counts OWNED neighbors. The difference
+// (full minus owned) is the set of edges to ignored boundary nodes -- the
+// foreign cross-bucket crossings. We separate them because an ignored
+// node and a phantom edge on the same side are the SAME physical crossing
+// (the foreign successor is both flagged via the super's begin/end-ignored
+// phantom AND present as the adjacent super's duplicated boundary k-mer);
+// counting both as distinct edges falsely inflated degree and closed
+// hundreds of thousands of ends that are really simple-path boundaries.
+inline uint8_t owned_ext_mask(kmer_int_t can, uint32_t k, bucket_kmer_map const& m) {
+    uint8_t out = 0;
+    kmer_int_t fwd = can;
+    kmer_int_t rev = reverse_complement(can, k);
+    for (uint8_t nt = 0; nt < 4; ++nt) {
+        kmer_int_t cf = canonical(shift_append(fwd, nt, k), k);
+        auto itf = m.find(cf);
+        if (itf != m.end() && itf->second.owned) out |= (uint8_t)(1u << nt);
+        kmer_int_t cr = canonical(shift_append(rev, nt, k), k);
+        auto itr = m.find(cr);
+        if (itr != m.end() && itr->second.owned) out |= (uint8_t)(1u << (4 + nt));
     }
     return out;
 }
@@ -235,6 +259,53 @@ inline bool phantom_on_fwd(uint8_t phantom, bool rc) {
 }
 inline bool phantom_on_back(uint8_t phantom, bool rc) {
     return rc ? (phantom & KMER_PHANTOM_RIGHT) : (phantom & KMER_PHANTOM_LEFT);
+}
+
+// Per-side degree of `can` in walking orientation `rc`, separating real
+// interior continuations (owned neighbors) from foreign cross-bucket
+// crossings. A crossing can be signalled two redundant ways for the same
+// physical edge -- a phantom flag on this k-mer AND the foreign successor
+// present as an ignored boundary node -- so we DEDUP: foreign counts the
+// ignored-node edges, plus the phantom only if there is no ignored edge on
+// that side. This is the fix for the ~670k ends the walker over-closed by
+// counting phantom and its ignored-node twin as two distinct edges.
+struct side_degree {
+    uint8_t owned_nib;  // owned successor nibble (for picking the next base)
+    int owned;          // # owned successors
+    int foreign;        // # foreign crossings (deduped)
+    int total;          // owned + foreign
+};
+inline side_degree fwd_degree(kmer_int_t can, bool rc, uint32_t k, bucket_kmer_map const& m,
+                              uint8_t phantom) {
+    uint8_t full = local_ext_mask(can, k, m);
+    uint8_t owned = owned_ext_mask(can, k, m);
+    uint8_t full_n = fwd_nibble(full, rc);
+    uint8_t owned_n = fwd_nibble(owned, rc);
+    int ignored = __builtin_popcount((uint8_t)(full_n & ~owned_n));
+    int ph = phantom_on_fwd(phantom, rc) ? 1 : 0;
+    int foreign = ignored + ((ph && ignored == 0) ? 1 : 0);
+    side_degree d;
+    d.owned_nib = owned_n;
+    d.owned = __builtin_popcount(owned_n);
+    d.foreign = foreign;
+    d.total = d.owned + foreign;
+    return d;
+}
+inline side_degree back_degree(kmer_int_t can, bool rc, uint32_t k, bucket_kmer_map const& m,
+                               uint8_t phantom) {
+    uint8_t full = local_ext_mask(can, k, m);
+    uint8_t owned = owned_ext_mask(can, k, m);
+    uint8_t full_n = back_nibble(full, rc);
+    uint8_t owned_n = back_nibble(owned, rc);
+    int ignored = __builtin_popcount((uint8_t)(full_n & ~owned_n));
+    int ph = phantom_on_back(phantom, rc) ? 1 : 0;
+    int foreign = ignored + ((ph && ignored == 0) ? 1 : 0);
+    side_degree d;
+    d.owned_nib = owned_n;
+    d.owned = __builtin_popcount(owned_n);
+    d.foreign = foreign;
+    d.total = d.owned + foreign;
+    return d;
 }
 
 struct b_step {
@@ -272,50 +343,37 @@ inline left_end_check classify_left_end(
     ankerl::unordered_dense::map<kmer_int_t, uint32_t, kmer_hasher> const& cid_of) {
     auto it = m.find(can);
     uint8_t phantom = it->second.phantom;
-    uint8_t mask = local_ext_mask(can, k, m);
-    uint8_t back = back_nibble(mask, rc);
-    int local_back_n = __builtin_popcount(back);
-    int phantom_back_n = phantom_on_back(phantom, rc) ? 1 : 0;
-    int total_back = local_back_n + phantom_back_n;
-    if (total_back != 1) return {true, false, false, 0};
-    if (local_back_n == 0) {
-        // Only edge is phantom (a foreign successor seen from the flipped
-        // orientation, end-boundary model): open-left. `can` IS the boundary
-        // k-mer and is itself the start k-mer, so no prepend is needed.
-        return {true, true, false, 0};
+    side_degree bd = back_degree(can, rc, k, m, phantom);
+    if (bd.total != 1) return {true, false, false, 0};  // branch / isolated: closed left
+    if (bd.owned == 0) {
+        // The single back-side edge is a foreign crossing. If it is present
+        // as an ignored boundary node, `can` is open-left and the fragment
+        // prepends that node's leading base so its first k bases equal the
+        // shared boundary k-mer. For a pure phantom crossing, `can` IS the
+        // boundary k-mer already -- open-left, no prepend.
+        uint8_t full_n = back_nibble(local_ext_mask(can, k, m), rc);
+        uint8_t owned_n = back_nibble(owned_ext_mask(can, k, m), rc);
+        uint8_t ign_n = (uint8_t)(full_n & ~owned_n);
+        if (!ign_n) return {true, true, false, 0};  // pure phantom: no prepend
+        uint8_t nt = (uint8_t)__builtin_ctz(ign_n);
+        auto sr = bstep(can, !rc, k, nt);
+        kmer_int_t pred_can = sr.next_can;
+        bool pred_rc = !sr.next_rc;
+        kmer_int_t pred_walk = pred_rc ? reverse_complement(pred_can, k) : pred_can;
+        uint8_t base = (uint8_t)((pred_walk >> (2 * (k - 1))) & 3);
+        return {true, true, true, base};
     }
-    // total_back == 1 and the edge is local. The predecessor is either an
-    // owned interior k-mer (continue the chain) or an ignored boundary node.
-    uint8_t nt = (uint8_t)__builtin_ctz(back);
+    // The single back edge is an owned interior predecessor: continue the
+    // straight-line check -- its forward in walking orientation must also be
+    // degree 1 and color-match, else `can` is a (closed) left end.
+    uint8_t nt = (uint8_t)__builtin_ctz(bd.owned_nib);
     auto sr = bstep(can, !rc, k, nt);
     kmer_int_t pred_can = sr.next_can;
     bool pred_rc = !sr.next_rc;
     auto pit = m.find(pred_can);
     if (pit == m.end()) return {true, false, false, 0};  // shouldn't happen
-
-    if (!pit->second.owned) {
-        // Predecessor is the ignored boundary k-mer (its primary copy is in
-        // the adjacent bucket). If it has forward-degree exactly 1 (toward
-        // `can`) it is a simple cross-bucket boundary: `can` is open-left and
-        // the fragment prepends the boundary k-mer's leading base so its
-        // first k bases equal that k-mer, ready for the full-k-mer join. If
-        // it forks (degree >= 2), it is a real branch and `can` is a CLOSED
-        // unitig terminus that must NOT carry/join on the shared k-mer.
-        uint8_t pred_mask = local_ext_mask(pred_can, k, m);
-        int pred_local_fwd = __builtin_popcount(fwd_nibble(pred_mask, pred_rc));
-        if (pred_local_fwd != 1) return {true, false, false, 0};  // branch: closed
-        kmer_int_t pred_walk = pred_rc ? reverse_complement(pred_can, k) : pred_can;
-        uint8_t base = (uint8_t)((pred_walk >> (2 * (k - 1))) & 3);
-        return {true, true, true, base};
-    }
-
-    // Owned predecessor: continue the straight-line check exactly as before --
-    // its forward in walking orientation must also be degree 1 and color-match.
-    uint8_t pred_phantom = pit->second.phantom;
-    uint8_t pred_mask = local_ext_mask(pred_can, k, m);
-    int pred_local_fwd = __builtin_popcount(fwd_nibble(pred_mask, pred_rc));
-    int pred_phantom_fwd = phantom_on_fwd(pred_phantom, pred_rc) ? 1 : 0;
-    if (pred_local_fwd + pred_phantom_fwd != 1) return {true, false, false, 0};
+    side_degree pfd = fwd_degree(pred_can, pred_rc, k, m, pit->second.phantom);
+    if (pfd.total != 1) return {true, false, false, 0};
     auto cit = cid_of.find(pred_can);
     if (cit == cid_of.end() || cit->second != cid) return {true, false, false, 0};
     return {false, false, false, 0};
@@ -439,38 +497,39 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
         for (;;) {
             auto it = kmer_info.find(can);
             uint8_t phantom = it->second.phantom;
-            uint8_t mask = local_ext_mask(can, k, kmer_info);
-            uint8_t fwd_n = fwd_nibble(mask, rc);
-            int local_fwd = __builtin_popcount(fwd_n);
-            int phantom_fwd = phantom_on_fwd(phantom, rc) ? 1 : 0;
-            if (local_fwd + phantom_fwd != 1) break;  // closed (branch / dead end)
-            if (local_fwd == 0) {                     // open right (end boundary)
+            side_degree fd = fwd_degree(can, rc, k, kmer_info, phantom);
+            if (fd.total != 1) break;  // closed (branch / dead end)
+            if (fd.owned == 0) {
+                // The single forward continuation is a foreign crossing into
+                // the adjacent bucket: open-right. Include the boundary
+                // k-mer's trailing base when the foreign successor is present
+                // as an ignored node here, so the fragment ends with the full
+                // shared boundary k-mer; for a pure phantom crossing `can` is
+                // itself the boundary k-mer and no extra base is needed.
+                if (fd.foreign == 1) {
+                    uint8_t full_n = fwd_nibble(local_ext_mask(can, k, kmer_info), rc);
+                    uint8_t owned_n = fwd_nibble(owned_ext_mask(can, k, kmer_info), rc);
+                    uint8_t ign_n = (uint8_t)(full_n & ~owned_n);
+                    if (ign_n) {
+                        uint8_t nt = (uint8_t)__builtin_ctz(ign_n);
+                        auto sr = bstep(can, rc, k, nt);
+                        kmer_int_t nxt_walk = sr.next_rc ? reverse_complement(sr.next_can, k)
+                                                         : sr.next_can;
+                        u.seq.push_back(twobit_to_nuc((uint8_t)(nxt_walk & 3)));
+                    }
+                }
                 u.open_flags |= UNITIG_OPEN_RIGHT;
                 break;
             }
-            uint8_t nt = (uint8_t)__builtin_ctz(fwd_n);
+            uint8_t nt = (uint8_t)__builtin_ctz(fd.owned_nib);
             auto sr = bstep(can, rc, k, nt);
-            // If the successor is an ignored boundary node, this is a
-            // begin-boundary seen from the far side: include its trailing
-            // base so the fragment ends with the full shared boundary k-mer,
-            // mark OPEN_RIGHT, and stop. (Its primary copy + the rest of that
-            // unitig live in the adjacent bucket.)
-            if (node_is_ignored(sr.next_can, kmer_info)) {
-                kmer_int_t nxt_walk = sr.next_rc ? reverse_complement(sr.next_can, k)
-                                                 : sr.next_can;
-                u.seq.push_back(twobit_to_nuc((uint8_t)(nxt_walk & 3)));
-                u.open_flags |= UNITIG_OPEN_RIGHT;
-                break;
-            }
             // Successor must (a) have back-side degree exactly 1 in walking
             // orientation (no incoming branch) and (b) carry the same cid.
             auto nit = kmer_info.find(sr.next_can);
             if (nit == kmer_info.end()) break;
             uint8_t next_phantom = nit->second.phantom;
-            uint8_t next_mask = local_ext_mask(sr.next_can, k, kmer_info);
-            int next_local_back = __builtin_popcount(back_nibble(next_mask, sr.next_rc));
-            int next_phantom_back = phantom_on_back(next_phantom, sr.next_rc) ? 1 : 0;
-            if (next_local_back + next_phantom_back != 1) break;
+            side_degree nbd = back_degree(sr.next_can, sr.next_rc, k, kmer_info, next_phantom);
+            if (nbd.total != 1) break;
             if (cid_of[sr.next_can] != cid) break;
             if (visited.find(sr.next_can) != visited.end()) break;  // cycle closure
             visited[sr.next_can] = 1;
