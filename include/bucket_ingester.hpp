@@ -85,7 +85,13 @@ inline void emit_super_kmers(uint8_t const* bases, uint32_t L, uint32_t k, uint3
         uint64_t new_min = mq.min_hash();
         if (new_min != cur_min) {
             emit_super(super_start, i - 1, cur_bucket, is_first_super, /*is_run_end=*/false);
-            super_start = i;
+            // k-base overlap (GGCAT lib.rs:240-256): the next super-k-mer
+            // starts at k-mer i-1, the SAME k-mer that was the last of the
+            // super just emitted, so consecutive supers physically share
+            // their full boundary k-mer (k bases). The walker decides which
+            // bucket owns that duplicated k-mer (step 3); here we only emit
+            // the overlap. (Was `super_start = i`, a k-1 junction overlap.)
+            super_start = i - 1;
             is_first_super = false;
             cur_min = new_min;
             cur_bucket = bucket_of(new_min);
