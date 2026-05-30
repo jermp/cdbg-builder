@@ -92,6 +92,18 @@ inline constexpr uint8_t KMER_PHANTOM_RIGHT = 1u << 1;  // phantom successor exi
 struct bucket_kmer_info {
     kmer_entry colors;
     uint8_t phantom = 0;
+    // k-overlap "ignored boundary" model (GGCAT hashmap.rs:382-398).
+    // owned == false means this canonical k-mer is present ONLY as the
+    // foreign first k-mer of a begin-ignored super-k-mer -- it is the
+    // duplicated boundary k-mer whose primary copy (color + walk) lives
+    // in the adjacent bucket that ends a super on it. We keep it in the
+    // map as a colorless NODE so local degree counting sees it (that is
+    // what makes branch detection local, replacing the old global
+    // joinable map), but we never color it, never assign it a cid, never
+    // start a walk from it, and never emit it as an interior node. The
+    // walk stops when a step lands on an ignored node, marking that end
+    // OPEN and including the full boundary k-mer there.
+    bool owned = false;
 };
 
 using bucket_kmer_map = ankerl::unordered_dense::map<kmer_int_t, bucket_kmer_info, kmer_hasher>;
@@ -129,43 +141,72 @@ inline void load_bucket(std::string const& path, uint32_t k, bucket_kmer_map& ou
             rc = (rc >> 2) | ((kmer_int_t)(v ^ 3) << k_minus_1_x2);
         }
 
-        kmer_int_t first_can = 0, last_can = 0;
-        bool first_is_fwd = true, last_is_fwd = true;
-        bool have_first = false;
+        // k-overlap "ignored boundary" model (GGCAT hashmap.rs:382-398).
+        // With k-base super-k-mer overlap, the super's FIRST k-mer is the
+        // boundary k-mer duplicated from the predecessor super in the
+        // adjacent bucket whenever this super does not begin an ACGT run
+        // (IS_ACGT_BEGIN clear). That boundary k-mer's own minimizer is the
+        // OLD minimizer, so its primary (colored, walkable) copy lives in
+        // that predecessor bucket; here it is FOREIGN. We add it to the map
+        // as a colorless ignored node (owned stays false) so the local
+        // degree count sees it -- it is the predecessor that makes the owned
+        // start k-mer open-left, and the walk includes it at that open end
+        // so the emitted fragment carries the full boundary k-mer for the
+        // cross-bucket join. We never color it, never give it a cid, never
+        // start a walk from it. The super's last k-mer is always owned (only
+        // index 0 can be foreign), and the END boundary is unchanged from
+        // the pre-overlap model: the foreign successor is NOT present in
+        // this bucket, so it is still signalled by a phantom-right edge.
+        const bool begin_ignored = (flags & SK_FLAG_IS_ACGT_BEGIN) == 0;
+        const bool end_ignored = (flags & SK_FLAG_IS_ACGT_END) == 0;
 
-        for (uint32_t i = k - 1; i < bases.size(); ++i) {
+        kmer_int_t last_can = 0;
+        bool last_is_fwd = true;
+        bool have_owned = false;
+        uint32_t idx = 0;
+        for (uint32_t i = k - 1; i < bases.size(); ++i, ++idx) {
             uint8_t v = bases[i];
             fwd = ((fwd << 2) | v) & mask;
             rc = (rc >> 2) | ((kmer_int_t)(v ^ 3) << k_minus_1_x2);
             bool is_fwd = (fwd <= rc);
             kmer_int_t can = is_fwd ? fwd : rc;
-            out[can].colors.add(rsid);
-            if (!have_first) {
-                first_can = can;
-                first_is_fwd = is_fwd;
-                have_first = true;
+            if (idx == 0 && begin_ignored) {
+                // Foreign boundary k-mer: ensure the node exists but do not
+                // color it or claim ownership. If the same canonical k-mer
+                // is owned via another record in this bucket, that record's
+                // else-branch below sets owned=true; touching here never
+                // clears it.
+                out[can];
+            } else {
+                bucket_kmer_info& info = out[can];
+                info.owned = true;
+                info.colors.add(rsid);
+                last_can = can;
+                last_is_fwd = is_fwd;
+                have_owned = true;
             }
-            last_can = can;
-            last_is_fwd = is_fwd;
         }
-        if (!have_first) continue;
+        if (!have_owned) continue;  // super was a lone foreign boundary k-mer
 
-        // Boundary phantom edges. The super-k-mer's first k-mer (in input
-        // order) has a predecessor in another bucket iff IS_ACGT_BEGIN is
-        // not set. Likewise the last k-mer for IS_ACGT_END.
-        if ((flags & SK_FLAG_IS_ACGT_BEGIN) == 0) {
-            // The phantom edge enters first_kmer's input "back" side.
-            // In canonical orientation: input-back maps to canonical-left if
-            // input == canonical, else canonical-right.
-            uint8_t bit = first_is_fwd ? KMER_PHANTOM_LEFT : KMER_PHANTOM_RIGHT;
-            out[first_can].phantom |= bit;
-        }
-        if ((flags & SK_FLAG_IS_ACGT_END) == 0) {
-            // Phantom edge exits last_kmer on its input "fwd" side.
+        // End boundary: the owned last k-mer has a successor in another
+        // bucket iff IS_ACGT_END is not set. That successor is not a node
+        // here, so signal it with a phantom-right edge (canonical-oriented).
+        if (end_ignored) {
             uint8_t bit = last_is_fwd ? KMER_PHANTOM_RIGHT : KMER_PHANTOM_LEFT;
             out[last_can].phantom |= bit;
         }
+        // No begin-side phantom: the foreign predecessor is represented by
+        // the ignored node added above, which the walk detects and includes.
     }
+}
+
+// True iff `can` is present in the map only as an ignored boundary node
+// (the foreign duplicated copy of a k-mer owned by an adjacent bucket).
+// Such a node participates in local degree counting (so branch detection
+// stays local) but is never colored, walk-started, or emitted as interior.
+inline bool node_is_ignored(kmer_int_t can, bucket_kmer_map const& m) {
+    auto it = m.find(can);
+    return it != m.end() && !it->second.owned;
 }
 
 // 8-bit local extension mask, bits 0..3 = forward-side successors of `can`,
@@ -222,7 +263,9 @@ inline b_step bstep(kmer_int_t can, bool rc, uint32_t k, uint8_t nt) {
 // makes the resulting unitig OPEN_LEFT.
 struct left_end_check {
     bool is_left_end;
-    bool back_is_phantom_only;  // true => unitig will be open-left
+    bool open_left;        // true => unitig will be OPEN_LEFT
+    bool prepend;          // true => prepend `prepend_base` to carry the full boundary k-mer
+    uint8_t prepend_base;  // walking-orientation leading base of the boundary k-mer
 };
 inline left_end_check classify_left_end(
     kmer_int_t can, bool rc, uint32_t cid, uint32_t k, bucket_kmer_map const& m,
@@ -234,27 +277,48 @@ inline left_end_check classify_left_end(
     int local_back_n = __builtin_popcount(back);
     int phantom_back_n = phantom_on_back(phantom, rc) ? 1 : 0;
     int total_back = local_back_n + phantom_back_n;
-    if (total_back != 1) return {true, false};
+    if (total_back != 1) return {true, false, false, 0};
     if (local_back_n == 0) {
-        // Only edge is phantom: this is a left-end and the unitig is open.
-        return {true, true};
+        // Only edge is phantom (a foreign successor seen from the flipped
+        // orientation, end-boundary model): open-left. `can` IS the boundary
+        // k-mer and is itself the start k-mer, so no prepend is needed.
+        return {true, true, false, 0};
     }
-    // total_back == 1 and edge is local. Walk to predecessor and check that
-    // *its* forward in walking orientation is also degree 1 and color matches.
+    // total_back == 1 and the edge is local. The predecessor is either an
+    // owned interior k-mer (continue the chain) or an ignored boundary node.
     uint8_t nt = (uint8_t)__builtin_ctz(back);
     auto sr = bstep(can, !rc, k, nt);
     kmer_int_t pred_can = sr.next_can;
     bool pred_rc = !sr.next_rc;
     auto pit = m.find(pred_can);
-    if (pit == m.end()) return {true, false};  // shouldn't happen: local_back_n said it does
+    if (pit == m.end()) return {true, false, false, 0};  // shouldn't happen
+
+    if (!pit->second.owned) {
+        // Predecessor is the ignored boundary k-mer (its primary copy is in
+        // the adjacent bucket). If it has forward-degree exactly 1 (toward
+        // `can`) it is a simple cross-bucket boundary: `can` is open-left and
+        // the fragment prepends the boundary k-mer's leading base so its
+        // first k bases equal that k-mer, ready for the full-k-mer join. If
+        // it forks (degree >= 2), it is a real branch and `can` is a CLOSED
+        // unitig terminus that must NOT carry/join on the shared k-mer.
+        uint8_t pred_mask = local_ext_mask(pred_can, k, m);
+        int pred_local_fwd = __builtin_popcount(fwd_nibble(pred_mask, pred_rc));
+        if (pred_local_fwd != 1) return {true, false, false, 0};  // branch: closed
+        kmer_int_t pred_walk = pred_rc ? reverse_complement(pred_can, k) : pred_can;
+        uint8_t base = (uint8_t)((pred_walk >> (2 * (k - 1))) & 3);
+        return {true, true, true, base};
+    }
+
+    // Owned predecessor: continue the straight-line check exactly as before --
+    // its forward in walking orientation must also be degree 1 and color-match.
     uint8_t pred_phantom = pit->second.phantom;
     uint8_t pred_mask = local_ext_mask(pred_can, k, m);
     int pred_local_fwd = __builtin_popcount(fwd_nibble(pred_mask, pred_rc));
     int pred_phantom_fwd = phantom_on_fwd(pred_phantom, pred_rc) ? 1 : 0;
-    if (pred_local_fwd + pred_phantom_fwd != 1) return {true, false};
+    if (pred_local_fwd + pred_phantom_fwd != 1) return {true, false, false, 0};
     auto cit = cid_of.find(pred_can);
-    if (cit == cid_of.end() || cit->second != cid) return {true, false};
-    return {false, false};
+    if (cit == cid_of.end() || cit->second != cid) return {true, false, false, 0};
+    return {false, false, false, 0};
 }
 
 inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_colors,
@@ -308,6 +372,10 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
         std::vector<uint32_t> rsids_scratch;
         std::vector<uint32_t> merged_scratch;
         for (auto& kv : kmer_info) {
+            // Ignored boundary nodes carry no color (no rsid). Skip them:
+            // they get no cid and are never walk-started or emitted. Their
+            // primary copy is colored in the bucket that owns them.
+            if (!kv.second.owned) continue;
             kmer_entry& e = kv.second.colors;
             uint32_t cid;
             if (e.rest.empty()) {
@@ -348,10 +416,15 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
     ankerl::unordered_dense::map<kmer_int_t, uint8_t, kmer_hasher> visited;
     visited.reserve(kmer_info.size());
 
-    auto extend_and_emit = [&](kmer_int_t start_can, bool start_rc, uint32_t cid, bool open_left) {
+    auto extend_and_emit = [&](kmer_int_t start_can, bool start_rc, uint32_t cid, bool open_left,
+                               bool prepend, uint8_t prepend_base) {
         stitchable_unitig u;
         kmer_int_t cur = start_rc ? reverse_complement(start_can, k) : start_can;
         u.seq = kmer_to_string(cur, k);
+        // Carry the full boundary k-mer at an open-left end: prepend the
+        // ignored boundary k-mer's leading base so the fragment's first k
+        // bases equal that shared boundary k-mer (full-k-mer stitch key).
+        if (prepend) u.seq.insert(u.seq.begin(), twobit_to_nuc(prepend_base));
         // Local cid; process_buckets remaps to global after merging the
         // local_dict into the shared global dict. The actual color list
         // lives in out_local_dict and is moved into the global dict
@@ -371,12 +444,24 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
             int local_fwd = __builtin_popcount(fwd_n);
             int phantom_fwd = phantom_on_fwd(phantom, rc) ? 1 : 0;
             if (local_fwd + phantom_fwd != 1) break;  // closed (branch / dead end)
-            if (local_fwd == 0) {                     // open right
+            if (local_fwd == 0) {                     // open right (end boundary)
                 u.open_flags |= UNITIG_OPEN_RIGHT;
                 break;
             }
             uint8_t nt = (uint8_t)__builtin_ctz(fwd_n);
             auto sr = bstep(can, rc, k, nt);
+            // If the successor is an ignored boundary node, this is a
+            // begin-boundary seen from the far side: include its trailing
+            // base so the fragment ends with the full shared boundary k-mer,
+            // mark OPEN_RIGHT, and stop. (Its primary copy + the rest of that
+            // unitig live in the adjacent bucket.)
+            if (node_is_ignored(sr.next_can, kmer_info)) {
+                kmer_int_t nxt_walk = sr.next_rc ? reverse_complement(sr.next_can, k)
+                                                 : sr.next_can;
+                u.seq.push_back(twobit_to_nuc((uint8_t)(nxt_walk & 3)));
+                u.open_flags |= UNITIG_OPEN_RIGHT;
+                break;
+            }
             // Successor must (a) have back-side degree exactly 1 in walking
             // orientation (no incoming branch) and (b) carry the same cid.
             auto nit = kmer_info.find(sr.next_can);
@@ -399,22 +484,25 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
     // First pass: start from k-mers that look like a left-end of some unitig.
     for (auto& kv : kmer_info) {
         kmer_int_t can = kv.first;
+        // Ignored boundary nodes are never walk-started: their primary copy
+        // is walked in the owning bucket. (They are also never in cid_of.)
+        if (!kv.second.owned) continue;
         if (visited.find(can) != visited.end()) continue;
         uint32_t cid = cid_of[can];
         // Try both orientations.
         auto le_f = classify_left_end(can, false, cid, k, kmer_info, cid_of);
         auto le_r = classify_left_end(can, true, cid, k, kmer_info, cid_of);
+        left_end_check le;
         bool start_rc;
-        bool open_left;
         if (le_f.is_left_end) {
             start_rc = false;
-            open_left = le_f.back_is_phantom_only;
+            le = le_f;
         } else if (le_r.is_left_end) {
             start_rc = true;
-            open_left = le_r.back_is_phantom_only;
+            le = le_r;
         } else
             continue;
-        extend_and_emit(can, start_rc, cid, open_left);
+        extend_and_emit(can, start_rc, cid, le.open_left, le.prepend, le.prepend_base);
     }
 
     // Second pass: anything still unvisited is on a pure cycle inside the
@@ -422,8 +510,10 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
     // (since by definition no left-end exists, but we've torn the cycle).
     for (auto& kv : kmer_info) {
         kmer_int_t can = kv.first;
+        if (!kv.second.owned) continue;  // never start from an ignored node
         if (visited.find(can) != visited.end()) continue;
-        extend_and_emit(can, false, cid_of[can], /*open_left=*/false);
+        extend_and_emit(can, false, cid_of[can], /*open_left=*/false,
+                        /*prepend=*/false, /*prepend_base=*/0);
     }
     prof.ns_walk.fetch_add(bucket_process_prof::since(t_walk), std::memory_order_relaxed);
     prof.n_unitigs.fetch_add((uint64_t)out_local.size(), std::memory_order_relaxed);
