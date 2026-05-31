@@ -10,6 +10,19 @@ file-by-file plan in §7, validating against the test oracle at each
 step. Branch to use: `claude/stitch-fully-external` (off main; currently
 holds only the merged ext-mem stitch, no in-progress edits).
 
+> **Correctness note (count is 86630, not 87297).** Earlier revisions of
+> this doc cited 87297 unitigs on salmonella_10, taken from the `main`
+> branch on the assumption it was ground truth. It is not: `main`
+> OVER-splits 626 unitigs into 1293 at provably simple-path points (0
+> internal dBG branches, 0 color changes, unique junction k-mers with
+> real edges). The correct colored compacted dBG has **86630** unitigs,
+> confirmed by an independent naive Python builder (now folded into
+> `test_data/verify.py`, which compares by exact unitig-set equality). The
+> shipped pipeline produces exactly that. Two walker/stitch bugs that had
+> inflated the count to 440k were fixed at the same time (walk every
+> k-mer, not just color-owned ones; coalesce reconciled color runs).
+> Do NOT "fix" the builder to reproduce 87297 — that count is wrong.
+
 ---
 
 ## 1. The problem (why this work exists)
@@ -23,8 +36,8 @@ On the Blackwell 661k pangenome run (`-g 64`):
   at 5.7e9 fragments.
 
 The ext-mem stitch (merged, PR #31, `stitch_extmem.hpp`) fixed the
-segfault and is **correct** (exact, deterministic 87297 unitigs on
-salmonella_10; all 3 test paths pass). BUT it is **not memory-bounded**:
+segfault and is **correct** (exact, deterministic 86630 unitigs on
+salmonella_10; all test paths pass). BUT it is **not memory-bounded**:
 two structures are still fully in-RAM and blow `-g` at 661k:
 
 - **(A) frag_unitig_reader index**: a `vector<entry>` (24 B/fragment)
@@ -242,9 +255,9 @@ Adopt GGCAT's model end to end:
 
 ## 7. File-by-file change list (implementation order)
 
-Validate `bash test_data/run_test.sh` (expect 87297 unitigs, 171 color
-sets, 0 internal-branch problems) AND `build/test_stitch` after each
-step that can be tested.
+Validate `bash test_data/run_test.sh` (expect 86630 unitigs == the
+independent ground-truth ccdBG, 171 color sets) AND `build/test_stitch`
+after each step that can be tested.
 
 1. `test/gen.hpp` — update `split_unitig` to k-overlap; add a shared-cid
    branchy generator. (Do FIRST so the oracle is ready.)
@@ -257,8 +270,9 @@ step that can be tested.
 5. `stitch.hpp` — full-k-mer concat (oracle) or retire.
 6. `frag_unitig_*` in `unitig_spill.hpp` — streaming Source; wire into
    `builder.hpp` stitch call.
-7. End-to-end: salmonella_10 byte-identical (87297); then a larger run
-   to confirm peak RAM tracks `-g`.
+7. End-to-end: salmonella_10 matches the ground-truth ccdBG (86630
+   unitigs via `verify.py`); then a larger run to confirm peak RAM
+   tracks `-g`.
 
 ---
 
