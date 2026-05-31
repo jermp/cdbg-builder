@@ -36,8 +36,18 @@ inline void emit_super_kmers(uint8_t const* bases, uint32_t L, uint32_t k, uint3
                              uint32_t color, uint32_t bucket_log2,
                              per_thread_bucket_buffers& sink) {
     if (L < k) return;
-    const uint32_t K = L - k + 1;  // number of k-mers
-    const uint32_t W = k - m + 1;  // window size, in m-mer indices
+    const uint32_t K = L - k + 1;  // number of k-mers; (k-1)-mers indexed 0..K
+    // Minimize over (k-1)-mers, NOT k-mers (GGCAT/BCALM2: lib.rs:94
+    // BatchMinQueue::new(k - m)). A (k-1)-mer has (k-1)-m+1 = k-m m-mers, so the
+    // window is W = k - m. This is what co-locates branches: every dBG edge
+    // X->Y shares its junction (k-1)-mer S = suffix(X) = prefix(Y), and both
+    // endpoints route to bucket(min(S)). A branch X->{Y1,Y2} shares one S, so
+    // X, Y1 and Y2 all land in bucket(min(S)) -- the branch is locally visible
+    // in one bucket. (k-mer minimizers, W = k-m+1, scattered the two arms into
+    // different buckets so no bucket saw the branch -> strict-topology
+    // internal-branch failures.) It also makes each k-mer's primary bucket
+    // intrinsic: X is primary in bucket(min(prefix(X))), foreign elsewhere.
+    const uint32_t W = k - m;  // window size, in m-mer indices (a (k-1)-mer)
     const uint64_t bucket_mask = (uint64_t(1) << bucket_log2) - 1;
 
     auto bucket_of = [&](uint64_t h) -> uint32_t {
@@ -52,52 +62,72 @@ inline void emit_super_kmers(uint8_t const* bases, uint32_t L, uint32_t k, uint3
     mq.reset((int32_t)W);
     mq.push(canonical_mhash(fwd, rc), 0);
 
-    // Fill the first k-mer's window: m-mers at positions 0..k-m.
-    for (uint32_t i = 1; i <= k - m; ++i) {
+    // Fill the first (k-1)-mer's window: m-mers at positions 0..k-m-1.
+    for (uint32_t i = 1; i < k - m; ++i) {
         uint8_t out_b = bases[i - 1];
         uint8_t in_b = bases[i + m - 1];
         nthash_roll(out_b, in_b, m, fwd, rc);
         mq.push(canonical_mhash(fwd, rc), (int32_t)i);
     }
 
-    uint32_t super_start = 0;  // first k-mer index in the running super-k-mer
+    uint32_t run_a = 0;  // first (k-1)-mer index of the running minimizer block
     bool is_first_super = true;
-    uint64_t cur_min = mq.min_hash();
+    bool cur_owns_first = true;  // first super's idx0 is the ACGT-begin (not a boundary)
+    uint64_t cur_min = mq.min_hash();  // minimizer of (k-1)-mer 0
     uint32_t cur_bucket = bucket_of(cur_min);
 
     auto emit_super = [&](uint32_t first_kmer, uint32_t last_kmer, uint32_t bucket,
-                          bool is_run_begin, bool is_run_end) {
+                          bool is_run_begin, bool is_run_end, bool owns_first, bool owns_last) {
         uint32_t base_start = first_kmer;
         uint32_t base_len = (last_kmer - first_kmer) + k;
         uint8_t flags = 0;
         if (is_run_begin) flags |= SK_FLAG_IS_ACGT_BEGIN;
         if (is_run_end) flags |= SK_FLAG_IS_ACGT_END;
+        if (owns_first) flags |= SK_FLAG_OWNS_FIRST;
+        if (owns_last) flags |= SK_FLAG_OWNS_LAST;
         sink.append(bucket, flags, color, bases + base_start, base_len);
     };
 
-    for (uint32_t i = 1; i < K; ++i) {
-        uint32_t mpos = i + k - m;
+    // Walk the (k-1)-mers j = 1..K. A maximal run [run_a..b] of equal-minimizer
+    // (k-1)-mers becomes a super-k-mer spanning k-mers [run_a-1 .. b] (clamped
+    // at the read start): the k-mers whose prefix OR suffix junction is in the
+    // run. Consecutive supers therefore share exactly their boundary k-mer
+    // X_b (k-overlap): it is the last k-mer of one super (its prefix junction
+    // P_b is in this run) and the begin-ignored first k-mer of the next (its
+    // suffix junction P_{b+1} starts the next run). bucket(min P_b) != bucket(min
+    // P_{b+1}) is exactly when that k-mer lands in two buckets -- the BCALM2
+    // "k-mer in two buckets iff its left and right minimizers differ" rule.
+    //
+    // Ownership (which bucket COLORS the shared k-mer): X = A.last = B.first is
+    // colored in bucket(min(mA, mB)). At the split mA = cur_min, mB = new_min:
+    // the ending super A owns its last X iff mA < mB; the starting super B owns
+    // its first X iff mB < mA. (mA != mB at a split, so exactly one owns it.)
+    for (uint32_t j = 1; j <= K; ++j) {
+        uint32_t mpos = j + k - m - 1;  // rightmost m-mer of (k-1)-mer j
         uint8_t out_b = bases[mpos - 1];
         uint8_t in_b = bases[mpos + m - 1];
         nthash_roll(out_b, in_b, m, fwd, rc);
         mq.push(canonical_mhash(fwd, rc), (int32_t)mpos);
 
-        uint64_t new_min = mq.min_hash();
+        uint64_t new_min = mq.min_hash();  // minimizer of (k-1)-mer j
         if (new_min != cur_min) {
-            emit_super(super_start, i - 1, cur_bucket, is_first_super, /*is_run_end=*/false);
-            // k-base overlap (GGCAT lib.rs:240-256): the next super-k-mer
-            // starts at k-mer i-1, the SAME k-mer that was the last of the
-            // super just emitted, so consecutive supers physically share
-            // their full boundary k-mer (k bases). The walker decides which
-            // bucket owns that duplicated k-mer (step 3); here we only emit
-            // the overlap. (Was `super_start = i`, a k-1 junction overlap.)
-            super_start = i - 1;
+            uint32_t first_kmer = (run_a == 0) ? 0 : run_a - 1;
+            bool owns_last = (cur_min < new_min);
+            emit_super(first_kmer, j - 1, cur_bucket, is_first_super, /*is_run_end=*/false,
+                       cur_owns_first, owns_last);
             is_first_super = false;
+            cur_owns_first = (new_min < cur_min);  // B owns its first X iff mB < mA
             cur_min = new_min;
             cur_bucket = bucket_of(new_min);
+            run_a = j;
         }
     }
-    emit_super(super_start, K - 1, cur_bucket, is_first_super, /*is_run_end=*/true);
+    uint32_t first_kmer = (run_a == 0) ? 0 : run_a - 1;
+    // Run-end super: its last k-mer is the ACGT-end terminus (not a cross-bucket
+    // boundary), so it always owns it; its first k-mer ownership was decided at
+    // the preceding split (cur_owns_first).
+    emit_super(first_kmer, K - 1, cur_bucket, is_first_super, /*is_run_end=*/true,
+               cur_owns_first, /*owns_last=*/true);
 }
 
 inline void ingest_file_bucketed(std::string const& path, uint32_t k, uint32_t m,

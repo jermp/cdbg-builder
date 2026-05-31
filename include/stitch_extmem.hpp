@@ -116,7 +116,12 @@ inline void ext_split_monochromatic(ext_tig& t, uint32_t k, uint8_t open_flags, 
     for (size_t i = 0; i < lo; ++i) base_off += t.runs[i].num_kmers;
     for (size_t i = lo; i < hi; ++i) {
         const uint32_t m = t.runs[i].num_kmers;
-        if (t.runs[i].cid == COLOR_RUN_FOREIGN) {  // measurement: skip (drop) for now
+        if (t.runs[i].cid == COLOR_RUN_FOREIGN) {
+            // Safety net: with BCALM2 ownership every k-mer is primary in
+            // exactly one bucket, so a foreign placeholder is always resolved at
+            // its join and none should reach here. If one ever did (an open end
+            // that never met its primary partner), the owning bucket emits it --
+            // so drop it rather than output the sentinel cid.
             base_off += m;
             continue;
         }

@@ -532,7 +532,7 @@ struct per_thread_bucket_buffers {
         // its dedup-map find() instead of re-hashing the (typically
         // cold) bytes from the writer's bases_storage.
         uint64_t h = bucket_compactor::hash_bases(sk_bases, len);
-        recs[b].push_back({h, color, off, len, (uint8_t)(flags & 0x3u)});
+        recs[b].push_back({h, color, off, len, (uint8_t)(flags & 0xfu)});
         if (bbuf.size() >= sink->flush_bases()) sink->flush(b, recs[b], bbuf);
     }
 

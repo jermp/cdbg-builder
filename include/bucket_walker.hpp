@@ -199,6 +199,8 @@ inline void load_bucket(std::string const& path, uint32_t k, bucket_kmer_map& ou
         // stitch reconciling the two copies on the full-k-mer key.
         const bool begin_incl = (flags & SK_FLAG_IS_ACGT_BEGIN) != 0;
         const bool end_incl = (flags & SK_FLAG_IS_ACGT_END) != 0;
+        const bool owns_first = (flags & SK_FLAG_OWNS_FIRST) != 0;
+        const bool owns_last = (flags & SK_FLAG_OWNS_LAST) != 0;
         const uint32_t n_kmers = (uint32_t)(bases.size() - (k - 1));
         const uint32_t last_idx = n_kmers - 1;
 
@@ -216,18 +218,19 @@ inline void load_bucket(std::string const& path, uint32_t k, bucket_kmer_map& ou
 
             bucket_kmer_info& info = out[can];
             info.flags |= contrib;
-            // Color (and mark primary) every occurrence EXCEPT a begin-ignored
-            // idx-0 overlap copy whose primary lives in the adjacent bucket --
-            // UNLESS this k-mer is the WHOLE super (idx0 == last_idx, a length-1
-            // super-k-mer). Such a k-mer is the overlap copy on its begin side
-            // but is not carried primary by any neighbouring super in THIS
-            // bucket, so if we skipped it here it could be primary in NO bucket
-            // (foreign on both sides of its eventual join -> an uncolored
-            // interior k-mer). Coloring it makes it primary here; the global
-            // dict reconciles the (identical) color across the duplicate copies.
-            const bool whole_super = (idx == 0 && idx == last_idx);
-            const bool begin_ignored = (!begin_incl && idx == 0 && !whole_super);
-            if (!begin_ignored) {
+            // Color (mark primary) this occurrence iff THIS bucket owns the
+            // k-mer (BCALM2: the boundary k-mer is colored in bucket(min(lmin,
+            // rmin)) only). Interior k-mers (neither first nor last) are always
+            // owned -- they are not cross-bucket boundaries. The first/last
+            // k-mers are owned per the SK_FLAG_OWNS_* bits set at ingest. This
+            // makes each k-mer primary in EXACTLY one bucket, so its color is the
+            // full union over its occurrences there (no partial-color split).
+            const bool is_first = (idx == 0);
+            const bool is_last = (idx == last_idx);
+            bool owned = true;
+            if (is_first && !owns_first) owned = false;
+            if (is_last && !owns_last) owned = false;
+            if (owned) {
                 info.colors.add(rsid);
                 info.primary = true;
             }

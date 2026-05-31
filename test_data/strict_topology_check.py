@@ -154,8 +154,7 @@ def check_unitig_topology(seq, k, kmer_colors, problems):
                 in_count += 1
         if out_count != 1 or in_count != 1:
             problems.append(
-                f"  internal k-mer at pos {p}: out={out_count} in={in_count}"
-                f" kmer={seq[p:p+k]} unitig_len={len(seq)}")
+                f"  internal k-mer at pos {p}: out={out_count} in={in_count}")
             if len(problems) > 20:
                 return
 
