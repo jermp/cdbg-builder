@@ -164,11 +164,20 @@ inline void ext_concat_runs(std::vector<color_run>& a, std::vector<color_run> b)
         uint64_t b_x = b.front().cid;
         uint64_t real = (a_x != COLOR_RUN_FOREIGN) ? a_x : b_x;  // foreign if both foreign
         if (a_x != real) {
-            // a's X run was a foreign placeholder; split it so only the single
-            // X k-mer takes the real cid (the rest of that run stays as-is --
-            // but a foreign run only ever has length 1 at an open end, so the
-            // whole run flips).
+            // a's X run was a foreign placeholder (length 1 at the open end);
+            // flip it to the real cid recovered from b's owning side.
             a.back().cid = real;
+            // Coalesce the just-reconciled X unit backward into a's preceding
+            // run when they now share a cid. Without this, every join across a
+            // same-color boundary leaves a spurious [run(c,n), run(c,1)] split;
+            // over a long chain that compounds into thousands of bogus runs per
+            // topological tig, and the monochromatic split then shatters one
+            // tig into thousands of unitigs (salmonella-10: 2123 runs/tig ->
+            // 409k unitigs instead of 87,297).
+            if (a.size() >= 2 && a[a.size() - 2].cid == real) {
+                a[a.size() - 2].num_kmers += a.back().num_kmers;
+                a.pop_back();
+            }
         }
     }
     // Drop the shared boundary k-mer X from b's front (already counted in a).

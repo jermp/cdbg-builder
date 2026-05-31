@@ -522,12 +522,26 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
         out_local.emplace_back(std::move(u));
     };
 
-    // Seed every PRIMARY k-mer once (foreign overlap copies are never seeded;
-    // they are pulled in only at the open end of a primary's walk). Unvisited
-    // primary k-mers on a pure cycle are torn at an arbitrary seed; both ends
-    // come out CLOSED (no boundary reached).
+    // Seed every k-mer present in this bucket once -- NOT just the color-owned
+    // (primary) ones. Every super-k-mer record in this bucket lives here (it
+    // was written to bucket_of(its own minimizer)), so all of its k-mers must
+    // be walked here; ownership gates COLORING only (an unowned/foreign k-mer
+    // gets a COLOR_RUN_FOREIGN run unit at emit, reconciled by the stitch).
+    //
+    // Gating the seed on `primary` strands degenerate supers that own none of
+    // their k-mers: a short super [F,X] sandwiched between two smaller-
+    // minimizer neighbors has owns_first==owns_last==0 (both k-mers colored in
+    // the adjacent buckets), so neither is primary. It is exactly the bridge
+    // fragment whose open ends are the stitch partners of F (in F's owner
+    // bucket) and X (in X's owner bucket); never walking it leaves both F and X
+    // with a lonely, partnerless open end -- the cross-bucket joins then fail
+    // and unitigs come out fragmented (salmonella-10: 440k unitigs instead of
+    // 87,297). Boundary k-mers are shared between two buckets by construction;
+    // each is seeded in both and emitted as the open end of each side's
+    // fragment, which is precisely what the full-k-mer stitch joins on. The
+    // `visited` set still prevents re-walking within a bucket, so each bucket
+    // emits each of its fragments exactly once.
     for (auto& kv : kmer_info) {
-        if (!kv.second.primary) continue;
         if (visited.find(kv.first) != visited.end()) continue;
         emit_from_seed(kv.first);
     }
