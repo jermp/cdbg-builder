@@ -719,28 +719,55 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
 // gates each join on compatible orientation locally (colorless). This
 // deletes the one global O(num_junctions) map the (k-1)-keyed stitch
 // needed -- the round loop now streams only one bucket's tigs at a time.
+// Seed one already-constructed round-0 tig: sink it if closed, else route it to
+// its first bucket. Shared by the random-access and streaming seed paths.
+template <typename Store, typename Sink>
+inline void ext_seed_one(ext_tig&& t, uint32_t k, Store& store, Sink&& sink,
+                         std::atomic<uint64_t>* done) {
+    t.rng = ext_seed_from_seq(t.seq);
+    if (k < 2 || t.open_flags == 0) {
+        // Already closed: split at color-run boundaries and sink.
+        ext_split_monochromatic(t, k, t.open_flags, [&](stitchable_unitig&& u) {
+            if (done) done->fetch_add(1, std::memory_order_relaxed);
+            sink(std::move(u));
+        });
+        return;
+    }
+    uint64_t dummy = 0;
+    ext_route(std::move(t), k, store, dummy);
+}
+
+// Random-access seed path: pulls every fragment from a Source exposing
+// size()/runs(i)/open_flags(i)/seq_view(i) (vector_frag_source, tests). Holds
+// no per-fragment state beyond the tig in flight.
 template <typename Source, typename Store, typename Sink>
 inline void ext_seed_round0(Source& frag, uint32_t k, Store& store, Sink&& sink,
                             std::atomic<uint64_t>* done) {
     const uint64_t n = (uint64_t)frag.size();
-
     for (uint64_t i = 0; i < n; ++i) {
         ext_tig t;
         t.runs = frag.runs(i);
         t.open_flags = frag.open_flags(i);
         std::string_view sv = frag.seq_view(i);
         t.seq.assign(sv.data(), sv.size());
-        t.rng = ext_seed_from_seq(t.seq);
-        if (k < 2 || t.open_flags == 0) {
-            // Already closed: split at color-run boundaries and sink.
-            ext_split_monochromatic(t, k, t.open_flags, [&](stitchable_unitig&& u) {
-                if (done) done->fetch_add(1, std::memory_order_relaxed);
-                sink(std::move(u));
-            });
-            continue;
-        }
-        uint64_t dummy = 0;
-        ext_route(std::move(t), k, store, dummy);
+        ext_seed_one(std::move(t), k, store, sink, done);
+    }
+    store.advance();  // round-0 emissions become round-1 input
+}
+
+// Streaming seed path: pulls fragments one at a time from a Reader exposing
+// `bool next(uint8_t& open_flags, std::vector<color_run>& runs,
+// std::string& seq)` (frag_unitig_stream_reader). Peak RAM is ONE fragment, so
+// the stitch carries no O(num_fragments) index -- this is what makes the whole
+// stitch phase bounded by the round-store bucket count, not the fragment count.
+template <typename Reader, typename Store, typename Sink>
+inline void ext_seed_round0_stream(Reader& reader, uint32_t k, Store& store, Sink&& sink,
+                                   std::atomic<uint64_t>* done) {
+    ext_tig t;
+    while (reader.next(t.open_flags, t.runs, t.seq)) {
+        ext_seed_one(std::move(t), k, store, sink, done);
+        // ext_seed_one moved t's seq/runs into the store or the sink; the
+        // moved-from vectors/string are reused by the next next() call.
     }
     store.advance();  // round-0 emissions become round-1 input
 }
@@ -761,10 +788,12 @@ inline void stitch_unitigs_extmem(Source& frag, uint32_t k, Sink&& sink,
     detail::ext_run_rounds(store, k, num_buckets, sink, done);
 }
 
-// External-memory stitch with FILE-backed round storage. Peak RAM is one
-// bucket's tigs at a time (plus per-bucket write batches), independent
-// of fragment count. Round files live under `tmp_dir`. This is the
-// production path for inputs too large for the in-RAM stitch.
+// External-memory stitch with FILE-backed round storage, RANDOM-ACCESS source.
+// Peak RAM is one round-store bucket's tigs at a time (plus per-bucket write
+// batches), independent of fragment count -- EXCEPT that a random-access Source
+// (e.g. frag_unitig_reader) may itself hold an O(num_fragments) index. Used by
+// tests (vector_frag_source). Production uses the _stream overload below, whose
+// reader holds only one fragment, so the whole stitch is fragment-count-free.
 template <typename Source, typename Sink>
 inline void stitch_unitigs_extmem_file(Source& frag, uint32_t k, std::string const& tmp_dir,
                                        Sink&& sink, uint32_t num_buckets,
@@ -772,6 +801,24 @@ inline void stitch_unitigs_extmem_file(Source& frag, uint32_t k, std::string con
     if (num_buckets == 0) num_buckets = 1024;
     detail::round_store_file store(tmp_dir, num_buckets);
     detail::ext_seed_round0(frag, k, store, sink, done);
+    detail::ext_run_rounds(store, k, num_buckets, sink, done);
+}
+
+// External-memory stitch with FILE-backed round storage, STREAMING source.
+// `reader` exposes `bool next(open_flags, runs, seq)` and holds only one
+// fragment resident (frag_unitig_stream_reader). Combined with the file-backed
+// round store, peak RAM is bounded by num_buckets, NOT by the fragment count --
+// no O(num_fragments) structure anywhere in the stitch. This is the production
+// path. `reader` is a template parameter so this header needn't depend on
+// unitig_spill.hpp.
+template <typename Reader, typename Sink>
+inline void stitch_unitigs_extmem_file_stream(Reader& reader, uint32_t k,
+                                              std::string const& tmp_dir, Sink&& sink,
+                                              uint32_t num_buckets,
+                                              std::atomic<uint64_t>* done = nullptr) {
+    if (num_buckets == 0) num_buckets = 1024;
+    detail::round_store_file store(tmp_dir, num_buckets);
+    detail::ext_seed_round0_stream(reader, k, store, sink, done);
     detail::ext_run_rounds(store, k, num_buckets, sink, done);
 }
 

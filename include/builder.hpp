@@ -167,10 +167,11 @@ struct builder {
         // dense pangenome inputs that vector grew to multi-GB during
         // bucket-process and was the dominant peak contributor.
         // Instead each fragment is streamed through a disk-backed
-        // frag_unitig_writer to a single tmp file. Stitch then opens
-        // a mmap-backed frag_unitig_reader over that file and walks
-        // chains in-place via string_view into the kernel page cache;
-        // no full vector<stitchable_unitig> is ever materialised.
+        // frag_unitig_writer to a single tmp file. Stitch then reads
+        // that file back with a streaming frag_unitig_stream_reader that
+        // holds one fragment at a time, so no full
+        // vector<stitchable_unitig> -- and no O(num_fragments) index --
+        // is ever materialised.
         //
         // Streaming dict: encodes each new color set into its bvb at
         // intern() time and immediately flushes complete 64-bit words
@@ -216,31 +217,31 @@ struct builder {
 
         // Stitch streams each finished unitig into a cid-range
         // unitig_bucket_writer. The K bucket count auto-scales so
-        // per-bucket peak at emit stays under ~10% of -g. We
-        // size K up-front from a single index-only walk over the
-        // mmap-backed frag spill (no seq bytes touched here).
+        // per-bucket peak at emit stays under ~10% of -g. We size K
+        // up-front from the frag writer's own seq-byte counter (no walk
+        // over the spill).
         std::unique_ptr<unitig_bucket_writer> uwriter_ptr;
         {
-            // Scope the frag_unitig_reader to just the stitch phase so
-            // its index vector + mmap are released before emit. emit
-            // only needs uwriter (cid-bucketed unitig spill) and
-            // global_dict (streaming color sets).
+            // The stitch reads the frag spill with a STREAMING reader that
+            // holds one fragment at a time -- no O(num_fragments) index. The
+            // total seq bytes (for bucket sizing) and fragment count (for the
+            // progress bar) come from the writer's own counters, so we never
+            // walk an index. emit only needs uwriter (cid-bucketed unitig
+            // spill) and global_dict (streaming color sets).
             phase_rss_marker rss("stitch");
             {
                 timer _("stitch");
-                frag_unitig_reader frag_reader(frag_sink.path());
-
-                uint64_t total_frag_seq_bytes = 0;
-                for (size_t i = 0; i < frag_reader.size(); ++i)
-                    total_frag_seq_bytes += frag_reader.seq_view(i).size();
+                const uint64_t total_frag_seq_bytes = frag_sink.total_seq_bytes();
+                const uint64_t n_frags = frag_sink.count();
 
                 const uint32_t unitig_bucket_count = pick_unitig_bucket_count_(
                     m_num_color_classes, total_frag_seq_bytes, m_cfg.max_ram_gb);
                 uwriter_ptr = std::make_unique<unitig_bucket_writer>(
                     tmp_dir, m_num_color_classes, unitig_bucket_count);
 
+                frag_unitig_stream_reader frag_reader(frag_sink.path());
                 std::atomic<uint64_t> done{0};
-                progress prog("stitch", done, frag_reader.size());
+                progress prog("stitch", done, n_frags);
                 // External-memory iterative-doubling stitch: per-round
                 // tigs are bucketed to LZ4-framed files under tmp_dir,
                 // one bucket resident at a time, so peak RAM is bounded
@@ -252,11 +253,11 @@ struct builder {
                 const uint32_t stitch_buckets =
                     pick_stitch_bucket_count_(total_frag_seq_bytes, m_cfg.max_ram_gb);
                 std::cout << "  stitch buckets: " << stitch_buckets << "\n";
-                stitch_unitigs_extmem_file(frag_reader, m_cfg.k, tmp_dir,
-                                           std::ref(*uwriter_ptr), stitch_buckets, &done);
+                stitch_unitigs_extmem_file_stream(frag_reader, m_cfg.k, tmp_dir,
+                                                  std::ref(*uwriter_ptr), stitch_buckets, &done);
                 prog.stop();
                 std::cout << "  unitigs after stitching: " << uwriter_ptr->total_unitigs() << "\n";
-                // frag_reader destroyed here -- mmap unmapped, index freed.
+                // frag_reader destroyed here -- file handle closed.
             }
             rss.stop();
         }

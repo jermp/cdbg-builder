@@ -672,8 +672,10 @@ hash work can run lock-free.
 
 Stitch peak: one hash bucket's fragments + its boundary-k-mer hash
 table, resident one bucket at a time (`round_store_file`). No global
-per-fragment index or junction map — peak scales with the bucket count,
-not the total fragment count.
+per-fragment index or junction map — round 0 seeds from the frag spill
+through a `frag_unitig_stream_reader` that holds one fragment at a time
+(not a mmap-backed index), so peak scales with the bucket count, not the
+total fragment count.
 
 Emit peak: one cid-range bucket of records loaded for sorting (~3 MB
 on salmonella-25K), plus the u2c bit_vector builder.

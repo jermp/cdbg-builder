@@ -42,11 +42,18 @@ two structures are still fully in-RAM and blow `-g` at 661k:
 
 - **(A) frag_unitig_reader index**: a `vector<entry>` (24 B/fragment)
   built once over the whole frag spill → **~137 GB** at 5.7e9 fragments.
+  **DONE** — replaced by `frag_unitig_stream_reader` (sequential, one
+  fragment resident) + `stitch_unitigs_extmem_file_stream`; the indexed
+  reader is deleted. Round 0 reads each fragment once in order and nothing
+  revisits the spill, so no index is needed.
 - **(B) joinable_set / seed-pass jmap**: a global per-junction map built
   in one pass to decide which (k-1) junctions are joinable →
-  **tens of GB to 100+** at 661k.
+  **tens of GB to 100+** at 661k. **DONE** — full-k-mer keying separates
+  branches structurally, so the map is gone (merged ext-mem stitch).
 
-This task removes BOTH by aligning with GGCAT's design.
+Both (A) and (B) are now removed. The stitch phase is fully external:
+peak RAM scales with the round-store bucket count (sized against `-g`),
+not the fragment count.
 
 ---
 
