@@ -77,6 +77,15 @@ inline constexpr uint8_t UNITIG_OPEN_RIGHT = 1u << 1;
 // runs summing to L). This is the RLE color sequence GGCAT carries on a
 // topological unitig (UnitigColorData); the monochromatic split at emit
 // time cuts a tig at its run boundaries.
+//
+// INVARIANT: sum of num_kmers over a tig's runs == its seq k-mer count. Every
+// k-mer carries exactly one run unit, INCLUDING a foreign boundary k-mer at an
+// open end (whose color is owned by the adjacent bucket): it gets a run with
+// cid == COLOR_RUN_FOREIGN as a placeholder so seq and runs stay aligned. The
+// stitch reconciles that placeholder to the real color when the open end joins
+// its primary-side partner (ext_concat_runs); a fully closed (sunk) tig has had
+// every boundary joined, so it contains no foreign placeholders.
+inline constexpr uint64_t COLOR_RUN_FOREIGN = UINT64_MAX;
 struct color_run {
     uint64_t cid;        // local during process_bucket, global after remap
     uint32_t num_kmers;  // number of k-mers covered by this run (>= 1)
@@ -208,10 +217,16 @@ inline void load_bucket(std::string const& path, uint32_t k, bucket_kmer_map& ou
             bucket_kmer_info& info = out[can];
             info.flags |= contrib;
             // Color (and mark primary) every occurrence EXCEPT a begin-ignored
-            // idx-0 overlap copy, whose primary lives in the adjacent bucket.
-            // If the same canonical k-mer also occurs primary in this bucket via
-            // another super, primary/color win (OR-accumulated, order-free).
-            const bool begin_ignored = (!begin_incl && idx == 0);
+            // idx-0 overlap copy whose primary lives in the adjacent bucket --
+            // UNLESS this k-mer is the WHOLE super (idx0 == last_idx, a length-1
+            // super-k-mer). Such a k-mer is the overlap copy on its begin side
+            // but is not carried primary by any neighbouring super in THIS
+            // bucket, so if we skipped it here it could be primary in NO bucket
+            // (foreign on both sides of its eventual join -> an uncolored
+            // interior k-mer). Coloring it makes it primary here; the global
+            // dict reconciles the (identical) color across the duplicate copies.
+            const bool whole_super = (idx == 0 && idx == last_idx);
+            const bool begin_ignored = (!begin_incl && idx == 0 && !whole_super);
             if (!begin_ignored) {
                 info.colors.add(rsid);
                 info.primary = true;
@@ -467,11 +482,12 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
             } else {
                 u.seq.push_back(twobit_to_nuc((uint8_t)(walk_kmer(p) & 3)));
             }
-            // Foreign boundary k-mers (only ever at an open end) are part of the
-            // sequence (the full-k-mer stitch key) but carry no color run -- the
-            // join keeps the partner's primary, colored copy and drops this one,
-            // so total runs == primary k-mers and seq/runs realign after the cut.
-            if (kmer_info.find(p.first)->second.primary) push_cid(u.runs, cid_of[p.first]);
+            // Every k-mer gets exactly one run unit so sum(runs)==seq k-mers.
+            // A foreign boundary k-mer (open end, colored by the adjacent
+            // bucket) gets a COLOR_RUN_FOREIGN placeholder; the stitch replaces
+            // it with the real color from the primary-side partner at the join.
+            bool prim = kmer_info.find(p.first)->second.primary;
+            push_cid(u.runs, prim ? cid_of[p.first] : COLOR_RUN_FOREIGN);
         };
         for (auto it = bw.rbegin(); it != bw.rend(); ++it) append_kmer(*it);
         append_kmer({seed, false});
@@ -609,7 +625,8 @@ inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t nu
                                                   std::memory_order_relaxed);
             }
             for (auto& u : bucket_unitigs) {
-                for (auto& r : u.runs) r.cid = local_to_global[r.cid];
+                for (auto& r : u.runs)
+                    if (r.cid != COLOR_RUN_FOREIGN) r.cid = local_to_global[r.cid];
                 sink(std::move(u));
             }
             process_prof().n_buckets.fetch_add(1, std::memory_order_relaxed);

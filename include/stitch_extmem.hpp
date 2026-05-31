@@ -52,6 +52,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <cassert>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -99,18 +100,34 @@ struct ext_tig {
 // only k-1 bases (no shared k-mer), so every k-mer lands in exactly one piece.
 template <typename Emit>
 inline void ext_split_monochromatic(ext_tig& t, uint32_t k, uint8_t open_flags, Emit&& emit) {
-    size_t base_off = 0;
     const size_t nruns = t.runs.size();
-    for (size_t i = 0; i < nruns; ++i) {
+    // A COLOR_RUN_FOREIGN placeholder can only survive to emit at an EXTREMITY:
+    // a boundary k-mer whose open end never joined its primary partner (the
+    // small unjoined-end residual). Its color is owned by the adjacent bucket,
+    // which emits it -- so we DROP such an extremal foreign k-mer here rather
+    // than output it with the sentinel cid. (An interior foreign run would mean
+    // a k-mer was lost from the graph; it does not occur because every boundary
+    // k-mer is primary in exactly one bucket, and is asserted against below.)
+    size_t lo = 0, hi = nruns;  // [lo, hi) runs to emit
+    if (lo < hi && t.runs[lo].cid == COLOR_RUN_FOREIGN) ++lo;
+    if (lo < hi && t.runs[hi - 1].cid == COLOR_RUN_FOREIGN) --hi;
+    // k-mer offset of the first emitted run (foreign-dropped prefix k-mers).
+    size_t base_off = 0;
+    for (size_t i = 0; i < lo; ++i) base_off += t.runs[i].num_kmers;
+    for (size_t i = lo; i < hi; ++i) {
         const uint32_t m = t.runs[i].num_kmers;
+        if (t.runs[i].cid == COLOR_RUN_FOREIGN) {  // measurement: skip (drop) for now
+            base_off += m;
+            continue;
+        }
         stitchable_unitig u;
         u.seq = t.seq.substr(base_off, (size_t)m + k - 1);
         u.runs.push_back({t.runs[i].cid, m});
         // OPEN flags only survive on the two extremal pieces (a split tig is
         // only ever sunk when fully closed, so open_flags is 0 in practice).
         uint8_t of = 0;
-        if (i == 0) of |= (open_flags & UNITIG_OPEN_LEFT);
-        if (i + 1 == nruns) of |= (open_flags & UNITIG_OPEN_RIGHT);
+        if (i == lo) of |= (open_flags & UNITIG_OPEN_LEFT);
+        if (i + 1 == hi) of |= (open_flags & UNITIG_OPEN_RIGHT);
         u.open_flags = of;
         emit(std::move(u));
         base_off += m;
@@ -123,12 +140,33 @@ inline void ext_reverse_runs(std::vector<color_run>& runs) {
     std::reverse(runs.begin(), runs.end());
 }
 
-// Append `b` runs onto `a`, dropping b's first k-mer (the shared boundary
-// k-mer, already counted as a's last k-mer) and merging the seam run if the
-// two abutting runs carry the same cid.
+// Append `b` runs onto `a` at a join seam. `a` is oriented keyed-end-at-RIGHT
+// and `b` keyed-end-at-LEFT, so a's LAST k-mer and b's FIRST k-mer are both the
+// shared boundary k-mer X. The merged SEQ drops one full copy of X (k bases), so
+// the runs must drop exactly one X unit, keeping sum(runs)==seq k-mer count.
+//
+// X is colored on the side that OWNS it and is a COLOR_RUN_FOREIGN placeholder
+// on the side that doesn't (it may be owned by a, by b, or -- when X is primary
+// in some third bucket -- foreign in BOTH). Reconcile: the surviving X unit
+// takes the real cid if either side has one, else stays foreign (a later join
+// at the other end resolves it). We keep X in `a`'s last run, fix its cid, then
+// drop X from `b`'s front before appending.
 inline void ext_concat_runs(std::vector<color_run>& a, std::vector<color_run> b) {
     if (b.empty()) return;
-    // Drop the shared boundary k-mer from b's front.
+    // Reconcile X's color into a's last run (X = a's last k-mer).
+    if (!a.empty()) {
+        uint64_t a_x = a.back().cid;
+        uint64_t b_x = b.front().cid;
+        uint64_t real = (a_x != COLOR_RUN_FOREIGN) ? a_x : b_x;  // foreign if both foreign
+        if (a_x != real) {
+            // a's X run was a foreign placeholder; split it so only the single
+            // X k-mer takes the real cid (the rest of that run stays as-is --
+            // but a foreign run only ever has length 1 at an open end, so the
+            // whole run flips).
+            a.back().cid = real;
+        }
+    }
+    // Drop the shared boundary k-mer X from b's front (already counted in a).
     if (--b.front().num_kmers == 0) b.erase(b.begin());
     if (b.empty()) return;
     size_t bi = 0;
