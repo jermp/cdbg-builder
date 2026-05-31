@@ -34,7 +34,7 @@
 #include "super_kmer.hpp"
 #include "util.hpp"
 
-namespace cdgb {
+namespace cdbg {
 
 // Per-k-mer color accumulator. We don't store raw colors here. Instead,
 // each bucket maintains a `record_sets` compact_color_set_dict that
@@ -676,4 +676,4 @@ inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t nu
     for (auto& w : workers) w.join();
 }
 
-}  // namespace cdgb
+}  // namespace cdbg

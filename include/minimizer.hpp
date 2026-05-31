@@ -16,7 +16,7 @@
 
 #include "kmer.hpp"
 
-namespace cdgb {
+namespace cdbg {
 
 // Per-base ntHash seeds (the canonical ntHash table by Mohamadi et al.).
 inline constexpr uint64_t NT_SEED[4] = {
@@ -136,4 +136,4 @@ struct min_queue {
     int32_t min_pos() const { return cur_min_pos; }
 };
 
-}  // namespace cdgb
+}  // namespace cdbg

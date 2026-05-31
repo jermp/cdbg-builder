@@ -6,7 +6,7 @@
 #include <functional>
 #include <string>
 
-namespace cdgb {
+namespace cdbg {
 
 // 2-bit packed k-mer for k <= 63, stored canonical (min of forward / RC).
 // Encoding: A=0, C=1, G=2, T=3. Position 0 is the lowest two bits, so the
@@ -117,4 +117,4 @@ struct kmer_hasher {
     }
 };
 
-}  // namespace cdgb
+}  // namespace cdbg

@@ -5,13 +5,13 @@
 # independently built ground-truth ccdBG (exact unitig-set equality:
 # coverage, monochromaticity, topology AND maximality).
 #
-# Run from anywhere; binary is expected at <repo>/build/cdgb-build.
+# Run from anywhere; binary is expected at <repo>/build/cdbg-build.
 
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
-BIN="$REPO/build/cdgb-build"
+BIN="$REPO/build/cdbg-build"
 K=31
 THREADS="${THREADS:-4}"
 DATA_DIR="$HERE/salmonella_10"

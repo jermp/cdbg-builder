@@ -13,9 +13,9 @@
 #include <string>
 #include <vector>
 
-#include "bucket_walker.hpp"  // cdgb::stitchable_unitig, UNITIG_OPEN_*
+#include "bucket_walker.hpp"  // cdbg::stitchable_unitig, UNITIG_OPEN_*
 
-namespace cdgb_test {
+namespace cdbg_test {
 
 inline char rc_base(char c) {
     switch (c) {
@@ -67,10 +67,10 @@ inline std::string random_dna(uint64_t len, std::mt19937_64& rng) {
 // k bases of it -> k-base overlap. `num_frags` is clamped so every
 // fragment has >= 2 k-mers (the interior split indices live in
 // [1, M-2], giving at most M-1 fragments).
-inline std::vector<cdgb::stitchable_unitig> split_unitig(std::string const& S, uint32_t k,
+inline std::vector<cdbg::stitchable_unitig> split_unitig(std::string const& S, uint32_t k,
                                                          uint32_t cid, uint64_t num_frags,
                                                          std::mt19937_64& rng) {
-    using cdgb::stitchable_unitig;
+    using cdbg::stitchable_unitig;
     const uint64_t L = S.size();
     const uint64_t M = (L >= k) ? (L - k + 1) : 1;  // number of k-mers
     const uint64_t max_frags = std::max<uint64_t>(1, (M >= 2) ? (M - 1) : 1);
@@ -100,14 +100,14 @@ inline std::vector<cdgb::stitchable_unitig> split_unitig(std::string const& S, u
         u.seq = S.substr(start_kmer, (end_kmer + k) - start_kmer);
         u.set_mono(cid, k);
         uint8_t flags = 0;
-        if (f > 0) flags |= cdgb::UNITIG_OPEN_LEFT;               // internal left boundary
-        if (f + 1 < num_frags) flags |= cdgb::UNITIG_OPEN_RIGHT;  // internal right boundary
+        if (f > 0) flags |= cdbg::UNITIG_OPEN_LEFT;               // internal left boundary
+        if (f + 1 < num_frags) flags |= cdbg::UNITIG_OPEN_RIGHT;  // internal right boundary
         // Randomly flip orientation; swap the open-flag sides to match.
         if (rng() & 1u) {
             u.seq = revcomp(u.seq);
             uint8_t nf = 0;
-            if (flags & cdgb::UNITIG_OPEN_LEFT) nf |= cdgb::UNITIG_OPEN_RIGHT;
-            if (flags & cdgb::UNITIG_OPEN_RIGHT) nf |= cdgb::UNITIG_OPEN_LEFT;
+            if (flags & cdbg::UNITIG_OPEN_LEFT) nf |= cdbg::UNITIG_OPEN_RIGHT;
+            if (flags & cdbg::UNITIG_OPEN_RIGHT) nf |= cdbg::UNITIG_OPEN_LEFT;
             flags = nf;
         }
         u.open_flags = flags;
@@ -137,9 +137,9 @@ inline std::vector<cdgb::stitchable_unitig> split_unitig(std::string const& S, u
 // fragments (randomly RC'd) and appended to `frags_out`; the three whole
 // unitigs (closed both ends, shared cid) are appended to `truth_out`.
 inline void gen_shared_cid_branch(uint32_t k, uint32_t cid, std::mt19937_64& rng,
-                                  std::vector<cdgb::stitchable_unitig>& frags_out,
-                                  std::vector<cdgb::stitchable_unitig>& truth_out) {
-    using cdgb::stitchable_unitig;
+                                  std::vector<cdbg::stitchable_unitig>& frags_out,
+                                  std::vector<cdbg::stitchable_unitig>& truth_out) {
+    using cdbg::stitchable_unitig;
     static const char bases[4] = {'A', 'C', 'G', 'T'};
 
     // Stem long enough to carry a real interior; its last k bases are B.
@@ -176,4 +176,4 @@ inline void gen_shared_cid_branch(uint32_t k, uint32_t cid, std::mt19937_64& rng
     }
 }
 
-}  // namespace cdgb_test
+}  // namespace cdbg_test

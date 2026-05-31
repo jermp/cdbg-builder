@@ -45,12 +45,12 @@ make -j
 If you cloned without `--recursive`, run `git submodule update --init --recursive`
 first.
 
-The build produces a single executable, `cdgb-build`, in the `build/` directory.
+The build produces a single executable, `cdbg-build`, in the `build/` directory.
 
 ## Usage
 
 ```
-cdgb-build -i <filenames_list> -k <k> -o <out_basename> [-t <num_threads>] [-g <GiB>]
+cdbg-build -i <filenames_list> -k <k> -o <out_basename> [-t <num_threads>] [-g <GiB>]
 ```
 
 Options:
@@ -91,11 +91,11 @@ Build the filenames list (one absolute path per line):
 find $(pwd)/Salmonella_enterica/Genomes/*.fasta > salmonella_4546_filenames.txt
 ```
 
-Run `cdgb-build` (from the `build/` directory) with `k = 31`, 8 threads,
+Run `cdbg-build` (from the `build/` directory) with `k = 31`, 8 threads,
 and a 4 GiB soft RAM budget:
 
 ```bash
-./cdgb-build \
+./cdbg-build \
     -i ~/salmonella_4546_filenames.txt \
     -o ~/Salmonella_enterica/salmonella_4546 \
     -k 31 \

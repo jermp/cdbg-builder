@@ -29,7 +29,7 @@
 #include "bucket_walker.hpp"
 #include "kmer.hpp"
 
-namespace cdgb {
+namespace cdbg {
 
 namespace detail {
 
@@ -105,4 +105,4 @@ struct vector_frag_source {
     }
 };
 
-}  // namespace cdgb
+}  // namespace cdbg

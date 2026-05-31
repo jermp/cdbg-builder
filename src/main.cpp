@@ -10,14 +10,14 @@
 
 namespace {
 
-bool parse_args(int argc, char** argv, cdgb::build_config& cfg) {
+bool parse_args(int argc, char** argv, cdbg::build_config& cfg) {
     cmd_line_parser::parser parser(argc, argv);
     parser.add("filenames_list",
                "Text file with one input path per line. The file at line i has color i.", "-i",
                true);
     parser.add("out_basename", "Output basename. Produces <basename>.fa and <basename>.colors.",
                "-o", true);
-    parser.add("k", "K-mer length (must be <= " + std::to_string(cdgb::MAX_K) + ").", "-k", true);
+    parser.add("k", "K-mer length (must be <= " + std::to_string(cdbg::MAX_K) + ").", "-k", true);
     parser.add("num_threads", "Number of worker threads (default 1).", "-t", false);
     parser.add("m", "Minimizer length (default: auto, derived from k).", "-m", false);
     parser.add("buckets_log2",
@@ -50,11 +50,11 @@ bool parse_args(int argc, char** argv, cdgb::build_config& cfg) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    cdgb::build_config cfg;
+    cdbg::build_config cfg;
     if (!parse_args(argc, argv, cfg)) return 1;
 
     try {
-        cdgb::builder builder(cfg);
+        cdbg::builder builder(cfg);
         builder.build();
     } catch (std::exception const& e) {
         std::cerr << "error: " << e.what() << '\n';

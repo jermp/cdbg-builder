@@ -62,7 +62,7 @@
 #include "super_kmer.hpp"
 #include "util.hpp"
 
-namespace cdgb {
+namespace cdbg {
 
 // ---- Per-bucket in-memory compactor + LZ4-framed disk output ---------------
 
@@ -618,4 +618,4 @@ private:
     size_t m_pos = 0;
 };
 
-}  // namespace cdgb
+}  // namespace cdbg

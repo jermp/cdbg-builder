@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Authoritative correctness check for cdgb-build output.
+Authoritative correctness check for cdbg-build output.
 
 This is the single source of truth. It builds the colored compacted de Bruijn
 graph (ccdBG) independently, the naive obviously-correct way, and compares the
@@ -330,9 +330,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--filenames", required=True,
-                    help="filenames list passed to cdgb-build (-i)")
+                    help="filenames list passed to cdbg-build (-i)")
     ap.add_argument("--out", required=True,
-                    help="output basename passed to cdgb-build (-o)")
+                    help="output basename passed to cdbg-build (-o)")
     ap.add_argument("-k", type=int, required=True)
     args = ap.parse_args()
     sys.exit(verify(args.filenames, args.out, args.k))

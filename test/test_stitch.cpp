@@ -35,11 +35,11 @@ namespace {
 uint64_t g_tmp_counter = 0;
 }
 
-using cdgb::stitchable_unitig;
-using cdgb_test::canonical;
-using cdgb_test::gen_shared_cid_branch;
-using cdgb_test::random_dna;
-using cdgb_test::split_unitig;
+using cdbg::stitchable_unitig;
+using cdbg_test::canonical;
+using cdbg_test::gen_shared_cid_branch;
+using cdbg_test::random_dna;
+using cdbg_test::split_unitig;
 
 namespace {
 
@@ -69,17 +69,17 @@ void run_stitch(which_stitch w, std::vector<stitchable_unitig>& frags, uint32_t 
     out.clear();
     auto sink = [&](stitchable_unitig&& u) { out.push_back(std::move(u)); };
     if (w == which_stitch::ext_mem) {
-        cdgb::vector_frag_source src(frags);
+        cdbg::vector_frag_source src(frags);
         // Small bucket count exercises multi-round doubling on tiny
         // inputs; 0 would pick the production default.
-        cdgb::stitch_unitigs_extmem(src, k, sink, /*num_buckets=*/16);
+        cdbg::stitch_unitigs_extmem(src, k, sink, /*num_buckets=*/16);
     } else {
-        cdgb::vector_frag_source src(frags);
+        cdbg::vector_frag_source src(frags);
         std::string dir = std::filesystem::temp_directory_path().string() +
-                          "/cdgb_stitch_test_" + std::to_string(::getpid()) + "_" +
+                          "/cdbg_stitch_test_" + std::to_string(::getpid()) + "_" +
                           std::to_string(g_tmp_counter++);
         std::filesystem::create_directories(dir);
-        cdgb::stitch_unitigs_extmem_file(src, k, dir, sink, /*num_buckets=*/16);
+        cdbg::stitch_unitigs_extmem_file(src, k, dir, sink, /*num_buckets=*/16);
         std::filesystem::remove_all(dir);
     }
 }

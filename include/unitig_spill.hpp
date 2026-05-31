@@ -51,7 +51,7 @@
 
 #include "bucket_walker.hpp"  // stitchable_unitig
 
-namespace cdgb {
+namespace cdbg {
 
 class unitig_bucket_writer {
 public:
@@ -392,4 +392,4 @@ private:
 };
 
 
-}  // namespace cdgb
+}  // namespace cdbg

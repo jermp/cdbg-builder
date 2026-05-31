@@ -35,7 +35,7 @@
 
 #include <libdeflate.h>
 
-namespace cdgb {
+namespace cdbg {
 
 // Memory stream type used by kseq's KSEQ_INIT below: a pointer + size +
 // position. mem_read copies up to `len` bytes into the caller's buffer
@@ -57,7 +57,7 @@ inline ssize_t mem_stream_read(mem_stream* s, void* buf, size_t len) {
     return (ssize_t)n;
 }
 
-}  // namespace cdgb
+}  // namespace cdbg
 
 extern "C" {
 #include "external/kseq.h"
@@ -67,9 +67,9 @@ extern "C" {
 // inlines mem_stream_read calls; for repeated 4096-byte buffer fills
 // this collapses to memcpy + pos bookkeeping, which the optimizer
 // reduces to a tight loop over the decompressed buffer.
-KSEQ_INIT(cdgb::mem_stream*, cdgb::mem_stream_read)
+KSEQ_INIT(cdbg::mem_stream*, cdbg::mem_stream_read)
 
-namespace cdgb {
+namespace cdbg {
 
 struct seq_reader {
     explicit seq_reader(std::string const& path) {
@@ -192,4 +192,4 @@ private:
     kseq_t* m_kseq = nullptr;
 };
 
-}  // namespace cdgb
+}  // namespace cdbg

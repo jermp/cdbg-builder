@@ -33,7 +33,7 @@
 #include <string>
 #include <vector>
 
-namespace cdgb {
+namespace cdbg {
 
 // ---- 2-bit packing helpers ---------------------------------------------------
 
@@ -139,4 +139,4 @@ inline size_t read_super_kmer(uint8_t const* buf, size_t buf_len, uint8_t& out_f
     return p + base_bytes;
 }
 
-}  // namespace cdgb
+}  // namespace cdbg

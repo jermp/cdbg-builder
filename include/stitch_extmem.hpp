@@ -67,7 +67,7 @@
 #include "kmer.hpp"
 #include "stitch.hpp"  // detail::side_junction_canonical, SIDE_*, revcomp_string
 
-namespace cdgb {
+namespace cdbg {
 
 namespace detail {
 
@@ -822,4 +822,4 @@ inline void stitch_unitigs_extmem_file_stream(Reader& reader, uint32_t k,
     detail::ext_run_rounds(store, k, num_buckets, sink, done);
 }
 
-}  // namespace cdgb
+}  // namespace cdbg

@@ -11,13 +11,13 @@
 //
 // Typical use:
 //
-//   cdgb::build_config cfg;
+//   cdbg::build_config cfg;
 //   cfg.filenames_list = "...";
 //   cfg.out_basename   = "...";
 //   cfg.k = 31;
 //   cfg.num_threads = 8;
 //
-//   cdgb::builder b(cfg);
+//   cdbg::builder b(cfg);
 //   b.build();
 //   // After build():
 //   //   b.num_colors()         -- one per input file
@@ -67,7 +67,7 @@
 #include "unitig_spill.hpp"
 #include "util.hpp"
 
-namespace cdgb {
+namespace cdbg {
 
 struct builder {
     builder() = default;
@@ -554,7 +554,7 @@ private:
     std::string resolve_tmp_dir() {
         if (m_cfg.tmp_dir.empty()) {
             std::string tmpl =
-                (std::filesystem::temp_directory_path() / "cdgb_buckets_XXXXXX").string();
+                (std::filesystem::temp_directory_path() / "cdbg_buckets_XXXXXX").string();
             std::vector<char> buf(tmpl.begin(), tmpl.end());
             buf.push_back('\0');
             if (mkdtemp(buf.data()) == nullptr)
@@ -774,4 +774,4 @@ private:
     size_t m_spill_bytes = 0;
 };
 
-}  // namespace cdgb
+}  // namespace cdbg

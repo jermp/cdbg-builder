@@ -78,7 +78,7 @@
 #include "hybrid_color_sets.hpp"
 #include "util.hpp"
 
-namespace cdgb {
+namespace cdbg {
 
 struct streaming_color_set_dict {
     streaming_color_set_dict(uint32_t num_colors, std::string output_path)
@@ -366,4 +366,4 @@ private:
     bool m_finalized = false;
 };
 
-}  // namespace cdgb
+}  // namespace cdbg

@@ -25,7 +25,7 @@
 #include "seq_reader.hpp"
 #include "super_kmer.hpp"
 
-namespace cdgb {
+namespace cdbg {
 
 namespace detail {
 
@@ -195,4 +195,4 @@ inline void ingest_bucketed(std::vector<std::string> const& files, uint32_t k, u
     for (auto& w : workers) w.join();
 }
 
-}  // namespace cdgb
+}  // namespace cdbg

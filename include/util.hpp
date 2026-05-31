@@ -18,7 +18,7 @@
 #include <thread>
 #include <unistd.h>
 
-namespace cdgb {
+namespace cdbg {
 
 // ---- build configuration ----------------------------------------------------
 
@@ -439,4 +439,4 @@ inline bucket_process_prof& process_prof() {
     return p;
 }
 
-}  // namespace cdgb
+}  // namespace cdbg
