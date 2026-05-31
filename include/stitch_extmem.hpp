@@ -141,6 +141,21 @@ inline uint64_t ext_rng_next(uint64_t& s) {
     return s;
 }
 
+// Well-mixed single bit from a state word (splitmix64 finalizer). xorshift64's
+// LOW bit is almost static across steps, so `(rng & 1)` made a both-open tig
+// present nearly the same end every round -> two partners almost never
+// co-presented their shared boundary k-mer in one round and the stitch
+// plateaued (deterministic-looking non-join). The finalizer's top bit flips
+// well, restoring the ~1/4 per-round meet probability the doubling relies on.
+inline bool ext_mix_bit(uint64_t s) {
+    s ^= s >> 30;
+    s *= 0xbf58476d1ce4e5b9ull;
+    s ^= s >> 27;
+    s *= 0x94d049bb133111ebull;
+    s ^= s >> 31;
+    return (s >> 63) & 1u;
+}
+
 // Seed a tig's rng deterministically from its sequence so runs are
 // reproducible but distinct tigs get distinct streams.
 inline uint64_t ext_seed_from_seq(std::string const& seq) {
@@ -190,7 +205,7 @@ inline bool ext_choose_side(ext_tig const& t, uint8_t& out_side) {
     bool l = (t.open_flags & UNITIG_OPEN_LEFT) != 0;
     bool r = (t.open_flags & UNITIG_OPEN_RIGHT) != 0;
     if (l && r) {
-        out_side = (t.rng & 1) ? SIDE_RIGHT : SIDE_LEFT;
+        out_side = ext_mix_bit(t.rng) ? SIDE_RIGHT : SIDE_LEFT;
         return true;
     }
     if (l) {
