@@ -256,6 +256,20 @@ inline uint8_t local_ext_mask(kmer_int_t can, uint32_t k, bucket_kmer_map const&
 inline uint8_t fwd_nibble(uint8_t m, bool rc) { return (uint8_t)((rc ? (m >> 4) : m) & 0xf); }
 inline uint8_t back_nibble(uint8_t m, bool rc) { return (uint8_t)((rc ? m : (m >> 4)) & 0xf); }
 
+// Local degree of `can` (walking orientation `rc`) on the forward / back side.
+// Counts neighbours present in THIS bucket; a cross-bucket boundary edge is not
+// counted (its partner lives in the adjacent bucket). Used to distinguish a
+// genuine cross-bucket simple-path boundary (this-side local degree <= 1, so the
+// only continuation crosses buckets -> emit OPEN) from a k-mer that is BOTH a
+// cross-bucket boundary AND a local branch (this-side local degree >= 2 -> a real
+// branch; must be CLOSED, not stitched, or the stitch joins past the branch).
+inline int local_fwd_degree(kmer_int_t can, bool rc, uint32_t k, bucket_kmer_map const& m) {
+    return __builtin_popcount(fwd_nibble(local_ext_mask(can, k, m), rc));
+}
+inline int local_back_degree(kmer_int_t can, bool rc, uint32_t k, bucket_kmer_map const& m) {
+    return __builtin_popcount(back_nibble(local_ext_mask(can, k, m), rc));
+}
+
 struct b_step {
     kmer_int_t next_can;
     bool next_rc;
@@ -423,11 +437,18 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
         std::vector<std::pair<kmer_int_t, bool>> bw, fw;
         bool open_left = false, open_right = false;
 
-        // Backward. Seed shortcut: if the seed itself is a left boundary
-        // (begin/end-ignored on its canonical-left), it is the open-left end
-        // already -- do not extend back.
+        // A boundary k-mer should be emitted OPEN (for cross-bucket stitching)
+        // ONLY when its local degree on the boundary side is <= 1: then the
+        // single continuation truly crosses into the adjacent bucket. If the
+        // boundary side also has >= 2 local neighbours, the k-mer is a genuine
+        // branch and must be CLOSED -- otherwise the stitch joins one local
+        // branch arm past the branch point (the strict-topology internal-branch
+        // failures on tandem-repeat k-mers).
+        // Backward. Seed shortcut: if the seed itself is a left boundary it is
+        // the open-left end already -- do not extend back (subject to the
+        // degree guard above).
         if (sflags == KMER_BOUND_LEFT) {
-            open_left = true;
+            open_left = (local_back_degree(seed, false, k, kmer_info) <= 1);
         } else {
             kmer_int_t can = seed;
             bool rc = false;
@@ -440,7 +461,7 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
                 can = s.next_can;
                 rc = s.next_rc;
                 if (is_contig_break(kmer_info.find(can)->second.flags)) {
-                    open_left = true;
+                    open_left = (local_back_degree(can, rc, k, kmer_info) <= 1);
                     break;
                 }
             }
@@ -448,7 +469,7 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
 
         // Forward. Symmetric seed shortcut for a right boundary.
         if (sflags == KMER_BOUND_RIGHT) {
-            open_right = true;
+            open_right = (local_fwd_degree(seed, false, k, kmer_info) <= 1);
         } else {
             kmer_int_t can = seed;
             bool rc = false;
@@ -461,7 +482,7 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
                 can = s.next_can;
                 rc = s.next_rc;
                 if (is_contig_break(kmer_info.find(can)->second.flags)) {
-                    open_right = true;
+                    open_right = (local_fwd_degree(can, rc, k, kmer_info) <= 1);
                     break;
                 }
             }
