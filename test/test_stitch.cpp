@@ -52,12 +52,10 @@ multiset_t to_multiset(std::vector<stitchable_unitig> const& v) {
     return m;
 }
 
-enum class which_stitch { in_ram, ext_mem, ext_file };
+enum class which_stitch { ext_mem, ext_file };
 
 char const* stitch_name(which_stitch w) {
     switch (w) {
-        case which_stitch::in_ram:
-            return "in_ram";
         case which_stitch::ext_mem:
             return "ext_mem";
         default:
@@ -70,9 +68,7 @@ void run_stitch(which_stitch w, std::vector<stitchable_unitig>& frags, uint32_t 
                 std::vector<stitchable_unitig>& out) {
     out.clear();
     auto sink = [&](stitchable_unitig&& u) { out.push_back(std::move(u)); };
-    if (w == which_stitch::in_ram) {
-        cdgb::stitch_unitigs(frags, k, out);
-    } else if (w == which_stitch::ext_mem) {
+    if (w == which_stitch::ext_mem) {
         cdgb::vector_frag_source src(frags);
         // Small bucket count exercises multi-round doubling on tiny
         // inputs; 0 would pick the production default.
@@ -143,10 +139,9 @@ bool run_case_impl(which_stitch w, uint64_t seed, uint32_t k, uint64_t num_uniti
 // Run a case against BOTH stitchers.
 bool run_case(uint64_t seed, uint32_t k, uint64_t num_unitigs, uint64_t max_len,
               uint64_t max_frags) {
-    bool a = run_case_impl(which_stitch::in_ram, seed, k, num_unitigs, max_len, max_frags);
     bool b = run_case_impl(which_stitch::ext_mem, seed, k, num_unitigs, max_len, max_frags);
     bool c = run_case_impl(which_stitch::ext_file, seed, k, num_unitigs, max_len, max_frags);
-    return a && b && c;
+    return b && c;
 }
 
 // Shared-cid branchy correctness case. Builds `num_clusters` branch
@@ -186,15 +181,13 @@ bool run_branch_case_impl(which_stitch w, uint64_t seed, uint32_t k, uint64_t nu
 }
 
 bool run_branch_case(uint64_t seed, uint32_t k, uint64_t num_clusters) {
-    bool a = run_branch_case_impl(which_stitch::in_ram, seed, k, num_clusters);
     bool b = run_branch_case_impl(which_stitch::ext_mem, seed, k, num_clusters);
     bool c = run_branch_case_impl(which_stitch::ext_file, seed, k, num_clusters);
-    return a && b && c;
+    return b && c;
 }
 
 // Larger case: report timing + fragment/unitig counts, plus the same
-// correctness check. Single-thread in-RAM stitch; this is the baseline
-// the external-memory redesign must match.
+// correctness check across the ext_mem and ext_file stitch paths.
 bool run_scale(uint64_t seed, uint32_t k, uint64_t num_unitigs) {
     std::mt19937_64 rng(seed);
     std::vector<stitchable_unitig> truth;
@@ -215,8 +208,7 @@ bool run_scale(uint64_t seed, uint32_t k, uint64_t num_unitigs) {
 
     std::vector<stitchable_unitig> out;
     bool ok = true;
-    for (which_stitch w :
-         {which_stitch::in_ram, which_stitch::ext_mem, which_stitch::ext_file}) {
+    for (which_stitch w : {which_stitch::ext_mem, which_stitch::ext_file}) {
         auto t0 = std::chrono::steady_clock::now();
         run_stitch(w, frags, k, out);
         auto t1 = std::chrono::steady_clock::now();

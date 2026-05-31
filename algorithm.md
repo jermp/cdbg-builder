@@ -65,7 +65,7 @@ B per-bucket files of LZ4-framed super-k-mer records      ← bucket-write
     ▼
 single frag_unitigs.bin file (cid + flags + seq) +        ← bucket-process
 streaming write to out.color_sets
-    │   join open ends across buckets via (k-1)-mer match
+    │   join open ends across buckets via full boundary k-mer match
     ▼
 K cid-range unitig_bucket files                           ← stitch
     │   sort by cid, write FASTA, build u2c
@@ -90,22 +90,43 @@ that minimizer. After this phase:
 - Every k-mer that lives in bucket `b` is reachable from records in
   bucket `b` alone (by construction of the minimizer-bucketing).
 
-### 3.2 Minimizer bucketing
+### 3.2 Minimizer bucketing ((k−1)-mer minimizers, BCALM2/GGCAT)
 
 Within an ACGT run of length `L ≥ k`, slide a window of size
-`W = k − m + 1` m-mers. The current k-mer's minimizer is the m-mer
-whose `canonical_mhash` (canonical ntHash; symmetric under RC) is
-minimum across the window. As the window slides, the minimum
-sometimes changes; each contiguous span of k-mers sharing one
-minimizer is a **super-k-mer**. The super-k-mer's bucket id is
-`(min_hash >> 1) & (B − 1)`. The low bit of the hash is reserved
-to match GGCAT's `cn_nthash.rs` convention.
+`W = k − m` m-mers over the run's **(k−1)-mers** (a (k−1)-mer has
+`(k−1) − m + 1 = k − m` m-mers). The minimizer of a (k−1)-mer is the
+m-mer whose `canonical_mhash` (canonical ntHash; symmetric under RC) is
+minimum across its window. Each maximal run of consecutive (k−1)-mers
+sharing one minimizer defines a **super-k-mer**; its bucket id is
+`(min_hash >> 1) & (B − 1)` (the low bit is reserved to match GGCAT's
+`cn_nthash.rs` convention).
+
+Minimizing over **(k−1)-mers**, not k-mers, is what keeps the de Bruijn
+graph correct under bucketing (the BCALM2 rule, matching GGCAT's
+`BatchMinQueue::new(k - m)`). Every dBG edge `X → Y` shares the junction
+(k−1)-mer `S = suffix(X) = prefix(Y)`, so both endpoints route to
+`bucket(min(S))`; a branch `X → {Y1, Y2}` shares one `S`, so `X`, `Y1`,
+`Y2` all land in `bucket(min(S))` and the branch is locally visible in a
+single bucket. (Minimizing over k-mers instead scatters the branch arms
+across buckets, so no bucket sees the branch — it would emit false
+through-paths the stitch then joins incorrectly.)
+
+A k-mer therefore lands in **two** buckets exactly when its prefix and
+suffix (k−1)-mers have different minimizers (`lmin ≠ rmin`); consecutive
+super-k-mers share that full boundary k-mer (a **k-base overlap**). The
+shared boundary k-mer is **colored in exactly one** bucket —
+`bucket(min(lmin, rmin))` — so its color is the full union over its
+occurrences there, with no partial-color split (§4).
 
 Each super-k-mer record carries:
 
-- `flags` : `IS_ACGT_BEGIN` (this super-k-mer's first k-mer has no
-  predecessor in input), `IS_ACGT_END` (analogously). The bucket
-  walker uses these to insert *phantom* edges across buckets (§4.4).
+- `flags` (4 bits): `IS_ACGT_BEGIN` / `IS_ACGT_END` (the super's first /
+  last k-mer has no predecessor / successor in the input run), and
+  `OWNS_FIRST` / `OWNS_LAST` — whether this bucket owns (colors) the
+  super's first / last boundary k-mer per the `min(lmin, rmin)` rule.
+  At a split between an ending super (run minimizer `mA`) and a starting
+  super (`mB`), the ending super owns its last shared k-mer iff `mA < mB`
+  and the starting super owns its first iff `mB < mA`.
 - `colors`: at write time, the single color of this input file.
   Compaction merges color lists across files later in this phase.
 - `bases` : 2-bit-packed bases.
@@ -218,81 +239,83 @@ bases). See `super_kmer.hpp`.
 For each bucket independently:
 
 1. Build the local dBG over canonical k-mers in that bucket, with
-   awareness of *phantom* edges that cross into neighboring buckets.
-2. Walk maximal unitig fragments. Each fragment is monochromatic.
-3. Intern its color list into a per-bucket `compact_color_set_dict`,
-   then merge per-bucket dicts into a shared
-   `streaming_color_set_dict` whose output goes directly to
-   `<out>.color_sets`.
+   per-k-mer **cross-bucket boundary flags** (GGCAT's begin/end-ignored
+   model — no phantom edges, no global joinable map).
+2. Walk maximal topological unitig fragments, carrying an RLE color-run
+   sequence (colorless extension; the monochromatic split happens at
+   emit).
+3. Intern color lists into a per-bucket `compact_color_set_dict`, then
+   merge per-bucket dicts into a shared `streaming_color_set_dict` whose
+   output goes directly to `<out>.color_sets`.
 
-Each bucket's fragments are emitted as records in a single
-disk-backed `frag_unitig_writer` for stitch to consume.
+Each bucket's fragments are emitted as records in a single disk-backed
+`frag_unitig_writer` for stitch to consume.
 
 ### 4.2 Per-bucket walker state
 
 Three structures per in-flight bucket:
 
 - **`kmer_info`** (`bucket_kmer_map`): canonical-k-mer → `{kmer_entry,
-  phantom flags}`. `kmer_entry` is `{first_rsid, vector<rest_rsid>}`
-  — almost every k-mer is contributed by a single super-k-mer record,
-  so `rest` is empty in the common case (no heap alloc per k-mer).
+  flags, primary}`. `flags` is two bits (`KMER_BOUND_LEFT/RIGHT`)
+  marking cross-bucket contig boundaries; `primary` says whether this
+  bucket owns (colors) the k-mer. `kmer_entry` is `{first_rsid,
+  vector<rest_rsid>}` — almost every k-mer is contributed by a single
+  super-k-mer record, so `rest` is empty in the common case.
 - **`record_sets`** (`compact_color_set_dict`): interns the sorted-
   deduped color list of every super-k-mer record read from disk.
-  Hybrid-encoded into an in-memory `bit_vector`; the dict gives back
-  decoded color lists into a caller-supplied scratch buffer
-  (`at(rsid, scratch)`). Memory per class: 24 B metadata +
-  hybrid-encoded bits.
 - **`local_dict`** (`compact_color_set_dict`): per-bucket final color
-  classes. Each unique color list (single-rsid k-mer's colors, or
-  the union of multi-rsid k-mer's color lists) is interned here and
-  the returned local cid is stored as the unitig fragment's `cid`.
+  classes; the returned local cid rides on each unitig's color runs.
 
 ### 4.3 Loading a bucket
 
-`load_bucket`:
+`load_bucket`, per super-k-mer record:
 
-1. Open the bucket file, decompress LZ4 frames, parse `super_kmer`
-   records.
-2. For each record: intern colors into `record_sets` → get rsid.
-3. Roll the canonical k-mer through the record's bases. Each k-mer
-   gets the rsid added to its `kmer_entry` via `add()`.
-4. Set phantom-edge flags on the first/last k-mer if the record's
-   `IS_ACGT_BEGIN`/`IS_ACGT_END` bits are NOT set (i.e., the
-   super-k-mer continues into another bucket).
+1. Intern colors into `record_sets` → get rsid.
+2. Roll the canonical k-mer through the record's bases. For each k-mer:
+   - **Boundary flags**: the first k-mer gets a boundary bit if the
+     record's `IS_ACGT_BEGIN` is clear (it is the begin-ignored overlap
+     copy of the previous super); the last gets one if `IS_ACGT_END` is
+     clear. The bit is oriented to the k-mer's canonical frame. Flags are
+     OR-accumulated over all occurrences. (GGCAT `hashmap.rs:382-398`.)
+   - **Ownership / color**: color the k-mer (and mark `primary`) unless
+     this bucket does not own it. An interior k-mer is always owned; the
+     first / last k-mer is owned iff the record's `OWNS_FIRST` /
+     `OWNS_LAST` flag is set (§3.2). So each k-mer is colored in exactly
+     one bucket, accumulating the full color union there.
 
-### 4.4 Phantom edges
+### 4.4 Contig-break flags (no phantom edges)
 
-Each k-mer carries two bits (`KMER_PHANTOM_LEFT/RIGHT`) saying
-whether a known dBG edge crosses into a different bucket. The walker
-treats a phantom edge as having degree 1 on that side: if the only
-edge on a side is phantom, the walk stops there and the unitig is
-emitted with that end **OPEN**, ready for the stitch phase to glue
-it. If the side mixes a local edge and a phantom edge, the global
-degree is ≥ 2 and the walk stops as a real branch (CLOSED).
+A k-mer is a **cross-bucket contig boundary** iff exactly one boundary
+bit is set (`flags == 1` or `2`): the unitig ends there and continues
+into the adjacent bucket, so that end is emitted **OPEN** with the full
+boundary k-mer included for the stitch to match on. `flags == 3` (both
+sides) is *not* a break — the k-mer is walked through as interior;
+`flags == 0` is plain interior (GGCAT `hashmap.rs:291`). To avoid
+threading through a real branch whose alternate arm crosses buckets, an
+end is only opened when the boundary side's **local degree ≤ 1**;
+local degree ≥ 2 is a genuine branch and is CLOSED. Because the (k−1)-mer
+bucketing co-locates every branch's arms in one bucket (§3.2), that local
+check sees all the arms.
 
-This matches GGCAT's `try_extend_function` logic. Closed unitigs go
-straight to the sink. Open unitigs carry their first and last
-canonical k-mers and side-flags so stitch can match them.
+### 4.5 Computing per-k-mer cids and the walk
 
-### 4.5 Computing per-k-mer cids
+After load, build `cid_of[k-mer]` for every **primary** (owned) k-mer:
+- *Single-rsid* (common): `local_dict.intern(record_sets.at(rsid))`,
+  with an `rsid_to_cid` cache for O(1) repeats.
+- *Multi-rsid*: sort+unique the rsids; one distinct rsid → cached path;
+  else union the referenced color lists and intern that.
 
-After load, two passes:
+After this, `record_sets` and the per-k-mer rsid storage are released;
+the walk needs only `kmer_info` (flags + primary) and `cid_of`.
 
-**Pass A**: build `cid_of[k-mer]`. For each k-mer in `kmer_info`:
-- *Single-rsid* (common): `local_dict.intern(record_sets.at(rsid))`.
-  A small `rsid_to_cid` cache makes this O(1) on subsequent k-mers
-  with the same rsid.
-- *Multi-rsid*: sort+unique the rsids; if one distinct rsid remains
-  use the cached path; else union the referenced color lists into a
-  fresh sorted set and intern that.
-
-After this, `record_sets` and the per-k-mer rsid storage are
-released; the walker only needs `kmer_info`'s phantom bits + the
-`cid_of` map for the chain walk.
-
-**Pass B**: the walk emits `stitchable_unitig` records with
-`{seq, cid, open_flags}`. Local cids will be remapped to global cids
-in §4.7.
+The walk seeds from each unvisited primary k-mer and extends both ways
+along degree-1 simple paths (GGCAT `hashmap.rs:455-545`), stopping at a
+contig break (OPEN, including the boundary k-mer) or a branch/dead-end
+(CLOSED). It emits `stitchable_unitig` records `{seq, runs, open_flags}`,
+where `runs` is the RLE color-run sequence over the k-mers; a foreign
+(unowned) boundary k-mer at an open end carries a `COLOR_RUN_FOREIGN`
+placeholder that the stitch reconciles to the owning side's color at the
+join. Local cids are remapped to global cids in §4.7.
 
 ### 4.6 Streaming the global color-set dict
 
@@ -394,51 +417,55 @@ listed as future work in §11.
 
 ---
 
-## 5. Phase 3: stitch (`include/stitch.hpp`)
+## 5. Phase 3: stitch (`include/stitch_extmem.hpp`)
 
-Single-threaded. Takes a `frag_unitig_reader` (mmap-backed view over
-`tmp/frag_unitigs.bin`) and a `Sink` (the cid-range
-`unitig_bucket_writer` for emit).
+External-memory, GGCAT-faithful hash-bucketed iterative join
+(`extend_unitigs.rs`). It glues the open-ended fragments from §4 into
+maximal unitigs while holding only **one hash bucket at a time** in RAM,
+so peak memory is bounded by the bucket count, not the fragment count.
+(The older in-RAM stitch — one global junction map + a per-fragment
+adjacency array, O(num_fragments) resident — was retired; `stitch.hpp`
+now holds only shared helpers, §1.)
 
-**Pass 1 — junction indexing**: for every fragment with an open
-side, hash the canonical (k−1)-mer at that side. Insert into a
-`by_junction` map keyed by junction kmer; the map's value holds up to
-two open-end refs per junction (overflow rejected).
+**Keying — the full boundary k-mer.** Two fragments that should glue
+share their full boundary **k-mer** (the k-base overlap, §3.2), present
+in both. The stitch keys each open end on the canonical full k-mer, so a
+dBG branch's distinct k-mers route to different slots and never
+false-join — no global "joinable junction" map is needed.
 
-**Pass 2 — adjacency build**: for each junction with exactly two
-open ends and matching `cid` (gating on the cheap u32 compare we
-established at process_bucket time), record the bidirectional link
-in `adj` (one packed `uint64_t` per fragment, low/high u32 = LEFT/
-RIGHT side encoded as `(other_idx << 1) | other_side`, sentinel
-`UINT32_MAX` for "no link"). 8 bytes per fragment.
+**Round loop.** Each round:
 
-**Pass 3 — walk chains**, in three sub-passes:
+1. Every still-open fragment presents **one** open end (a both-open
+   fragment picks which via a per-fragment RNG, re-rolled each round) and
+   is routed to bucket `H(boundary_kmer)`.
+2. Within a bucket, a hash table keyed by the boundary k-mer pairs
+   arrivals first-come/second-come: the first waits, a compatible second
+   **joins**. The join concatenates the two oriented sequences dropping
+   the shared k-mer (k bases), and concatenates their color-run sequences
+   reconciling the shared k-mer's color (a `COLOR_RUN_FOREIGN` placeholder
+   from the unowned side takes the owned side's cid). An
+   orientation-incompatible collision re-presents the other end next
+   round.
+3. A joined fragment that still has an open end is re-routed by its **new**
+   end's hash for the next round; one with no open end is a finished
+   unitig.
 
-- **Pass 3a** scans fragments with `adj[i].LEFT == LINK_NONE` (a
-  free LEFT end); each is a chain head, walked forward
-  (`start_flipped=false`).
-- **Pass 3b** scans fragments with `adj[i].RIGHT == LINK_NONE`,
-  walked from the RIGHT end backwards (`start_flipped=true`). This
-  catches chains whose two endpoints are both on the RIGHT side
-  (per-fragment LEFT/RIGHT is per-orientation, not
-  per-chain-direction, so a chain *can* have two free-RIGHT
-  endpoints; pass 3b's second hit is harmless because the chain is
-  already `visited` from its first endpoint).
-- **Pass 3c** picks up anything still unvisited — pure cross-bucket
-  cycles with no free end. Any unvisited k-mer breaks the cycle.
+The loop ends when a full round produces **zero** joins (GGCAT's
+`has_joinable_unitigs`); every remaining open fragment is then flushed as
+a terminal unitig. A two-open-ended fragment that re-routes to its own
+bucket with both extremal hashes equal is a circular unitig.
 
-Within each sub-pass: start a chain at the claimed endpoint;
-repeatedly hop via `adj`, copying the next fragment's seq from the
-mmap (revcomped if the chain orientation flips). At each hop, append
-`seq[k-1..]` to the merged unitig (the shared k-1 prefix is already
-covered). Cycle closure stops the walk when `visited[nxt]` is
-already set. Emit the merged unitig to the sink with its propagated
-`cid`.
+**Emit / monochromatic split.** A finished topological tig carries an RLE
+color-run sequence; `ext_split_monochromatic` cuts it at run boundaries
+into monochromatic output unitigs (cdbg output unitigs are
+monochromatic — the one step GGCAT does not need, since it keeps colored
+topological unitigs). Any extremal `COLOR_RUN_FOREIGN` placeholder that
+never met its primary partner is dropped (the owning bucket emits it).
 
-mmap'd seq pages are accessed in chain order — random with respect
-to the on-disk layout. `MADV_RANDOM` tells the kernel to skip
-readahead and reclaim pages aggressively under pressure. On SSD
-this is acceptable; on HDD it would be slow.
+**Stores.** Two interchangeable round stores share the loop:
+`round_store_mem` (in-RAM rounds; tests/dev) and `round_store_file`
+(LZ4-framed files, one bucket resident at a time; the production
+external-memory path, `stitch_unitigs_extmem_file`).
 
 ---
 
@@ -624,7 +651,7 @@ Bucket-process peak per in-flight thread:
 ```
 record_sets   (compact, hybrid-encoded)   ~10–30 MB / bucket
 local_dict    (compact, hybrid-encoded)   ~10–30 MB / bucket
-kmer_info     (per-k-mer rsid + phantom)  ~hundreds of MB / bucket on dense input
+kmer_info     (per-k-mer rsid+flags+owned) ~hundreds of MB / bucket on dense input
 merge batch   (decoded color lists, 32)   few MB at num_colors = 100K
 ```
 
@@ -636,10 +663,10 @@ during the chain walk). The §4.7 batched merge keeps a small
 per-thread buffer (32 decoded classes) so the local-dict decode +
 hash work can run lock-free.
 
-Stitch peak: `frag_unitig_reader` index (~16 B per fragment) +
-`by_junction` + `adj` (8 B per fragment, packed). Mmap pages of seq
-bytes are accessed with `MADV_RANDOM` and counted in RSS only as
-they're touched.
+Stitch peak: one hash bucket's fragments + its boundary-k-mer hash
+table, resident one bucket at a time (`round_store_file`). No global
+per-fragment index or junction map — peak scales with the bucket count,
+not the total fragment count.
 
 Emit peak: one cid-range bucket of records loaded for sorting (~3 MB
 on salmonella-25K), plus the u2c bit_vector builder.
@@ -656,7 +683,7 @@ compressed bit count.
 |---|---|---|
 | bucket-write | T worker threads, one input file each at a time; per-thread per-bucket buffers; per-bucket mutex guards `bucket_compactor` | per-bucket mutex + RSS watcher's `try_spill` sweep |
 | bucket-process | T worker threads pop next bucket from atomic counter; each owns one bucket end-to-end | per-bucket: thread-local; `global_mu` only during local→global merge |
-| stitch | single-threaded (the in-memory adjacency and walk are not yet parallelized) | n/a |
+| stitch | single-threaded round loop, one hash bucket at a time | n/a |
 | emit | single-threaded | n/a |
 
 Inter-phase: each phase finishes before the next begins. There is no
@@ -724,10 +751,10 @@ branch was reset to just the batched-merge commit.
 
 ### 11.4 Single-threaded stitch and emit
 
-Stitch is ~16 s / ~27 s / ~57 s on 25K / 50K / 100K. Scales sub-
-linearly with input size but would matter if num_unitigs grew much
-further. Emit is ~4–13 s and I/O-bound. Both are unparallelized
-today; not a priority.
+Stitch (the external-memory round loop) and emit are single-threaded.
+The stitch's per-round work is dominated by sequential bucket I/O and
+the per-bucket hash-table joins; it converges in O(log L) rounds for
+chains of length L. Both are unparallelized today; not a priority.
 
 ### 11.5 Per-bucket walker `kmer_info` is the largest RSS residual
 
@@ -738,12 +765,13 @@ either (a) restructuring the walker to be a streaming-online
 algorithm rather than load-then-walk, or (b) accepting some CPU
 cost to encode the rsid lists more compactly. Both are substantial.
 
-### 11.6 mmap-backed stitch is SSD-friendly, HDD-painful
+### 11.6 External-memory stitch is sequential-I/O friendly
 
-`MADV_RANDOM` keeps the resident set bounded but means each
-fragment access can be a page fault. On NVMe SSDs ~50 µs per
-fragment; on HDD this would be orders of magnitude slower.
-Documented but not auto-detected.
+The round-based stitch streams whole LZ4-framed bucket files
+sequentially (read one bucket, join, write the next round's buckets),
+rather than random-accessing a global mmap'd fragment index. Peak RAM is
+one bucket's fragments + its hash table, and the I/O pattern is
+large sequential reads/writes — friendly to both SSD and HDD.
 
 ### 11.7 Wall-time vs GGCAT
 
@@ -765,7 +793,8 @@ bucket-write disk I/O, not bucket-process compute.
 | `include/bucket_io.hpp`                     | per-bucket compactor, LZ4 framing, RSS watcher |
 | `include/bucket_ingester.hpp`               | parse + minimizer + bucketing per input file |
 | `include/bucket_walker.hpp`                 | per-bucket dBG load + walk; multi-thread driver |
-| `include/stitch.hpp`                        | cross-bucket open-end joining |
+| `include/stitch_extmem.hpp`                 | cross-bucket open-end joining (external-memory) |
+| `include/stitch.hpp`                        | shared stitch helpers (side tags, junction, frag source) |
 | `include/unitig_spill.hpp`                  | disk-backed frag/unitig sinks + mmap reader |
 | `include/super_kmer.hpp`                    | super-k-mer record format (varint + 2-bit) |
 | `include/streaming_color_set_dict.hpp`      | global color-set dict; writes `.color_sets` |
