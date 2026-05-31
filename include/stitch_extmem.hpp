@@ -82,6 +82,12 @@ struct ext_tig {
     uint8_t open_flags;
     uint64_t rng;
     std::string seq;
+    // Persistent presented side (GGCAT flags bit0 = HASH_ENDING_FLAG_MASK):
+    // which open end this tig keys on for the current round. Set when the tig
+    // is routed; on a failed (orientation-incompatible) collision it is flipped
+    // to present the other extremity next round, exactly as GGCAT re-emits with
+    // `flags ^ HASH_ENDING_FLAG_MASK`. Only meaningful while the tig is open.
+    uint8_t pres = SIDE_LEFT;
 };
 
 // Split a colorless (topological) tig into monochromatic unitigs at its
@@ -536,6 +542,7 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
     constexpr uint32_t MAX_ROUNDS = 4096;  // safety net; O(log L) expected
     for (uint32_t round_no = 0;; ++round_no) {
         uint64_t carried_this_round = 0;
+        uint64_t joined_this_round = 0;
 
         for (uint32_t b = 0; b < num_buckets; ++b) {
             std::vector<ext_tig> tigs = store.take_input_bucket(b);
@@ -599,6 +606,7 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
                 consumed[a_idx] = 1;
                 consumed[i] = 1;
                 waiting.erase(it);
+                ++joined_this_round;
                 if (is_terminal(merged)) {
                     sink_unitig(merged);
                 } else {
@@ -630,12 +638,18 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
         store.advance();
 #ifdef CDGB_STITCH_DEBUG
         std::cerr << "[ext-stitch round " << round_no << "] carried=" << carried_this_round
-                  << "\n";
+                  << " joined=" << joined_this_round << "\n";
 #endif
-        if (carried_this_round == 0) break;  // store drained
-        if (round_no >= MAX_ROUNDS) {
-            std::cerr << "[ext-stitch] WARNING: round cap " << MAX_ROUNDS << " hit; flushing "
-                      << carried_this_round << " survivors\n";
+        // GGCAT termination (extend_unitigs.rs:716): stop as soon as a full
+        // round produces ZERO joins. `carried` is NOT a termination signal --
+        // it counts every still-open tig re-routed for another attempt, and a
+        // tig whose partner never co-buckets (or a genuine terminus) is carried
+        // every round forever. When no join happened this round, no further
+        // join is possible, so flush every remaining open tig as a terminal
+        // unitig (its open end has no partner in the graph) and finish.
+        if (joined_this_round == 0 || round_no >= MAX_ROUNDS) {
+            if (round_no >= MAX_ROUNDS)
+                std::cerr << "[ext-stitch] WARNING: round cap " << MAX_ROUNDS << " hit\n";
             for (uint32_t b = 0; b < num_buckets; ++b) {
                 std::vector<ext_tig> rem = store.take_input_bucket(b);
                 for (auto& t : rem) sink_unitig(t);
