@@ -308,10 +308,17 @@ After load, build `cid_of[k-mer]` for every **primary** (owned) k-mer:
 After this, `record_sets` and the per-k-mer rsid storage are released;
 the walk needs only `kmer_info` (flags + primary) and `cid_of`.
 
-The walk seeds from each unvisited primary k-mer and extends both ways
-along degree-1 simple paths (GGCAT `hashmap.rs:455-545`), stopping at a
-contig break (OPEN, including the boundary k-mer) or a branch/dead-end
-(CLOSED). It emits `stitchable_unitig` records `{seq, runs, open_flags}`,
+The walk seeds from **every** unvisited k-mer present in the bucket -- owned
+*or* foreign -- not just the color-owned ones, and extends both ways along
+degree-1 simple paths (GGCAT `hashmap.rs:455-545`), stopping at a contig
+break (OPEN, including the boundary k-mer) or a branch/dead-end (CLOSED).
+Seeding must NOT be gated on ownership: a short super-k-mer that owns none of
+its k-mers (its two boundary k-mers are colored in the two adjacent buckets)
+would otherwise never be walked, yet it is exactly the bridge fragment whose
+open ends are the stitch partners of those two boundary k-mers -- dropping it
+strands both with no partner and the cross-bucket joins fail (this caused
+salmonella-10 to emit 440k fragmented unitigs instead of the correct 86,630).
+Ownership gates COLORING only. It emits `stitchable_unitig` records `{seq, runs, open_flags}`,
 where `runs` is the RLE color-run sequence over the k-mers; a foreign
 (unowned) boundary k-mer at an open end carries a `COLOR_RUN_FOREIGN`
 placeholder that the stitch reconciles to the owning side's color at the
