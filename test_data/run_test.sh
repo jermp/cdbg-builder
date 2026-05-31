@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # End-to-end correctness test.
 # Builds a colored compacted dBG over test_data/salmonella_10/*.fasta.gz with
-# k=31, then runs verify.py to validate every k-mer / unitig / color-set id.
+# k=31, then runs verify.py, which compares the output against an
+# independently built ground-truth ccdBG (exact unitig-set equality:
+# coverage, monochromaticity, topology AND maximality).
 #
 # Run from anywhere; binary is expected at <repo>/build/cdgb-build.
 
@@ -36,4 +38,3 @@ printf '%s\n' "${inputs[@]}" > "$FILELIST"
 OUT="$WORK/sal"
 "$BIN" -i "$FILELIST" -k "$K" -o "$OUT" -t "$THREADS" -d "$WORK/buckets"
 python3 "$HERE/verify.py" --filenames "$FILELIST" --out "$OUT" -k "$K"
-python3 "$HERE/strict_topology_check.py" --filenames "$FILELIST" --out "$OUT" -k "$K"
