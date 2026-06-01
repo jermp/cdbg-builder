@@ -796,60 +796,50 @@ private:
         size_t emitted = 0;
         uint64_t prev_cid = 0;
 
-        std::vector<unitig_bucket_writer::record> records;
-        uint64_t max_bucket_recs = 0, max_bucket_bytes = 0;
-        uint32_t max_bucket_id = 0;
-        for (uint32_t b = 0; b < uwriter.num_buckets(); ++b) {
-            uwriter.read_bucket(b, records);
-            // Track the fattest emit bucket: read_bucket loads one whole
-            // cid-range bucket into RAM, so the emit-fasta peak = the largest
-            // bucket. cid ranges are equal-WIDTH, so cid skew (low cids hold
-            // far more unitigs) makes one bucket dominate -- this surfaces it.
-            uint64_t bytes = records.size() * sizeof(unitig_bucket_writer::record);
-            for (auto const& r : records) bytes += r.seq.capacity();
-            if (bytes > max_bucket_bytes) {
-                max_bucket_bytes = bytes;
-                max_bucket_recs = records.size();
-                max_bucket_id = b;
-            }
-            std::sort(records.begin(), records.end(),
-                      [](unitig_bucket_writer::record const& x,
-                         unitig_bucket_writer::record const& y) { return x.cid < y.cid; });
-            for (auto const& r : records) {
-                // Mark the final unitig of the previous run. emitted > 0
-                // guards the first unitig overall; cid != prev_cid is
-                // true on every group boundary because we iterate
-                // buckets in ascending cid range and sort within each.
-                if (emitted > 0 && r.cid != prev_cid) {
-                    u2c_bvb.set(emitted - 1, 1);
-                }
-                prev_cid = r.cid;
-                ++emitted;
+        // Per-bucket RAM cap for the cid-sort. read_bucket_sorted sorts in RAM
+        // when a bucket fits this, else external merge-sorts -- so the
+        // emit-fasta peak is bounded by this cap REGARDLESS of cid skew (which
+        // otherwise made one low-cid bucket dominate; 661k: +36 GiB). Use a
+        // modest share of -g; fall back to a fixed cap with no -g.
+        const uint64_t emit_mem_cap =
+            m_cfg.max_ram_gb > 0
+                ? (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0 * 0.10)
+                : (uint64_t)(1ull << 30);  // 1 GiB default
 
-                reserve(22);  // '>' + up to 20 digits (uint64_t) + '\n'
-                buf[pos++] = '>';
-                auto rr = std::to_chars(buf.data() + pos, buf.data() + pos + 20, r.cid);
-                pos = (size_t)(rr.ptr - buf.data());
-                buf[pos++] = '\n';
-                size_t s_pos = 0;
-                while (s_pos < r.seq.size()) {
-                    if (pos == BUF_BYTES) flush_buf();
-                    size_t take = std::min(BUF_BYTES - pos, r.seq.size() - s_pos);
-                    std::memcpy(buf.data() + pos, r.seq.data() + s_pos, take);
-                    pos += take;
-                    s_pos += take;
-                }
-                reserve(1);
-                buf[pos++] = '\n';
+        auto emit_record = [&](uint64_t cid, std::string_view seq) {
+            // Mark the final unitig of the previous run. cid is globally
+            // non-decreasing (buckets ascending by cid range, sorted within),
+            // so cid != prev_cid is exactly a color-set group boundary.
+            if (emitted > 0 && cid != prev_cid) u2c_bvb.set(emitted - 1, 1);
+            prev_cid = cid;
+            ++emitted;
+
+            reserve(22);  // '>' + up to 20 digits (uint64_t) + '\n'
+            buf[pos++] = '>';
+            auto rr = std::to_chars(buf.data() + pos, buf.data() + pos + 20, cid);
+            pos = (size_t)(rr.ptr - buf.data());
+            buf[pos++] = '\n';
+            size_t s_pos = 0;
+            while (s_pos < seq.size()) {
+                if (pos == BUF_BYTES) flush_buf();
+                size_t take = std::min(BUF_BYTES - pos, seq.size() - s_pos);
+                std::memcpy(buf.data() + pos, seq.data() + s_pos, take);
+                pos += take;
+                s_pos += take;
             }
+            reserve(1);
+            buf[pos++] = '\n';
+        };
+
+        for (uint32_t b = 0; b < uwriter.num_buckets(); ++b) {
+            uwriter.read_bucket_sorted(b, emit_mem_cap, emit_record);
         }
         flush_buf();
         std::fclose(fa);
 
-        std::cout << "  [emit-fasta] " << uwriter.num_buckets() << " buckets; fattest = bucket "
-                  << max_bucket_id << " (" << max_bucket_recs << " unitigs, "
-                  << format_bytes(max_bucket_bytes)
-                  << " resident -- this drives the emit-fasta peak)\n";
+        std::cout << "  [emit-fasta] " << uwriter.num_buckets()
+                  << " buckets, cid-sort RAM cap " << format_bytes(emit_mem_cap)
+                  << " (external merge-sort if a bucket exceeds it)\n";
 
         // Close out the very last run.
         if (emitted > 0) u2c_bvb.set(emitted - 1, 1);

@@ -153,6 +153,122 @@ public:
         }
     }
 
+    // Stream bucket b's records in cid-ASCENDING order, calling
+    // emit(cid, seq_view) for each, using at most ~mem_cap bytes of RAM
+    // regardless of bucket size. This replaces "load whole bucket + in-RAM
+    // sort", whose peak was the FATTEST bucket -- and cid skew (unitigs
+    // cluster in low cids; cid ranges are equal-width) made one bucket
+    // dominate (661k emit-fasta: +36 GiB).
+    //
+    // Common case (bucket <= mem_cap): one in-RAM chunk, sort, emit -- no
+    // spill, same speed as before. Large bucket: read in <=mem_cap chunks,
+    // sort each, spill as a sorted run file, then k-way merge the runs to the
+    // sink. Order WITHIN a cid is irrelevant (verify compares unitig sets; u2c
+    // only needs each cid's unitigs contiguous, which cid-order guarantees).
+    template <typename Emit>
+    void read_bucket_sorted(uint32_t b, uint64_t mem_cap, Emit&& emit) {
+        std::FILE* f = m_files[b];
+        if (!f) throw std::runtime_error("read_bucket_sorted: file already closed");
+        std::fflush(f);
+        std::rewind(f);
+        if (mem_cap < (1u << 20)) mem_cap = 1u << 20;  // sane floor
+
+        std::vector<record> chunk;
+        uint64_t chunk_bytes = 0;
+        std::vector<std::string> run_paths;  // spilled sorted-run files
+
+        auto read_one = [&](std::FILE* fp, record& r) -> bool {
+            uint32_t seq_len = 0;
+            if (std::fread(&r.cid, sizeof(r.cid), 1, fp) != 1) {
+                if (std::feof(fp)) return false;
+                throw std::runtime_error("short read of cid in bucket " + std::to_string(b));
+            }
+            if (std::fread(&seq_len, sizeof(seq_len), 1, fp) != 1)
+                throw std::runtime_error("short read of len in bucket " + std::to_string(b));
+            r.seq.resize(seq_len);
+            if (seq_len > 0 &&
+                std::fread(r.seq.data(), 1, seq_len, fp) != (size_t)seq_len)
+                throw std::runtime_error("short read of seq in bucket " + std::to_string(b));
+            return true;
+        };
+        auto write_one = [&](std::FILE* fp, record const& r) {
+            uint32_t seq_len = (uint32_t)r.seq.size();
+            if (std::fwrite(&r.cid, sizeof(r.cid), 1, fp) != 1 ||
+                std::fwrite(&seq_len, sizeof(seq_len), 1, fp) != 1 ||
+                (seq_len > 0 && std::fwrite(r.seq.data(), 1, seq_len, fp) != (size_t)seq_len))
+                throw std::runtime_error("short write of run record for bucket " +
+                                         std::to_string(b));
+        };
+        auto sort_chunk = [&]() {
+            std::sort(chunk.begin(), chunk.end(),
+                      [](record const& x, record const& y) { return x.cid < y.cid; });
+        };
+        auto spill_chunk = [&]() {
+            std::string p = m_dir + "/unitig_run_" + std::to_string(b) + "_" +
+                            std::to_string(run_paths.size()) + ".bin";
+            std::FILE* rf = std::fopen(p.c_str(), "wb");
+            if (!rf) throw std::runtime_error("cannot open unitig run file: " + p);
+            for (auto const& r : chunk) write_one(rf, r);
+            std::fclose(rf);
+            run_paths.push_back(std::move(p));
+            chunk.clear();
+            chunk_bytes = 0;
+        };
+
+        // Pass 1: read in chunks; sort each. If it all fits one chunk and no
+        // prior runs, emit directly (the no-spill fast path).
+        record r;
+        while (read_one(f, r)) {
+            chunk_bytes += sizeof(record) + r.seq.size();
+            chunk.push_back(std::move(r));
+            r.seq.clear();
+            if (chunk_bytes >= mem_cap) { sort_chunk(); spill_chunk(); }
+        }
+        if (run_paths.empty()) {
+            // Whole bucket fit in RAM: sort + emit, no temp files.
+            sort_chunk();
+            for (auto const& rec : chunk) emit(rec.cid, std::string_view(rec.seq));
+            return;
+        }
+        if (!chunk.empty()) { sort_chunk(); spill_chunk(); }  // final partial run
+
+        // Pass 2: k-way merge the sorted runs. One record per run resident +
+        // a heap -- bounded by (#runs * one record). #runs = bucket/mem_cap.
+        struct cursor {
+            std::FILE* fp;
+            record cur;
+            bool live;
+        };
+        std::vector<cursor> cur(run_paths.size());
+        for (size_t i = 0; i < run_paths.size(); ++i) {
+            cur[i].fp = std::fopen(run_paths[i].c_str(), "rb");
+            if (!cur[i].fp) throw std::runtime_error("cannot reopen run: " + run_paths[i]);
+            cur[i].live = read_one(cur[i].fp, cur[i].cur);
+        }
+        // Min-heap of run indices by current cid.
+        auto worse = [&](size_t a, size_t c) { return cur[a].cur.cid > cur[c].cur.cid; };
+        std::vector<size_t> heap;
+        heap.reserve(cur.size());
+        for (size_t i = 0; i < cur.size(); ++i)
+            if (cur[i].live) heap.push_back(i);
+        std::make_heap(heap.begin(), heap.end(), worse);
+        while (!heap.empty()) {
+            std::pop_heap(heap.begin(), heap.end(), worse);
+            size_t i = heap.back();
+            heap.pop_back();
+            emit(cur[i].cur.cid, std::string_view(cur[i].cur.seq));
+            if (read_one(cur[i].fp, cur[i].cur)) {
+                heap.push_back(i);
+                std::push_heap(heap.begin(), heap.end(), worse);
+            }
+        }
+        for (size_t i = 0; i < cur.size(); ++i) {
+            if (cur[i].fp) std::fclose(cur[i].fp);
+            std::error_code ec;
+            std::filesystem::remove(run_paths[i], ec);
+        }
+    }
+
     void close_and_unlink() {
         for (uint32_t b = 0; b < m_num_buckets; ++b) {
             if (m_files[b]) {
