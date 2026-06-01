@@ -257,9 +257,16 @@ struct builder {
                 // -g a fixed default keeps small inputs fast.
                 const uint32_t stitch_buckets =
                     pick_stitch_bucket_count_(total_frag_seq_bytes, m_cfg.max_ram_gb);
-                std::cout << "  stitch buckets: " << stitch_buckets << "\n";
+                std::cout << "  stitch buckets: " << stitch_buckets
+                          << ", threads: " << m_cfg.num_threads << "\n";
+                // Parallel over the per-round bucket loop: buckets are
+                // independent within a round (own waiting-map; content-seeded
+                // RNG), so this fans out cleanly. Output is unchanged --
+                // emit_fasta sorts each cid-bucket, so .fa is identical
+                // regardless of which thread emitted which unitig.
                 stitch_unitigs_extmem_file_stream(frag_reader, m_cfg.k, tmp_dir,
-                                                  std::ref(*uwriter_ptr), stitch_buckets, &done);
+                                                  std::ref(*uwriter_ptr), stitch_buckets, &done,
+                                                  m_cfg.num_threads);
                 prog.stop();
                 std::cout << "  unitigs after stitching: " << uwriter_ptr->total_unitigs() << "\n";
                 // frag_reader destroyed here -- file handle closed.

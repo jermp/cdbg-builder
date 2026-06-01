@@ -16,6 +16,7 @@
 // Exit code 0 = all pass; non-zero = at least one failure.
 
 #include <atomic>
+#include <mutex>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -52,14 +53,16 @@ multiset_t to_multiset(std::vector<stitchable_unitig> const& v) {
     return m;
 }
 
-enum class which_stitch { ext_mem, ext_file };
+enum class which_stitch { ext_mem, ext_file, ext_file_mt };
 
 char const* stitch_name(which_stitch w) {
     switch (w) {
         case which_stitch::ext_mem:
             return "ext_mem";
-        default:
+        case which_stitch::ext_file:
             return "ext_file";
+        default:
+            return "ext_file_mt";
     }
 }
 
@@ -67,7 +70,13 @@ char const* stitch_name(which_stitch w) {
 void run_stitch(which_stitch w, std::vector<stitchable_unitig>& frags, uint32_t k,
                 std::vector<stitchable_unitig>& out) {
     out.clear();
-    auto sink = [&](stitchable_unitig&& u) { out.push_back(std::move(u)); };
+    // ext_file_mt runs the parallel round driver, whose sink is called from
+    // multiple threads -- guard the test accumulator with a mutex.
+    std::mutex out_mu;
+    auto sink = [&](stitchable_unitig&& u) {
+        std::lock_guard<std::mutex> lk(out_mu);
+        out.push_back(std::move(u));
+    };
     if (w == which_stitch::ext_mem) {
         cdbg::vector_frag_source src(frags);
         // Small bucket count exercises multi-round doubling on tiny
@@ -79,7 +88,11 @@ void run_stitch(which_stitch w, std::vector<stitchable_unitig>& frags, uint32_t 
                           "/cdbg_stitch_test_" + std::to_string(::getpid()) + "_" +
                           std::to_string(g_tmp_counter++);
         std::filesystem::create_directories(dir);
-        cdbg::stitch_unitigs_extmem_file(src, k, dir, sink, /*num_buckets=*/16);
+        // ext_file single-threaded; ext_file_mt with 4 threads exercises the
+        // parallel per-round bucket loop + per-output-bucket locking.
+        uint32_t threads = (w == which_stitch::ext_file_mt) ? 4u : 1u;
+        cdbg::stitch_unitigs_extmem_file(src, k, dir, sink, /*num_buckets=*/16,
+                                         /*done=*/nullptr, threads);
         std::filesystem::remove_all(dir);
     }
 }
@@ -141,7 +154,8 @@ bool run_case(uint64_t seed, uint32_t k, uint64_t num_unitigs, uint64_t max_len,
               uint64_t max_frags) {
     bool b = run_case_impl(which_stitch::ext_mem, seed, k, num_unitigs, max_len, max_frags);
     bool c = run_case_impl(which_stitch::ext_file, seed, k, num_unitigs, max_len, max_frags);
-    return b && c;
+    bool d = run_case_impl(which_stitch::ext_file_mt, seed, k, num_unitigs, max_len, max_frags);
+    return b && c && d;
 }
 
 // Shared-cid branchy correctness case. Builds `num_clusters` branch
@@ -183,7 +197,8 @@ bool run_branch_case_impl(which_stitch w, uint64_t seed, uint32_t k, uint64_t nu
 bool run_branch_case(uint64_t seed, uint32_t k, uint64_t num_clusters) {
     bool b = run_branch_case_impl(which_stitch::ext_mem, seed, k, num_clusters);
     bool c = run_branch_case_impl(which_stitch::ext_file, seed, k, num_clusters);
-    return b && c;
+    bool d = run_branch_case_impl(which_stitch::ext_file_mt, seed, k, num_clusters);
+    return b && c && d;
 }
 
 // Larger case: report timing + fragment/unitig counts, plus the same
@@ -208,7 +223,8 @@ bool run_scale(uint64_t seed, uint32_t k, uint64_t num_unitigs) {
 
     std::vector<stitchable_unitig> out;
     bool ok = true;
-    for (which_stitch w : {which_stitch::ext_mem, which_stitch::ext_file}) {
+    for (which_stitch w :
+         {which_stitch::ext_mem, which_stitch::ext_file, which_stitch::ext_file_mt}) {
         auto t0 = std::chrono::steady_clock::now();
         run_stitch(w, frags, k, out);
         auto t1 = std::chrono::steady_clock::now();
