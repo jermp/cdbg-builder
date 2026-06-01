@@ -156,6 +156,11 @@ struct builder {
         writer->close();
         std::cout << "  bucket bytes written: " << writer->total_bytes() << " (compressed; "
                   << writer->total_uncompressed_bytes() << " uncompressed)\n";
+        // Per-bucket size distribution: tells us whether the bucket-process
+        // working set is driven by a few outliers (resplit fixes it) or is
+        // broad (need more buckets / concurrency cap). num_threads = how many
+        // buckets are resident at once.
+        writer->report_bucket_size_distribution(m_cfg.num_threads);
         bucket_prof().print(m_cfg.num_threads);
 
         // Bucket processing emits stitchable fragments AND merges

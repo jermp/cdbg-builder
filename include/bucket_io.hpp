@@ -371,17 +371,67 @@ public:
     void close() {
         if (m_closed) return;
         for (auto& c : m_compactors) c->close();
-        // Stat each file once for the on-disk byte total.
+        // Stat each file once for the on-disk byte total. Also collect the
+        // per-bucket uncompressed sizes so we can report the bucket-size
+        // distribution: bucket-process holds ONE bucket's kmer_info resident
+        // per in-flight thread, so the peak working set is driven by the
+        // LARGEST buckets, not the average. The distribution (and the sum of
+        // the top-`report_threads` buckets) tells us whether a few outliers
+        // dominate (resplit fixes it) or the load is broad (need more buckets
+        // / a concurrency cap). Cheap: one stat()/accessor per bucket at close.
         uint64_t total_compressed = 0;
         uint64_t total_uncompressed = 0;
+        std::vector<uint64_t> unc;
+        unc.reserve(m_num_buckets);
         for (uint32_t b = 0; b < m_num_buckets; ++b) {
             struct stat st;
             if (::stat(bucket_path(b).c_str(), &st) == 0) total_compressed += (uint64_t)st.st_size;
-            total_uncompressed += m_compactors[b]->total_uncompressed_bytes();
+            uint64_t u = m_compactors[b]->total_uncompressed_bytes();
+            total_uncompressed += u;
+            unc.push_back(u);
         }
         m_total_compressed.store(total_compressed, std::memory_order_relaxed);
         m_total_uncompressed.store(total_uncompressed, std::memory_order_relaxed);
+        m_bucket_unc_sizes = std::move(unc);
         m_closed = true;
+    }
+
+    // Print the per-bucket (uncompressed) size distribution and the estimated
+    // bucket-process working set. `concurrency` is the number of buckets
+    // processed at once (num_threads). Call after close().
+    void report_bucket_size_distribution(uint32_t concurrency) const {
+        if (m_bucket_unc_sizes.empty()) return;
+        std::vector<uint64_t> v = m_bucket_unc_sizes;  // copy; sort ascending
+        std::sort(v.begin(), v.end());
+        const size_t n = v.size();
+        auto pct = [&](double p) -> uint64_t {
+            size_t i = (size_t)(p * (double)(n - 1));
+            return v[i];
+        };
+        uint64_t total = 0;
+        for (uint64_t x : v) total += x;
+        // Sum of the largest `concurrency` buckets = worst-case set of buckets
+        // resident together (each thread grabs the next bucket; the slowest /
+        // biggest can co-reside). This is the bucket-process peak driver, in
+        // *on-disk uncompressed* bytes -- the in-RAM kmer_info is a further
+        // ~constant multiple of this (record bytes -> hashmap entries).
+        uint64_t top_sum = 0;
+        for (size_t i = (n > concurrency ? n - concurrency : 0); i < n; ++i) top_sum += v[i];
+        uint32_t nonempty = 0;
+        for (uint64_t x : v) if (x) ++nonempty;
+        std::fprintf(stderr,
+            "[bucket size dist] buckets=%zu nonempty=%u  uncompressed bytes:\n"
+            "  mean=%.2f MiB  p50=%.2f  p90=%.2f  p99=%.2f  p999=%.2f  max=%.2f MiB\n"
+            "  largest-%u-sum=%.2f GiB (worst-case co-resident bucket bytes; "
+            "kmer_info RAM is a ~constant multiple of this)\n"
+            "  max-bucket=%llu bytes  total=%.2f GiB\n",
+            n, nonempty,
+            (double)total / n / 1048576.0,
+            (double)pct(0.50) / 1048576.0, (double)pct(0.90) / 1048576.0,
+            (double)pct(0.99) / 1048576.0, (double)pct(0.999) / 1048576.0,
+            (double)v[n - 1] / 1048576.0,
+            concurrency, (double)top_sum / 1073741824.0,
+            (unsigned long long)v[n - 1], (double)total / 1073741824.0);
     }
 
     uint64_t total_bytes() const { return m_total_compressed.load(std::memory_order_relaxed); }
@@ -492,6 +542,7 @@ private:
     std::vector<std::unique_ptr<bucket_compactor>> m_compactors;
     std::atomic<uint64_t> m_total_compressed{0};
     std::atomic<uint64_t> m_total_uncompressed{0};
+    std::vector<uint64_t> m_bucket_unc_sizes;  // per-bucket uncompressed bytes (set in close())
     bool m_closed = false;
     // Pressure flag set by the RSS watcher; informational only
     // (surfaced via under_pressure() / pressure_was_engaged() for the
