@@ -885,14 +885,58 @@ inline void ext_seed_round0(Source& frag, uint32_t k, Store& store, Sink&& sink,
 // std::string& seq)` (frag_unitig_stream_reader). Peak RAM is ONE fragment, so
 // the stitch carries no O(num_fragments) index -- this is what makes the whole
 // stitch phase bounded by the round-store bucket count, not the fragment count.
+//
+// num_threads > 1: read a bounded BATCH serially (the file has no record index,
+// so the read itself can't be sharded), then route the batch in parallel.
+// Routing is the CPU-heavy part -- it LZ4-compresses every round-0 output frame
+// -- and the store's per-output-bucket locks + the mutex-guarded sink make
+// concurrent routing safe. Peak RAM stays bounded to one batch (BATCH tigs).
 template <typename Reader, typename Store, typename Sink>
 inline void ext_seed_round0_stream(Reader& reader, uint32_t k, Store& store, Sink&& sink,
-                                   std::atomic<uint64_t>* done) {
-    ext_tig t;
-    while (reader.next(t.open_flags, t.runs, t.seq)) {
-        ext_seed_one(std::move(t), k, store, sink, done);
-        // ext_seed_one moved t's seq/runs into the store or the sink; the
-        // moved-from vectors/string are reused by the next next() call.
+                                   std::atomic<uint64_t>* done, uint32_t num_threads = 1) {
+    if (num_threads <= 1) {
+        ext_tig t;
+        while (reader.next(t.open_flags, t.runs, t.seq)) {
+            ext_seed_one(std::move(t), k, store, sink, done);
+            // ext_seed_one moved t's seq/runs into the store or the sink; the
+            // moved-from vectors/string are reused by the next next() call.
+        }
+        store.advance();  // round-0 emissions become round-1 input
+        return;
+    }
+
+    // Parallel: serial read into a batch, parallel route. The sink
+    // (unitig_bucket_writer) is not internally thread-safe, so guard it.
+    constexpr size_t BATCH = 1u << 16;  // 65536 frags/batch: bounds RAM, amortizes sync
+    std::mutex sink_mu;
+    auto guarded_sink = [&](stitchable_unitig&& u) {
+        std::lock_guard<std::mutex> lk(sink_mu);
+        sink(std::move(u));
+    };
+    std::vector<ext_tig> batch;
+    batch.reserve(BATCH);
+    for (;;) {
+        batch.clear();
+        ext_tig t;
+        while (batch.size() < BATCH && reader.next(t.open_flags, t.runs, t.seq)) {
+            batch.push_back(std::move(t));
+            t = ext_tig{};  // fresh buffers for the next record
+        }
+        if (batch.empty()) break;
+
+        std::atomic<size_t> next_i{0};
+        std::vector<std::thread> workers;
+        workers.reserve(num_threads);
+        for (uint32_t w = 0; w < num_threads; ++w) {
+            workers.emplace_back([&]() {
+                for (;;) {
+                    size_t i = next_i.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= batch.size()) break;
+                    ext_seed_one(std::move(batch[i]), k, store, guarded_sink, done);
+                }
+            });
+        }
+        for (auto& wk : workers) wk.join();
     }
     store.advance();  // round-0 emissions become round-1 input
 }
@@ -947,8 +991,8 @@ inline void stitch_unitigs_extmem_file_stream(Reader& reader, uint32_t k,
     if (num_buckets == 0) num_buckets = 1024;
     detail::round_store_file store(tmp_dir, num_buckets);
     auto t_seed = std::chrono::steady_clock::now();
-    detail::ext_seed_round0_stream(reader, k, store, sink, done);
-    std::cout << "  [stitch] round-0 seed (single-threaded read of all frags): "
+    detail::ext_seed_round0_stream(reader, k, store, sink, done, num_threads);
+    std::cout << "  [stitch] round-0 seed (read all frags; route in parallel): "
               << std::chrono::duration<double>(std::chrono::steady_clock::now() - t_seed).count()
               << "s\n";
     detail::ext_run_rounds(store, k, num_buckets, sink, done, num_threads);
