@@ -51,6 +51,7 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <thread>
 #include <cerrno>
@@ -713,32 +714,84 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
     // so both route to the same bucket whenever they present that end) --
     // O(log L) expected rounds.
     constexpr uint32_t MAX_ROUNDS = 4096;  // safety net; O(log L) expected
-    for (uint32_t round_no = 0;; ++round_no) {
-        std::atomic<uint64_t> joined_this_round{0};
 
-        if (num_threads == 1) {
-            for (uint32_t b = 0; b < num_buckets; ++b)
-                joined_this_round.fetch_add(process_bucket(b), std::memory_order_relaxed);
-        } else {
-            // Workers pull input buckets from a shared atomic index. Buckets
-            // are independent within a round (see process_bucket), so this is
-            // a clean fan-out; results route to the store (per-output-bucket
-            // locked) for the NEXT round, read only after the join barrier.
-            std::atomic<uint32_t> next_b{0};
-            std::vector<std::thread> workers;
-            workers.reserve(num_threads);
-            for (uint32_t t = 0; t < num_threads; ++t) {
-                workers.emplace_back([&]() {
-                    uint64_t local_joined = 0;
+    // Persistent worker pool: spawned ONCE and reused across all rounds, so we
+    // pay num_threads thread-creations total instead of per round (the round
+    // count is O(log L); re-spawning each round added measurable barrier
+    // overhead on small inputs). Each round the main thread publishes the
+    // shared cursor `next_b` and signals `go`; workers drain buckets via
+    // process_bucket, then the last one to finish signals `done_round`. A
+    // generation counter avoids lost/duplicate wakeups.
+    std::mutex pool_mu;
+    std::condition_variable cv_go, cv_done;
+    std::atomic<uint32_t> next_b{0};
+    std::atomic<uint64_t> joined_this_round{0};
+    uint32_t generation = 0;       // bumped once per round to release workers
+    uint32_t active = 0;           // workers still draining this generation
+    bool pool_stop = false;        // set at teardown to retire workers
+    const bool parallel = (num_threads > 1);
+
+    std::vector<std::thread> pool;
+    if (parallel) {
+        pool.reserve(num_threads);
+        for (uint32_t t = 0; t < num_threads; ++t) {
+            pool.emplace_back([&]() {
+                uint32_t seen = 0;  // last generation this worker processed
+                for (;;) {
+                    {
+                        std::unique_lock<std::mutex> lk(pool_mu);
+                        cv_go.wait(lk, [&] { return pool_stop || generation != seen; });
+                        if (pool_stop) return;
+                        seen = generation;
+                    }
+                    uint64_t local = 0;
                     for (;;) {
                         uint32_t b = next_b.fetch_add(1, std::memory_order_relaxed);
                         if (b >= num_buckets) break;
-                        local_joined += process_bucket(b);
+                        local += process_bucket(b);
                     }
-                    joined_this_round.fetch_add(local_joined, std::memory_order_relaxed);
-                });
+                    joined_this_round.fetch_add(local, std::memory_order_relaxed);
+                    {
+                        std::unique_lock<std::mutex> lk(pool_mu);
+                        if (--active == 0) cv_done.notify_one();
+                    }
+                }
+            });
+        }
+    }
+    // Retire the pool on scope exit (also on exception).
+    struct pool_guard {
+        std::mutex& mu;
+        std::condition_variable& cv;
+        bool& stop;
+        std::vector<std::thread>& pool;
+        ~pool_guard() {
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                stop = true;
             }
-            for (auto& w : workers) w.join();
+            cv.notify_all();
+            for (auto& w : pool) w.join();
+        }
+    } guard{pool_mu, cv_go, pool_stop, pool};
+
+    for (uint32_t round_no = 0;; ++round_no) {
+        joined_this_round.store(0, std::memory_order_relaxed);
+
+        if (!parallel) {
+            for (uint32_t b = 0; b < num_buckets; ++b)
+                joined_this_round.fetch_add(process_bucket(b), std::memory_order_relaxed);
+        } else {
+            // Release the pool on a fresh cursor, then wait for all workers to
+            // drain this round's buckets (the round barrier).
+            {
+                std::unique_lock<std::mutex> lk(pool_mu);
+                next_b.store(0, std::memory_order_relaxed);
+                active = num_threads;
+                ++generation;
+                cv_go.notify_all();
+                cv_done.wait(lk, [&] { return active == 0; });
+            }
         }
 
         store.advance();

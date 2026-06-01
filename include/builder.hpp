@@ -255,10 +255,18 @@ struct builder {
                 // hundreds of GB on the 661k pangenome). num_buckets is
                 // sized so one bucket's tigs fit a share of -g; with no
                 // -g a fixed default keeps small inputs fast.
-                const uint32_t stitch_buckets =
-                    pick_stitch_bucket_count_(total_frag_seq_bytes, m_cfg.max_ram_gb);
+                // Buckets + concurrency chosen together so peak RSS
+                // (~stitch_threads * one bucket) stays within stitch's share
+                // of -g; under a tight budget stitch_threads may be < -t.
+                const auto sp = pick_stitch_plan_(total_frag_seq_bytes, m_cfg.max_ram_gb,
+                                                  m_cfg.num_threads);
+                const uint32_t stitch_buckets = sp.buckets;
                 std::cout << "  stitch buckets: " << stitch_buckets
-                          << ", threads: " << m_cfg.num_threads << "\n";
+                          << ", threads: " << sp.threads;
+                if (sp.threads < m_cfg.num_threads)
+                    std::cout << " (capped from " << m_cfg.num_threads
+                              << " to fit -g)";
+                std::cout << "\n";
                 // Parallel over the per-round bucket loop: buckets are
                 // independent within a round (own waiting-map; content-seeded
                 // RNG), so this fans out cleanly. Output is unchanged --
@@ -266,7 +274,7 @@ struct builder {
                 // regardless of which thread emitted which unitig.
                 stitch_unitigs_extmem_file_stream(frag_reader, m_cfg.k, tmp_dir,
                                                   std::ref(*uwriter_ptr), stitch_buckets, &done,
-                                                  m_cfg.num_threads);
+                                                  sp.threads);
                 prog.stop();
                 std::cout << "  unitigs after stitching: " << uwriter_ptr->total_unitigs() << "\n";
                 // frag_reader destroyed here -- file handle closed.
@@ -701,23 +709,46 @@ private:
     // bytes. More buckets -> smaller per-bucket resident set but more
     // round files; fewer buckets -> larger resident set. With no -g a
     // fixed default keeps small inputs in a handful of rounds.
-    static uint32_t pick_stitch_bucket_count_(uint64_t total_frag_seq_bytes, double max_ram_gb) {
+    // Pick the stitch round-store bucket count AND the effective stitch
+    // concurrency together, so peak RSS stays within budget.
+    //
+    // The parallel stitch holds ONE bucket resident per in-flight thread, so
+    // peak ~= effective_threads * (one bucket's tigs). To keep that within
+    // stitch's SHARE of -g we size buckets for `num_threads` resident copies:
+    // count >= needed * num_threads / budget. If that hits the MAX_BUCKETS
+    // (file-count) ceiling, we instead CAP the thread count so
+    // effective_threads * one_bucket still fits. Returns {buckets, threads}.
+    struct stitch_plan { uint32_t buckets; uint32_t threads; };
+    static stitch_plan pick_stitch_plan_(uint64_t total_frag_seq_bytes, double max_ram_gb,
+                                         uint32_t num_threads) {
         constexpr uint32_t MIN_BUCKETS = 64;
         constexpr uint32_t MAX_BUCKETS = 1u << 20;  // 1M files cap
         constexpr uint32_t DEFAULT_BUCKETS = 1024;
         constexpr double OVERHEAD = 3.0;  // tig record + decode vector + maps
-        constexpr double SHARE = 0.50;    // stitch's share of -g per resident bucket
+        constexpr double SHARE = 0.50;    // stitch's share of -g (across ALL resident buckets)
+        if (num_threads == 0) num_threads = 1;
 
-        if (max_ram_gb <= 0 || total_frag_seq_bytes == 0) return DEFAULT_BUCKETS;
-        const uint64_t per_bucket_budget =
+        if (max_ram_gb <= 0 || total_frag_seq_bytes == 0)
+            return {DEFAULT_BUCKETS, num_threads};  // no budget: user owns the tradeoff
+        const uint64_t budget =
             (uint64_t)(max_ram_gb * 1024.0 * 1024.0 * 1024.0 * SHARE);
-        if (per_bucket_budget == 0) return DEFAULT_BUCKETS;
+        if (budget == 0) return {DEFAULT_BUCKETS, num_threads};
         const uint64_t needed = (uint64_t)((double)total_frag_seq_bytes * OVERHEAD);
-        // Round up to a count where needed/count <= per_bucket_budget.
-        uint64_t count = (needed + per_bucket_budget - 1) / per_bucket_budget;
+
+        // Buckets sized so `num_threads` resident buckets fit `budget`.
+        uint64_t count = ((needed * num_threads) + budget - 1) / budget;
         if (count < MIN_BUCKETS) count = MIN_BUCKETS;
-        if (count > MAX_BUCKETS) count = MAX_BUCKETS;
-        return (uint32_t)count;
+        uint32_t threads = num_threads;
+        if (count > MAX_BUCKETS) {
+            // Can't make buckets small enough; cap concurrency instead so
+            // threads * one_bucket <= budget. one_bucket = needed / MAX_BUCKETS.
+            count = MAX_BUCKETS;
+            const uint64_t one_bucket = (needed + count - 1) / count;
+            uint64_t fit = one_bucket ? (budget / one_bucket) : num_threads;
+            if (fit < 1) fit = 1;
+            if (fit < threads) threads = (uint32_t)fit;
+        }
+        return {(uint32_t)count, threads};
     }
 
     // FASTA emit. Hand-rolled 1 MiB buffer + std::to_chars for the
