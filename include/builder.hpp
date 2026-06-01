@@ -797,8 +797,21 @@ private:
         uint64_t prev_cid = 0;
 
         std::vector<unitig_bucket_writer::record> records;
+        uint64_t max_bucket_recs = 0, max_bucket_bytes = 0;
+        uint32_t max_bucket_id = 0;
         for (uint32_t b = 0; b < uwriter.num_buckets(); ++b) {
             uwriter.read_bucket(b, records);
+            // Track the fattest emit bucket: read_bucket loads one whole
+            // cid-range bucket into RAM, so the emit-fasta peak = the largest
+            // bucket. cid ranges are equal-WIDTH, so cid skew (low cids hold
+            // far more unitigs) makes one bucket dominate -- this surfaces it.
+            uint64_t bytes = records.size() * sizeof(unitig_bucket_writer::record);
+            for (auto const& r : records) bytes += r.seq.capacity();
+            if (bytes > max_bucket_bytes) {
+                max_bucket_bytes = bytes;
+                max_bucket_recs = records.size();
+                max_bucket_id = b;
+            }
             std::sort(records.begin(), records.end(),
                       [](unitig_bucket_writer::record const& x,
                          unitig_bucket_writer::record const& y) { return x.cid < y.cid; });
@@ -832,6 +845,11 @@ private:
         }
         flush_buf();
         std::fclose(fa);
+
+        std::cout << "  [emit-fasta] " << uwriter.num_buckets() << " buckets; fattest = bucket "
+                  << max_bucket_id << " (" << max_bucket_recs << " unitigs, "
+                  << format_bytes(max_bucket_bytes)
+                  << " resident -- this drives the emit-fasta peak)\n";
 
         // Close out the very last run.
         if (emitted > 0) u2c_bvb.set(emitted - 1, 1);

@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <random>
 #include <string>
 #include <vector>
@@ -70,6 +71,12 @@ int main(int argc, char** argv) {
     const uint32_t threads = (uint32_t)arg_u64(argc, argv, "--threads", 1);
     const uint64_t seed = arg_u64(argc, argv, "--seed", 42);
     const uint32_t k = (uint32_t)arg_u64(argc, argv, "-k", 31);
+    // cid skew: 0 = uniform; >0 biases unitigs toward LOW cids (small color
+    // classes / common k-mers), as in real pangenomes. cid = floor(num_classes
+    // * u^(1+skew)), u uniform in [0,1). skew=1 ~ quadratic bias; higher =
+    // fatter low-cid head. Reproduces the emit-fasta read_bucket skew that
+    // uniform cids miss (661k: ~9x fattest-vs-average).
+    const double cid_skew = arg_f64(argc, argv, "--cid-skew", 0.0);
 
     // Mean per-class color-set size (>=1). If total_integers unset, use 1.
     const double mean_class_size =
@@ -163,6 +170,8 @@ int main(int argc, char** argv) {
         std::geometric_distribution<uint64_t> glen(
             mean_unitig_len > (double)k ? 1.0 / (mean_unitig_len - (double)k + 1.0) : 0.5);
         std::uniform_int_distribution<uint64_t> cid_pick(0, num_classes - 1);
+        std::uniform_real_distribution<double> u01(0.0, 1.0);
+        const double skew_exp = 1.0 + cid_skew;  // cid = num_classes * u^skew_exp
         const char* B = "ACGT";
         std::string seq;
         for (uint64_t u = 0; u < num_unitigs; ++u) {
@@ -173,9 +182,17 @@ int main(int argc, char** argv) {
                 if ((i & 31) == 0) bits = urng();
                 seq[i] = B[(bits >> ((i & 31) * 2)) & 3];
             }
+            uint64_t cid;
+            if (cid_skew <= 0.0) {
+                cid = cid_pick(urng);
+            } else {
+                double uu = u01(urng);
+                cid = (uint64_t)((double)num_classes * std::pow(uu, skew_exp));
+                if (cid >= num_classes) cid = num_classes - 1;
+            }
             stitchable_unitig su;
             su.seq.swap(seq);
-            su.set_mono(cid_pick(urng), k);
+            su.set_mono(cid, k);
             uwriter(std::move(su));
             seq.clear();
             if (((u + 1) % 100000000ull) == 0)
