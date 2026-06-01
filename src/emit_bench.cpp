@@ -148,8 +148,16 @@ int main(int argc, char** argv) {
                         "emit-colors RAM will be sized to the smaller count\n");
 
         // ---- 2) Populate the unitig bucket writer (drives emit_fasta) ----
+        // emit_fasta's read_bucket loads ONE cid-bucket's records into RAM and
+        // sorts them, so its peak scales with records-per-bucket =
+        // num_unitigs / K. K MUST match what build() picks, or the measured
+        // emit-fasta RAM is off by the K ratio. Default (--unitig-buckets 0):
+        // derive K exactly as the builder does from total_bases and -g.
         uint32_t ub = unitig_buckets;
-        if (ub == 0) ub = 64;
+        if (ub == 0)
+            ub = builder::pick_unitig_bucket_count(num_classes, total_bases, ram_gb);
+        std::printf("  unitig buckets K = %u (records/bucket ~= %.1f M)\n", ub,
+                    (double)num_unitigs / ub / 1e6);
         unitig_bucket_writer uwriter(tmp_dir, num_classes, ub);
         std::mt19937_64 urng(seed ^ 0x9e3779b97f4a7c15ull);
         std::geometric_distribution<uint64_t> glen(

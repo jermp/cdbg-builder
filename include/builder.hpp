@@ -346,6 +346,15 @@ struct builder {
         std::cout << "\n";
     }
 
+    // Public forwarder so the emit-bench harness sizes its unitig bucket
+    // count EXACTLY as build() does (else the emit-fasta read_bucket peak,
+    // which scales with records-per-bucket = num_unitigs / K, is wrong).
+    static uint32_t pick_unitig_bucket_count(uint64_t num_color_classes,
+                                             uint64_t total_seq_bytes_estimate,
+                                             double max_ram_gb) {
+        return pick_unitig_bucket_count_(num_color_classes, total_seq_bytes_estimate, max_ram_gb);
+    }
+
 private:
     // Soft-cap policy. Reads m_cfg.max_ram_gb (0 = unset) and decides:
     //   - bucket_log2 (more buckets -> smaller per-bucket data structures)
