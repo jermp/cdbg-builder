@@ -138,6 +138,7 @@ struct streaming_color_set_dict {
     // lock so threads only serialise on the actual hashmap-find +
     // encode work.
     uint64_t intern_with_hashes(std::vector<uint32_t>&& candidate, precomputed_hash h) {
+        assert(!m_released && "intern() after release_index()");
         auto it = m_index.find(hash_pair{h.primary, h.secondary});
         if (it != m_index.end()) return *it;
 
@@ -161,17 +162,32 @@ struct streaming_color_set_dict {
         return id;
     }
 
-    uint64_t size() const { return m_classes.size(); }
+    uint64_t size() const { return m_released ? m_released_count : m_classes.size(); }
     uint64_t total_integers() const { return m_total_integers; }
     uint64_t total_bits() const { return m_flushed_words * 64 + m_bvb.num_bits(); }
 
-    // Approx RAM held by this dict: m_classes (16 B/class) + the m_index
-    // dedup hashset (ankerl flat backing: ~ value + 1 control byte per slot,
-    // at <=0.8 load -> ~ 1.6 * 9 B/entry). This dict is built in
-    // bucket-process and stays resident through stitch AND emit (freed only
-    // at finalize), so it's the dominant cross-phase carry-in at high class
-    // counts. Reported at phase boundaries to attribute the budget.
+    // Free the dedup index + per-class hashes once interning is DONE (after
+    // bucket-process). Neither m_index nor m_classes is read by finalize() --
+    // it only needs the class COUNT (stashed here) and the on-disk bits +
+    // sidecar offsets. This dict otherwise stays fully resident through stitch
+    // AND emit (it's freed at finalize today), and at high class counts that's
+    // the dominant cross-phase CARRY-IN that pushed stitch over budget (100K:
+    // ~15 GiB carried into stitch; 661k would be far worse). Releasing here
+    // hands that RAM back before stitch starts. After release, intern() must
+    // NOT be called again (asserted); size()/total_*()/finalize() still work.
+    void release_index() {
+        if (m_released) return;
+        m_released_count = m_classes.size();
+        decltype(m_index){}.swap(m_index);     // free the dedup hashset
+        std::vector<hash_pair>{}.swap(m_classes);  // free the per-class hashes
+        m_released = true;
+    }
+
+    // Approx RAM held by the dedup structures: m_classes (16 B/class) + the
+    // m_index hashset (ankerl flat backing ~ 1.6 * 9 B/entry). This is what
+    // release_index() frees. Reported at phase boundaries to attribute budget.
     uint64_t resident_bytes() const {
+        if (m_released) return 0;
         const uint64_t n = m_classes.size();
         const uint64_t classes_bytes = n * sizeof(hash_pair);             // 16 B/class
         const uint64_t index_bytes = (uint64_t)((double)n * 1.6 * 9.0);   // hashset est
@@ -212,7 +228,7 @@ struct streaming_color_set_dict {
         // 3) Build EF via a file-backed input iterator. EF::encode
         //    walks the sequence exactly once when universe is given,
         //    so a single-pass iterator suffices.
-        const uint64_t n = (uint64_t)m_classes.size() + 1;
+        const uint64_t n = (uint64_t)size() + 1;
         bits::elias_fano<false, false> ef;
         offset_file_iterator begin(m_offsets_file);
         ++begin;  // load the first value into operator*
@@ -243,7 +259,7 @@ struct streaming_color_set_dict {
         write_pod_(m_num_colors);
         write_pod_(m_sparse_threshold);
         write_pod_(m_dense_threshold);
-        write_pod_((uint64_t)m_classes.size());
+        write_pod_((uint64_t)size());
         write_pod_(total_bit_count);
         write_pod_(total_word_count);
 
@@ -251,7 +267,7 @@ struct streaming_color_set_dict {
         std::fclose(m_file);
         m_file = nullptr;
 
-        std::cout << "  num_color_sets = " << m_classes.size() << "\n";
+        std::cout << "  num_color_sets = " << size() << "\n";
         std::cout << "  num_total_integers = " << m_total_integers << "\n";
         std::cout << "  total bits for ints  = " << total_bit_count << "\n";
         std::cout << "  total bits for offs  = " << 8 * ef_bytes.size() << "\n";
@@ -363,6 +379,8 @@ private:
 
     bits::bit_vector::builder m_bvb;
     uint64_t m_flushed_words = 0;
+    bool m_released = false;          // release_index() called (interning done)
+    uint64_t m_released_count = 0;    // class count stashed before release
     std::vector<hash_pair> m_classes;  // 16 B per class (dedup hashes only)
     // bucket_type::big -> 64-bit internal value-index; the default
     // standard bucket caps at 2^32 entries, which overflows past

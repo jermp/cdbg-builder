@@ -207,6 +207,12 @@ struct builder {
         }
         process_prof().print(m_cfg.num_threads);
         m_num_color_classes = global_dict.size();
+        // Interning is done. Free the dict's dedup index + per-class hash
+        // vector NOW (finalize only needs the class count + the on-disk
+        // bits/offsets). At high class counts this was the dominant cross-
+        // phase carry-in -- it stayed resident through stitch + emit and
+        // pushed stitch over budget (100K -g16: ~15 GiB carried into stitch).
+        global_dict.release_index();
         frag_sink.close_for_writing();
         // bucket_writer's per-bucket compactor state (m_dict_classes
         // and other reuse-friendly buffers) is alive at high-water
