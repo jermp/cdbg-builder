@@ -51,7 +51,9 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <iostream>
 #include <mutex>
 #include <thread>
 #include <cerrno>
@@ -775,7 +777,15 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
         }
     } guard{pool_mu, cv_go, pool_stop, pool};
 
+    // Coarse timing so we can see where stitch time goes (round count and
+    // wall time; the per-round file I/O of late, near-empty rounds vs the
+    // CPU-heavy early rounds). Printed once at the end -- negligible cost.
+    auto t_rounds0 = std::chrono::steady_clock::now();
+    uint32_t rounds_run = 0;
+    double early_secs = 0.0;  // rounds 0-4 (the heavy ones)
+
     for (uint32_t round_no = 0;; ++round_no) {
+        auto t_r0 = std::chrono::steady_clock::now();
         joined_this_round.store(0, std::memory_order_relaxed);
 
         if (!parallel) {
@@ -796,6 +806,12 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
 
         store.advance();
         const uint64_t joined = joined_this_round.load(std::memory_order_relaxed);
+        ++rounds_run;
+        {
+            double rs = std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - t_r0).count();
+            if (round_no < 5) early_secs += rs;
+        }
 #ifdef CDGB_STITCH_DEBUG
         std::cerr << "[ext-stitch round " << round_no << "] joined=" << joined << "\n";
 #endif
@@ -814,6 +830,10 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
             break;
         }
     }
+    double total_round_secs =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_rounds0).count();
+    std::cout << "  [stitch] " << rounds_run << " rounds, " << total_round_secs
+              << "s total (" << early_secs << "s in rounds 0-4)\n";
 }
 
 // Seed round 0 from the fragment source into `store`, sinking already-
@@ -926,7 +946,11 @@ inline void stitch_unitigs_extmem_file_stream(Reader& reader, uint32_t k,
                                               uint32_t num_threads = 1) {
     if (num_buckets == 0) num_buckets = 1024;
     detail::round_store_file store(tmp_dir, num_buckets);
+    auto t_seed = std::chrono::steady_clock::now();
     detail::ext_seed_round0_stream(reader, k, store, sink, done);
+    std::cout << "  [stitch] round-0 seed (single-threaded read of all frags): "
+              << std::chrono::duration<double>(std::chrono::steady_clock::now() - t_seed).count()
+              << "s\n";
     detail::ext_run_rounds(store, k, num_buckets, sink, done, num_threads);
 }
 
