@@ -271,8 +271,12 @@ struct builder {
         m_num_unitigs = uwriter_ptr->total_unitigs();
 
         {
-            phase_rss_marker rss("emit");
+            phase_rss_marker rss("emit-fasta");
             emit_fasta(*uwriter_ptr);
+            rss.stop();
+        }
+        {
+            phase_rss_marker rss("emit-colors");
             emit_colors(global_dict);
             rss.stop();
         }

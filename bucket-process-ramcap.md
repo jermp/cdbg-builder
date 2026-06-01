@@ -2,6 +2,72 @@
 
 Branch: `claude/bucket-process-ramcap` (off `claude/stitch-fully-external`).
 
+## STATUS UPDATE after the full 661k run (-g 64, 48 threads)
+
+The completed 661k run changed the picture. Recorded peaks:
+
+| phase | peak RSS | increment | vs 64 GiB |
+|---|---|---|---|
+| bucket-write | 30.48 GiB | +30.40 | ok |
+| bucket-process | 81.29 GiB | +50.80 | **OVER** |
+| stitch | 81.29 GiB | **+0** | ok ✅ (streaming stitch validated at 6.08e9 frags) |
+| **emit** | **117.32 GiB** | **+36.03** | **OVER — the actual peak** |
+
+Two corrections to the earlier scorecard:
+1. **The stitch is fully validated**: +0 over prior peak at 6.08 billion
+   fragments. The streaming-frag-reader work did its job at full scale.
+2. **emit is the REAL peak (117 GiB), not bucket-process (81 GiB).** emit
+   had been +0 at 4546 genomes so it was assumed capped, but it had never
+   been stressed at 389 MILLION color classes. So there are TWO uncapped
+   stages, and **emit is the larger violator** — it must be addressed
+   first (it sets the 117 GiB peak; fixing bucket-process alone would only
+   drop the peak from 117 to ... still 117, because emit dominates).
+
+### emit: what allocates +36 GiB (NOT yet fully explained — instrument first)
+
+emit = emit_fasta + emit_colors. Static sizing from the run's counters
+(389e6 classes, 1.48e12 total ints, 1.31e9 unitigs) accounts for only
+~17–21 GiB:
+  - emit_colors dedup hashtable: 16 B/class metadata + ankerl table
+    overhead ≈ **~13 GiB** (this persists from bucket-process, not new).
+  - emit_fasta read_bucket: one unitig bucket's records in RAM + sort
+    copy ≈ **~4–8 GiB** (MAX_K=1024 cap on emit buckets means a bucket can
+    still be large at this scale).
+  - EF build at finalize ≈ <1 GiB.
+There is a ~15 GiB gap I cannot explain from static reasoning, so the
+split `emit-fasta` / `emit-colors` RSS markers were added (this commit)
+to localize it on the next run. DO NOT design the fix until that run says
+which half owns the +36 GiB.
+
+Likely fixes once localized (to be confirmed):
+  - emit_fasta: lower the MAX_K cap so a unitig bucket fits the budget,
+    OR stream-sort instead of in-RAM sort.
+  - emit_colors: the dedup hashtable is O(num_classes) and unavoidable in
+    its current form; may need to drop/spill it before finalize (it isn't
+    needed once interning is done), or shrink the per-class metadata.
+
+### bucket-process: broad, not outlier-dominated (pending distribution)
+
++50.80 GiB / 48 threads ≈ 1.06 GiB per in-flight bucket; 187.6e9 kmers /
+8192 buckets ≈ 22.9M kmers/bucket average → ~1 GiB average kmer_info.
+This points to the overshoot being BROAD (concurrency × average), so
+outlier-only resplit may be necessary-but-not-sufficient; a concurrency
+cap and/or more primary buckets may be needed too. The
+`report_bucket_size_distribution` instrumentation (committed) will
+confirm outlier-vs-broad on the next run.
+
+### Revised priority order
+1. **emit** (sets the 117 GiB peak) — instrument (done), then fix.
+2. **bucket-process** (81 GiB) — distribution, then resplit ± concurrency.
+
+---
+
+(Original resplit design for bucket-process below; still valid for that
+phase once emit is handled.)
+
+---
+
+
 Goal: make **bucket-process** honor the `-g` budget. It is the last
 uncapped phase. On the Blackwell 661k pangenome (`-g 64`) it peaked
 ~75.9 GiB (~12 GiB over) because a few dense minimizer buckets hold an
