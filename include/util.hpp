@@ -158,6 +158,12 @@ class phase_rss_marker {
 public:
     explicit phase_rss_marker(std::string label) : m_label(std::move(label)) {
         m_baseline = process_peak_rss_bytes();
+        // Live RSS at phase entry = memory CARRIED IN from prior phases (e.g.
+        // the global color-set dict, retained heap). The peak delta below is
+        // this phase's own growth; entry-live tells us what it stacks on. Both
+        // matter for the -g budget -- a phase can be "within its share" yet
+        // push the absolute peak over because of the carry-in.
+        m_entry_live = current_rss_bytes();
     }
     ~phase_rss_marker() { stop(); }
 
@@ -178,12 +184,15 @@ public:
         } else {
             std::cout << " (+0)";
         }
+        if (m_entry_live > 0)
+            std::cout << " [carried in " << format_bytes(m_entry_live) << "]";
         std::cout << "\n";
     }
 
 private:
     std::string m_label;
     uint64_t m_baseline = 0;
+    uint64_t m_entry_live = 0;
     bool m_stopped = false;
 };
 

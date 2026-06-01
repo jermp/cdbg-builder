@@ -199,6 +199,9 @@ struct builder {
                 prog.stop();
                 std::cout << "  bucket fragments: " << frag_sink.count() << "\n";
                 std::cout << "  distinct color classes: " << global_dict.size() << "\n";
+                std::cout << "  global color dict resident: ~"
+                          << format_bytes(global_dict.resident_bytes())
+                          << " (stays in RAM through stitch + emit)\n";
             }
             rss.stop();
         }

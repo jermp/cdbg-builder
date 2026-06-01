@@ -165,6 +165,19 @@ struct streaming_color_set_dict {
     uint64_t total_integers() const { return m_total_integers; }
     uint64_t total_bits() const { return m_flushed_words * 64 + m_bvb.num_bits(); }
 
+    // Approx RAM held by this dict: m_classes (16 B/class) + the m_index
+    // dedup hashset (ankerl flat backing: ~ value + 1 control byte per slot,
+    // at <=0.8 load -> ~ 1.6 * 9 B/entry). This dict is built in
+    // bucket-process and stays resident through stitch AND emit (freed only
+    // at finalize), so it's the dominant cross-phase carry-in at high class
+    // counts. Reported at phase boundaries to attribute the budget.
+    uint64_t resident_bytes() const {
+        const uint64_t n = m_classes.size();
+        const uint64_t classes_bytes = n * sizeof(hash_pair);             // 16 B/class
+        const uint64_t index_bytes = (uint64_t)((double)n * 1.6 * 9.0);   // hashset est
+        return classes_bytes + index_bytes;
+    }
+
     // Finalize the on-disk file: flush trailing partial word, build &
     // serialize the EF over per-class bit-offsets streamed back from
     // the sidecar, then fseek back to overwrite the placeholder header.
