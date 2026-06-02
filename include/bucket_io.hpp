@@ -443,17 +443,13 @@ public:
     // buckets that can be co-resident when `n` threads each process one bucket
     // (an atomic counter hands the biggest ones out; in the worst case the n
     // largest are in flight together). The builder multiplies this by an
-    // on-disk-bytes -> kmer_info-RAM overhead to size bucket-process
-    // concurrency against -g. Returns 0 if sizes weren't collected.
-    uint64_t worst_coresident_unc_bytes(uint32_t n) const {
-        if (m_bucket_unc_sizes.empty() || n == 0) return 0;
-        std::vector<uint64_t> v = m_bucket_unc_sizes;
-        std::sort(v.begin(), v.end(), std::greater<uint64_t>());
-        uint64_t sum = 0;
-        for (uint32_t i = 0; i < n && i < v.size(); ++i) sum += v[i];
-        return sum;
+    // Uncompressed on-disk bytes of bucket b (0 if unknown). The bucket-process
+    // memory-admission gate uses this to charge each bucket's kmer_info RAM
+    // (~a fixed multiple of these bytes) against the budget before loading it.
+    uint64_t bucket_unc_bytes(uint32_t b) const {
+        return b < m_bucket_unc_sizes.size() ? m_bucket_unc_sizes[b] : 0;
     }
-    // Largest single bucket's uncompressed bytes (one thread's worst case).
+    // Largest single bucket's uncompressed bytes (one bucket's worst case).
     uint64_t max_bucket_unc_bytes() const {
         uint64_t m = 0;
         for (uint64_t s : m_bucket_unc_sizes) m = std::max(m, s);

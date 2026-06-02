@@ -20,6 +20,7 @@
 #include <atomic>
 #include <cstdint>
 #include <iostream>
+#include <condition_variable>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -576,21 +577,50 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
 // production pipeline passes a frag_unitig_writer that streams
 // fragments to disk so the in-RAM accumulator never reaches its
 // multi-GB peak.
+// `mem_budget_bytes` (0 = unbounded) caps the total kmer_info RAM held by
+// in-flight buckets: a worker waits to "admit" its bucket until the running
+// total + this bucket's estimated cost fits the budget. All num_threads
+// threads stay alive; under a tight budget FEWER (large) buckets load at once,
+// MORE (small) buckets do -- bounding RAM without ever reducing the user's
+// thread count. One bucket is always allowed even if it alone exceeds the
+// budget (forward progress).
 template <typename Sink>
 inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t num_colors,
                             uint32_t num_threads, Sink&& sink,
                             streaming_color_set_dict& global_dict, std::mutex& global_mu,
-                            std::atomic<uint64_t>* done = nullptr) {
+                            std::atomic<uint64_t>* done = nullptr,
+                            uint64_t mem_budget_bytes = 0) {
     if (num_threads == 0) num_threads = 1;
     const uint32_t B = writer.num_buckets();
     std::atomic<uint32_t> next{0};
     std::vector<std::thread> workers;
     workers.reserve(num_threads);
 
+    // kmer_info RAM is ~a fixed multiple of a bucket's uncompressed on-disk
+    // bytes. Calibrated on 100K -g16: bucket-process +4.64 GiB at 32 in-flight
+    // buckets averaging ~10.7 MiB unc -> ~14x. Use 16x with margin.
+    constexpr double KMER_INFO_OVERHEAD = 16.0;
+    std::mutex mem_mu;
+    std::condition_variable mem_cv;
+    uint64_t mem_in_use = 0;
+    uint32_t mem_n_admitted = 0;  // how many buckets currently admitted
+
     auto run = [&]() {
         for (;;) {
             uint32_t b = next.fetch_add(1);
             if (b >= B) break;
+            const uint64_t cost =
+                (uint64_t)(KMER_INFO_OVERHEAD * (double)writer.bucket_unc_bytes(b));
+            // Admission: wait until this bucket fits the budget, or it would be
+            // the only one running (so an oversized bucket never deadlocks).
+            if (mem_budget_bytes > 0) {
+                std::unique_lock<std::mutex> lk(mem_mu);
+                mem_cv.wait(lk, [&] {
+                    return mem_n_admitted == 0 || mem_in_use + cost <= mem_budget_bytes;
+                });
+                mem_in_use += cost;
+                ++mem_n_admitted;
+            }
             std::vector<stitchable_unitig> bucket_unitigs;
             // Hybrid-encoded local dict: per-bucket footprint shrinks
             // ~10-30x vs the live-vector dict, so N threads in flight
@@ -603,6 +633,9 @@ inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t nu
             } catch (std::exception& e) {
                 std::cerr << "error processing bucket " << b << ": " << e.what() << '\n';
             }
+            // Release the admitted memory once kmer_info/local_dict for this
+            // bucket are gone (they go out of scope at the end of this loop
+            // iteration; release after the merge below, before next bucket).
             // Merge this bucket's local dict into the shared global
             // dict. The previous version did decode + wyhash + fnv1a
             // + dedup-find + (on miss) encode all under global_mu;
@@ -666,6 +699,16 @@ inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t nu
                 for (auto& r : u.runs)
                     if (r.cid != COLOR_RUN_FOREIGN) r.cid = local_to_global[r.cid];
                 sink(std::move(u));
+            }
+            // Release this bucket's memory admission: kmer_info + local_dict +
+            // bucket_unitigs for bucket b are done (kmer_info/local_dict freed
+            // inside process_bucket and at scope end; bucket_unitigs just
+            // drained to the sink). Wake any worker waiting to admit.
+            if (mem_budget_bytes > 0) {
+                std::lock_guard<std::mutex> lk(mem_mu);
+                mem_in_use -= cost;
+                --mem_n_admitted;
+                mem_cv.notify_all();
             }
             process_prof().n_buckets.fetch_add(1, std::memory_order_relaxed);
             if (done) done->fetch_add(1, std::memory_order_relaxed);

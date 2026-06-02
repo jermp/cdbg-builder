@@ -194,21 +194,25 @@ struct builder {
                 timer _("bucket-process");
                 std::atomic<uint64_t> done{0};
                 progress prog("bucket-process", done, num_buckets);
-                // Cap bucket-process concurrency to fit -g. Each in-flight
-                // thread holds one bucket's kmer_info resident, so peak ~=
-                // carry_in + threads * (OVERHEAD * avg_bucket_unc_bytes). The
-                // bucket-size distribution is broad (not outlier-skewed), so
-                // the lever is concurrency, not resplit. Size threads so the
-                // worst co-resident set fits the budget remainder; never below
-                // 1. With no -g, use all threads.
-                uint32_t bp_threads = pick_bucket_process_threads_(
-                    *writer, m_cfg.num_threads, m_cfg.max_ram_gb);
-                if (bp_threads < m_cfg.num_threads)
-                    std::cout << "  bucket-process threads: " << bp_threads
-                              << " (capped from " << m_cfg.num_threads
-                              << " to fit -g)\n";
-                process_buckets(*writer, m_cfg.k, m_num_colors, bp_threads,
-                                std::ref(frag_sink), global_dict, global_mu, &done);
+                // bucket-process holds one bucket's kmer_info resident per
+                // in-flight bucket. Rather than cap the user's -t, we cap the
+                // total kmer_info RAM via a memory-admission gate: workers
+                // (all num_threads of them) wait to load a bucket until it fits
+                // the budget. Under a tight -g this loads FEWER large buckets
+                // at once (and more small ones) -- "load less in RAM at a time"
+                // -- without ever reducing -t. Budget = share of -g remaining
+                // after the live carry-in.
+                uint64_t bp_budget = 0;
+                if (m_cfg.max_ram_gb > 0) {
+                    const uint64_t total =
+                        (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0);
+                    const uint64_t carry = current_rss_bytes();
+                    const uint64_t avail = total > carry ? (total - carry) : total;
+                    bp_budget = (uint64_t)((double)avail * 0.80);  // bucket-process share
+                }
+                process_buckets(*writer, m_cfg.k, m_num_colors, m_cfg.num_threads,
+                                std::ref(frag_sink), global_dict, global_mu, &done,
+                                bp_budget);
                 prog.stop();
                 std::cout << "  bucket fragments: " << frag_sink.count() << "\n";
                 std::cout << "  distinct color classes: " << global_dict.size() << "\n";
@@ -270,25 +274,15 @@ struct builder {
                 std::atomic<uint64_t> done{0};
                 progress prog("stitch", done, n_frags);
                 // External-memory iterative-doubling stitch: per-round
-                // tigs are bucketed to LZ4-framed files under tmp_dir,
-                // one bucket resident at a time, so peak RAM is bounded
-                // by the bucket count rather than the fragment count
-                // (the in-RAM stitch's by_junction + adj + visited were
-                // hundreds of GB on the 661k pangenome). num_buckets is
-                // sized so one bucket's tigs fit a share of -g; with no
-                // -g a fixed default keeps small inputs fast.
-                // Buckets + concurrency chosen together so peak RSS
-                // (~stitch_threads * one bucket) stays within stitch's share
-                // of -g; under a tight budget stitch_threads may be < -t.
-                const auto sp = pick_stitch_plan_(total_frag_seq_bytes, m_cfg.max_ram_gb,
-                                                  m_cfg.num_threads);
-                const uint32_t stitch_buckets = sp.buckets;
+                // tigs are bucketed to LZ4-framed files under tmp_dir, and the
+                // parallel round loop holds num_threads buckets resident at
+                // once. We DIMENSION THE BUCKET COUNT (never the user's thread
+                // count) so num_threads resident buckets fit stitch's share of
+                // -g: more, smaller buckets. The user's -t is honored as-is.
+                const uint32_t stitch_buckets = pick_stitch_buckets_(
+                    total_frag_seq_bytes, m_cfg.max_ram_gb, m_cfg.num_threads);
                 std::cout << "  stitch buckets: " << stitch_buckets
-                          << ", threads: " << sp.threads;
-                if (sp.threads < m_cfg.num_threads)
-                    std::cout << " (capped from " << m_cfg.num_threads
-                              << " to fit -g)";
-                std::cout << "\n";
+                          << ", threads: " << m_cfg.num_threads << "\n";
                 // Parallel over the per-round bucket loop: buckets are
                 // independent within a round (own waiting-map; content-seeded
                 // RNG), so this fans out cleanly. Output is unchanged --
@@ -296,7 +290,7 @@ struct builder {
                 // regardless of which thread emitted which unitig.
                 stitch_unitigs_extmem_file_stream(frag_reader, m_cfg.k, tmp_dir,
                                                   std::ref(*uwriter_ptr), stitch_buckets, &done,
-                                                  sp.threads);
+                                                  m_cfg.num_threads);
                 prog.stop();
                 std::cout << "  unitigs after stitching: " << uwriter_ptr->total_unitigs() << "\n";
                 // frag_reader destroyed here -- file handle closed.
@@ -740,80 +734,42 @@ private:
     // count >= needed * num_threads / budget. If that hits the MAX_BUCKETS
     // (file-count) ceiling, we instead CAP the thread count so
     // effective_threads * one_bucket still fits. Returns {buckets, threads}.
-    // Cap bucket-process concurrency so the co-resident kmer_info maps fit -g.
-    // Each in-flight thread holds one bucket's kmer_info, whose RAM is roughly
-    // KMER_INFO_OVERHEAD x the bucket's uncompressed on-disk bytes. We size the
-    // thread count so the worst co-resident set (sum of the t largest buckets)
-    // x overhead fits bucket-process's SHARE of the budget that remains after
-    // the live carry-in (color dict etc.). Measured on the 100K -g16 run:
-    // +6.34 GiB / 48 threads with ~0.78 GiB worst-48 unc bytes -> overhead ~8x.
-    static uint32_t pick_bucket_process_threads_(bucket_writer const& writer,
-                                                 uint32_t num_threads, double max_ram_gb) {
-        if (num_threads <= 1 || max_ram_gb <= 0) return num_threads ? num_threads : 1;
-        constexpr double KMER_INFO_OVERHEAD = 9.0;  // on-disk unc bytes -> kmer_info RAM (margin)
-        constexpr double SHARE = 0.80;              // bucket-process share of the remaining budget
-        const uint64_t carry_in = current_rss_bytes();  // live RSS already held (dict, heap)
-        const uint64_t budget_total = (uint64_t)(max_ram_gb * 1024.0 * 1024.0 * 1024.0);
-        if (budget_total == 0) return num_threads;
-        const uint64_t avail =
-            budget_total > carry_in ? (uint64_t)((budget_total - carry_in) * SHARE) : 0;
-        if (avail == 0) return 1;
-        // Find the largest t in [1, num_threads] such that
-        // OVERHEAD * worst_coresident_unc_bytes(t) <= avail.
-        uint32_t best = 1;
-        for (uint32_t t = num_threads; t >= 1; --t) {
-            uint64_t worst = writer.worst_coresident_unc_bytes(t);
-            if (worst == 0) return num_threads;  // no size info: don't cap
-            if ((uint64_t)(KMER_INFO_OVERHEAD * (double)worst) <= avail) { best = t; break; }
-            if (t == 1) break;
-        }
-        return best;
-    }
-
-    struct stitch_plan { uint32_t buckets; uint32_t threads; };
-    static stitch_plan pick_stitch_plan_(uint64_t total_frag_seq_bytes, double max_ram_gb,
+    // Dimension the stitch round-store bucket count so `num_threads` buckets
+    // (the parallel round loop holds one decoded bucket per in-flight thread)
+    // fit stitch's share of -g. We size the BUCKET COUNT, never the user's
+    // thread count -- more, smaller buckets keep full -t concurrency.
+    static uint32_t pick_stitch_buckets_(uint64_t total_frag_seq_bytes, double max_ram_gb,
                                          uint32_t num_threads) {
         constexpr uint32_t MIN_BUCKETS = 64;
-        constexpr uint32_t MAX_BUCKETS = 1u << 20;  // 1M files cap
+        constexpr uint32_t MAX_BUCKETS = 1u << 20;  // 1M files cap (fd headroom)
         constexpr uint32_t DEFAULT_BUCKETS = 1024;
         // Per-resident-bucket RAM is OVERHEAD x its on-disk seq bytes. Measured
-        // on 100K -g16: the plan assumed 3.0x and bounded stitch to 8 GiB, but
-        // stitch actually transient-spiked to ~17 GiB across 48 resident
-        // round-0 buckets -> real ratio ~6.4x. The extra is ext_tig's
-        // per-fragment FIXED overhead (std::vector<color_run> + std::string
-        // headers, ~120 B/tig) which dominates when fragments are short. Use
-        // 7.0x with margin.
+        // on 100K -g16: a 3.0x model bounded stitch to 8 GiB but it actually
+        // spiked to ~17 GiB across 48 resident round-0 buckets -> real ~6.4x.
+        // The extra is ext_tig's per-fragment FIXED overhead
+        // (std::vector<color_run> + std::string headers, ~120 B/tig) that
+        // dominates for short fragments. 7.0x with margin (validated: 100K
+        // -g16 stitch peak +1.16 GiB, whole run 15.77 < 16).
         constexpr double OVERHEAD = 7.0;
-        constexpr double SHARE = 0.50;    // stitch's share of -g (across ALL resident buckets)
+        constexpr double SHARE = 0.50;  // stitch's share of -g, across ALL resident buckets
         if (num_threads == 0) num_threads = 1;
+        if (max_ram_gb <= 0 || total_frag_seq_bytes == 0) return DEFAULT_BUCKETS;
 
-        if (max_ram_gb <= 0 || total_frag_seq_bytes == 0)
-            return {DEFAULT_BUCKETS, num_threads};  // no budget: user owns the tradeoff
-        // Budget is the share of what REMAINS after the live carry-in (color
-        // dict is freed before stitch via release_index, so this is small now,
-        // but stay correct if that changes).
+        // Share of what REMAINS after the live carry-in (the color dict is
+        // freed before stitch via release_index, so this is small now).
         const uint64_t carry_in = current_rss_bytes();
         const uint64_t budget_total = (uint64_t)(max_ram_gb * 1024.0 * 1024.0 * 1024.0);
         const uint64_t avail =
             budget_total > carry_in ? (budget_total - carry_in) : budget_total;
         const uint64_t budget = (uint64_t)((double)avail * SHARE);
-        if (budget == 0) return {DEFAULT_BUCKETS, num_threads};
-        const uint64_t needed = (uint64_t)((double)total_frag_seq_bytes * OVERHEAD);
+        if (budget == 0) return DEFAULT_BUCKETS;
 
-        // Buckets sized so `num_threads` resident buckets fit `budget`.
+        const uint64_t needed = (uint64_t)((double)total_frag_seq_bytes * OVERHEAD);
+        // count s.t. needed/count * num_threads <= budget (num_threads resident).
         uint64_t count = ((needed * num_threads) + budget - 1) / budget;
         if (count < MIN_BUCKETS) count = MIN_BUCKETS;
-        uint32_t threads = num_threads;
-        if (count > MAX_BUCKETS) {
-            // Can't make buckets small enough; cap concurrency instead so
-            // threads * one_bucket <= budget. one_bucket = needed / MAX_BUCKETS.
-            count = MAX_BUCKETS;
-            const uint64_t one_bucket = (needed + count - 1) / count;
-            uint64_t fit = one_bucket ? (budget / one_bucket) : num_threads;
-            if (fit < 1) fit = 1;
-            if (fit < threads) threads = (uint32_t)fit;
-        }
-        return {(uint32_t)count, threads};
+        if (count > MAX_BUCKETS) count = MAX_BUCKETS;  // hard fd ceiling; see note below
+        return (uint32_t)count;
     }
 
     // FASTA emit. Hand-rolled 1 MiB buffer + std::to_chars for the
