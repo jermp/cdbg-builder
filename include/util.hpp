@@ -174,6 +174,7 @@ public:
         if (m_stopped) return;
         m_stopped = true;
         uint64_t now = process_peak_rss_bytes();
+        uint64_t exit_live = current_rss_bytes();
         if (now == 0) {
             std::cout << "  [" << m_label << " peak RSS] unavailable\n";
             return;
@@ -184,8 +185,14 @@ public:
         } else {
             std::cout << " (+0)";
         }
-        if (m_entry_live > 0)
-            std::cout << " [carried in " << format_bytes(m_entry_live) << "]";
+        // entry_live / exit_live are LIVE VmRSS (not the monotonic VmHWM
+        // "peak RSS"). They disambiguate which phase's live footprint actually
+        // hits the high-water mark vs a transient that VmHWM carried forward:
+        // if exit_live << peak, the peak was a transient (e.g. a prior phase),
+        // not this phase's steady working set.
+        if (m_entry_live > 0 || exit_live > 0)
+            std::cout << " [live in " << format_bytes(m_entry_live) << " -> out "
+                      << format_bytes(exit_live) << "]";
         std::cout << "\n";
     }
 
