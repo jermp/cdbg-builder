@@ -41,6 +41,11 @@ struct build_config {
     //           colors vectors + glibc fragmentation + LZ4 scratch buffers)
     double alpha = 2.0;
     double beta = 7.0;
+    // Per-bucket batching payloads in bytes (0 = built-in default). flush_bases
+    // = thread->compactor handoff size; spill_bytes = compactor dedup window
+    // before a disk frame. Smaller -> larger derived bucket count B.
+    size_t flush_bases = 0;
+    size_t spill_bytes = 0;
     // Soft RAM budget in GiB. 0 = no budget. When set, the builder
     // auto-picks bucket_log2 (more buckets -> smaller per-bucket data
     // structures) and streams the encoded color bit_vector to a

@@ -40,6 +40,14 @@ bool parse_args(int argc, char** argv, cdbg::build_config& cfg) {
                "RAM-model per-bucket compactor overhead multiplier (default 7.0). Tunable"
                " knob for re-calibrating the bucket-count model per machine/allocator.",
                "--beta", false);
+    parser.add("flush_bases",
+               "Per-thread->compactor handoff size in bytes (default 4096). Smaller ->"
+               " larger derived bucket count B -> smaller, faster buckets.",
+               "--flush", false);
+    parser.add("spill_bytes",
+               "Compactor dedup window in bytes before a disk frame (default 65536)."
+               " Smaller -> larger B but weaker dedup / bigger bucket files.",
+               "--spill", false);
     parser.add("verbose", "Verbose output.", "--verbose", false, true);
 
     if (!parser.parse()) return false;
@@ -54,6 +62,8 @@ bool parse_args(int argc, char** argv, cdbg::build_config& cfg) {
     if (parser.parsed("max_ram_gb")) cfg.max_ram_gb = parser.get<double>("max_ram_gb");
     if (parser.parsed("alpha")) cfg.alpha = parser.get<double>("alpha");
     if (parser.parsed("beta")) cfg.beta = parser.get<double>("beta");
+    if (parser.parsed("flush_bases")) cfg.flush_bases = parser.get<size_t>("flush_bases");
+    if (parser.parsed("spill_bytes")) cfg.spill_bytes = parser.get<size_t>("spill_bytes");
     if (parser.parsed("verbose")) cfg.verbose = parser.get<bool>("verbose");
     return true;
 }

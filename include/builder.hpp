@@ -410,9 +410,14 @@ private:
     // alpha/beta model's ~7% undercount) is headroom the runtime watcher backs.
     static constexpr double BUCKET_WRITE_BUDGET_FRAC = 0.85;
 
-    // Good default per-bucket batching payload (good for LZ4 dedup). The bucket
-    // COUNT is sized against this; it is no longer auto-tuned down under -g.
-    static constexpr size_t DEFAULT_FLUSH_BASES = 64 * 1024;
+    // Good default per-bucket batching payloads. SMALL on purpose: B is derived
+    // as B = frac*g / (alpha*T*flush + beta*spill), so small flush/spill -> large
+    // B -> small (few-MiB) buckets, which keeps bucket-process parallel and
+    // cache-friendly. They cost bucket-write lock traffic (flush) and dedup /
+    // file size (spill), not budget -- the buffer pool 2*T*B*flush stays < M by
+    // construction. Overridable via --flush / --spill.
+    static constexpr size_t DEFAULT_FLUSH_BASES = 4 * 1024;
+    static constexpr size_t DEFAULT_SPILL_BYTES = 64 * 1024;
 
     // Total-RSS target for bucket-process, as a fraction of -g. The admission
     // gate keeps  carry + reserved kmer_info + live color dict  under this; the
@@ -432,11 +437,11 @@ private:
         if (m_cfg.m < 2 || m_cfg.m > m_cfg.k)
             throw std::runtime_error("invalid m=" + std::to_string(m_cfg.m) +
                                      " (need 2 <= m <= k)");
-        // Good, fixed defaults for the per-bucket batching knobs. The RAM
-        // model sizes the bucket COUNT against these (not the other way
-        // around), so they stay at values good for LZ4 dedup regardless of -g.
-        m_flush_bases = DEFAULT_FLUSH_BASES;            // 64 KiB
-        m_spill_bytes = DEFAULT_COMPACTOR_SPILL_BYTES;  // 256 KiB
+        // Per-bucket batching knobs (CLI-overridable). The RAM model sizes the
+        // bucket COUNT against these, so smaller values -> larger B -> smaller
+        // buckets (faster bucket-process) while bucket-write stays in budget.
+        m_flush_bases = m_cfg.flush_bases ? m_cfg.flush_bases : DEFAULT_FLUSH_BASES;
+        m_spill_bytes = m_cfg.spill_bytes ? m_cfg.spill_bytes : DEFAULT_SPILL_BYTES;
 
         // Resolve the bucket COUNT (need not be a power of two).
         if (m_cfg.bucket_log2 != 0) {
