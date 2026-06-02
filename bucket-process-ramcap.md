@@ -46,6 +46,28 @@ Likely fixes once localized (to be confirmed):
     its current form; may need to drop/spill it before finalize (it isn't
     needed once interning is done), or shrink the per-class metadata.
 
+### FINAL bucket-process design: dimension buckets to g/T + admission gate
+
+Two complementary mechanisms, neither touches the user's -t:
+1. **Dimension the bucket COUNT so avg kmer_info ~= g/T** (auto_bucket_log2):
+   B >= KMER_INFO_OVERHEAD * total_unc * T / (SHARE_BP * g), using an up-front
+   estimate of total uncompressed input bytes (gz size x4). Then T threads each
+   holding one AVERAGE bucket = ~g total -> full -t utilization, budget fully
+   used. Raised MAX_BUCKETS_LOG2 13->16 so it can reach the needed count
+   (661k/100k both land ~2^13 in practice). fd limit clamps if the OS can't
+   open that many files.
+2. **Runtime memory-admission gate** (process_buckets): absorbs the estimate
+   error and the bucket-size VARIANCE (max ~2.6x mean) -- a worker waits to
+   load a bucket until its kmer_info cost fits the live budget; one bucket
+   always admitted (forward progress). Bounds the actual peak even if the
+   up-front estimate was off.
+
+KMER_INFO_OVERHEAD = 16x (100K -g16: +4.64 GiB / 32 in-flight buckets x ~10.7
+MiB unc ~= 14x; 16 with margin). This replaced the earlier thread-cap, which
+overrode -t.
+
+(below: original notes that led here)
+
 ### bucket-process: broad, not outlier-dominated (pending distribution)
 
 +50.80 GiB / 48 threads ≈ 1.06 GiB per in-flight bucket; 187.6e9 kmers /

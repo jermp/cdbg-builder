@@ -395,7 +395,12 @@ private:
     // The user-facing CLI override (-b) takes precedence
     // over this auto-tune.
     static constexpr uint32_t MIN_BUCKETS_LOG2 = 10;
-    static constexpr uint32_t MAX_BUCKETS_LOG2 = 13;
+    // Raised 13 -> 16: bucket-process wants enough buckets that the AVERAGE
+    // bucket's kmer_info ~= g/T (so all T threads run, fully using the budget).
+    // 661k needs ~2^14; 16 leaves headroom. The fd limit is handled separately
+    // (ensure_fd_capacity_for_buckets_), which clamps if the OS can't open this
+    // many files.
+    static constexpr uint32_t MAX_BUCKETS_LOG2 = 16;
 
     void validate_and_resolve_config() {
         if (m_cfg.filenames_list.empty())
@@ -530,11 +535,52 @@ private:
         const double max_b =
             compactor_share_bytes / ((double)TARGET_SPILL_BYTES * COMPACTOR_OVERHEAD);
 
+        // bucket-write's choice: largest log2 whose spill_bytes stays >= target.
         uint32_t log2 = MAX_BUCKETS_LOG2;
         while (log2 > MIN_BUCKETS_LOG2 && (double)((uint64_t)1 << log2) > max_b) {
             --log2;
         }
+
+        // bucket-process's need: dimension the bucket count so the AVERAGE
+        // bucket's kmer_info ~= g/T, i.e. all T threads can hold one bucket
+        // each within the budget (full -t utilization, budget fully used).
+        // avg kmer_info = KMER_INFO_OVERHEAD * total_unc_bytes / B; want that
+        // <= (SHARE_BP * g) / T  =>  B >= KMER_INFO_OVERHEAD * total_unc * T /
+        // (SHARE_BP * g). total_unc is unknown up front, so estimate it from
+        // input file sizes; the runtime admission gate absorbs estimate error.
+        const uint64_t est_unc = estimate_total_unc_bytes_();
+        if (est_unc > 0) {
+            constexpr double KMER_INFO_OVERHEAD = 16.0;  // matches the gate
+            constexpr double SHARE_BP = 0.80;            // bucket-process share of -g
+            const double g = m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0;
+            const double T = (double)(m_cfg.num_threads ? m_cfg.num_threads : 1);
+            const double need_b = KMER_INFO_OVERHEAD * (double)est_unc * T / (SHARE_BP * g);
+            uint32_t bp_log2 = MIN_BUCKETS_LOG2;
+            while (bp_log2 < MAX_BUCKETS_LOG2 && (double)((uint64_t)1 << bp_log2) < need_b)
+                ++bp_log2;
+            if (bp_log2 > log2) log2 = bp_log2;  // take the larger requirement
+        }
         return log2;
+    }
+
+    // Estimate total uncompressed input bytes from the filenames list, for
+    // up-front bucket-count sizing. gzip'd FASTA decompresses ~3-4x; use a
+    // conservative 4x so we don't under-bucket. Plain files count as-is. Best
+    // effort: missing/unstattable files are skipped; returns 0 if none stat.
+    uint64_t estimate_total_unc_bytes_() const {
+        std::ifstream in(m_cfg.filenames_list);
+        if (!in) return 0;
+        uint64_t total = 0;
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.empty()) continue;
+            struct stat st;
+            if (::stat(line.c_str(), &st) != 0) continue;
+            uint64_t sz = (uint64_t)st.st_size;
+            bool gz = line.size() >= 3 && line.compare(line.size() - 3, 3, ".gz") == 0;
+            total += gz ? sz * 4 : sz;
+        }
+        return total;
     }
 
     // Joint auto-tune of (flush_bases, spill_bytes) against a fixed
