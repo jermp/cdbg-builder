@@ -194,7 +194,20 @@ struct builder {
                 timer _("bucket-process");
                 std::atomic<uint64_t> done{0};
                 progress prog("bucket-process", done, num_buckets);
-                process_buckets(*writer, m_cfg.k, m_num_colors, m_cfg.num_threads,
+                // Cap bucket-process concurrency to fit -g. Each in-flight
+                // thread holds one bucket's kmer_info resident, so peak ~=
+                // carry_in + threads * (OVERHEAD * avg_bucket_unc_bytes). The
+                // bucket-size distribution is broad (not outlier-skewed), so
+                // the lever is concurrency, not resplit. Size threads so the
+                // worst co-resident set fits the budget remainder; never below
+                // 1. With no -g, use all threads.
+                uint32_t bp_threads = pick_bucket_process_threads_(
+                    *writer, m_cfg.num_threads, m_cfg.max_ram_gb);
+                if (bp_threads < m_cfg.num_threads)
+                    std::cout << "  bucket-process threads: " << bp_threads
+                              << " (capped from " << m_cfg.num_threads
+                              << " to fit -g)\n";
+                process_buckets(*writer, m_cfg.k, m_num_colors, bp_threads,
                                 std::ref(frag_sink), global_dict, global_mu, &done);
                 prog.stop();
                 std::cout << "  bucket fragments: " << frag_sink.count() << "\n";
@@ -727,6 +740,36 @@ private:
     // count >= needed * num_threads / budget. If that hits the MAX_BUCKETS
     // (file-count) ceiling, we instead CAP the thread count so
     // effective_threads * one_bucket still fits. Returns {buckets, threads}.
+    // Cap bucket-process concurrency so the co-resident kmer_info maps fit -g.
+    // Each in-flight thread holds one bucket's kmer_info, whose RAM is roughly
+    // KMER_INFO_OVERHEAD x the bucket's uncompressed on-disk bytes. We size the
+    // thread count so the worst co-resident set (sum of the t largest buckets)
+    // x overhead fits bucket-process's SHARE of the budget that remains after
+    // the live carry-in (color dict etc.). Measured on the 100K -g16 run:
+    // +6.34 GiB / 48 threads with ~0.78 GiB worst-48 unc bytes -> overhead ~8x.
+    static uint32_t pick_bucket_process_threads_(bucket_writer const& writer,
+                                                 uint32_t num_threads, double max_ram_gb) {
+        if (num_threads <= 1 || max_ram_gb <= 0) return num_threads ? num_threads : 1;
+        constexpr double KMER_INFO_OVERHEAD = 9.0;  // on-disk unc bytes -> kmer_info RAM (margin)
+        constexpr double SHARE = 0.80;              // bucket-process share of the remaining budget
+        const uint64_t carry_in = current_rss_bytes();  // live RSS already held (dict, heap)
+        const uint64_t budget_total = (uint64_t)(max_ram_gb * 1024.0 * 1024.0 * 1024.0);
+        if (budget_total == 0) return num_threads;
+        const uint64_t avail =
+            budget_total > carry_in ? (uint64_t)((budget_total - carry_in) * SHARE) : 0;
+        if (avail == 0) return 1;
+        // Find the largest t in [1, num_threads] such that
+        // OVERHEAD * worst_coresident_unc_bytes(t) <= avail.
+        uint32_t best = 1;
+        for (uint32_t t = num_threads; t >= 1; --t) {
+            uint64_t worst = writer.worst_coresident_unc_bytes(t);
+            if (worst == 0) return num_threads;  // no size info: don't cap
+            if ((uint64_t)(KMER_INFO_OVERHEAD * (double)worst) <= avail) { best = t; break; }
+            if (t == 1) break;
+        }
+        return best;
+    }
+
     struct stitch_plan { uint32_t buckets; uint32_t threads; };
     static stitch_plan pick_stitch_plan_(uint64_t total_frag_seq_bytes, double max_ram_gb,
                                          uint32_t num_threads) {

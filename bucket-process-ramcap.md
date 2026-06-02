@@ -62,8 +62,39 @@ confirm outlier-vs-broad on the next run.
 
 ---
 
-(Original resplit design for bucket-process below; still valid for that
-phase once emit is handled.)
+## RESOLUTION (what was actually built, after measuring)
+
+The data overturned the resplit plan. Two findings:
+
+1. **The bucket-size distribution is BROAD, not outlier-skewed.** 100K -g16:
+   mean 10.85 MiB, p50 10.68, p99 14.99, max 28.61 -- max is only ~2.6x the
+   median. There is no fat-tail outlier. So the overshoot is NOT one giant
+   bucket; it is `num_threads` average buckets co-resident (one kmer_info per
+   in-flight thread). Resplit reduces the MAX bucket; our problem is the SUM
+   of the concurrently-resident buckets -> resplit would not help (4x more,
+   4x smaller, still num_threads co-resident = same total). Resplit is
+   therefore NOT on the critical path; it would only matter for a future
+   input that genuinely has a fat-tailed bucket.
+
+2. **emit was the real 117 GiB peak**, not bucket-process. Fixed separately:
+   - emit-fasta: external merge-sort per cid-bucket (bounded by a -g share),
+     fixing the cid-skew blowup (+36 GiB -> capped).
+   - color dict: release_index() frees the dedup index after bucket-process
+     (it was carried through stitch + emit; ~15 GiB carry-in at 100K -> ~1 GiB).
+   - stitch was never the true peak (VmHWM artifact; live-in/out instrumentation
+     showed stitch live ~5 GiB).
+
+**bucket-process fix = concurrency cap (built):** pick_bucket_process_threads_
+sizes the thread count so the worst co-resident set (sum of the t largest
+buckets' uncompressed bytes x a kmer_info overhead) fits the budget remaining
+after the live carry-in. Same pattern as pick_stitch_plan_. Broad overshoot ->
+fewer threads when -g is tight; full threads when it fits. Output unchanged
+(86630 == ground truth, including a forced-cap run at -g 0.05).
+
+---
+
+(Original resplit design below; retained for reference / future fat-tail
+inputs, but NOT used -- see resolution above.)
 
 ---
 
