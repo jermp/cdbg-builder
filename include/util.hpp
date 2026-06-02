@@ -28,8 +28,19 @@ struct build_config {
     uint32_t k = 31;
     uint32_t num_threads = 1;
     uint32_t m = 0;             // minimizer length, 0 = auto (compute_best_m(k))
-    uint32_t bucket_log2 = 0;   // 0 = auto (derived from max_ram_gb if set, else 10)
+    uint32_t bucket_log2 = 0;   // 0 = auto; if set via -b, forces num_buckets = 2^bucket_log2
+    uint32_t num_buckets = 0;   // resolved bucket COUNT (need not be a power of two);
+                                // 0 = auto. Derived in validate_and_resolve_config() from
+                                // the RAM model: B = frac*g / (alpha*T*flush + beta*spill).
     std::string tmp_dir;        // scratch dir; empty -> mkdtemp under $TMPDIR
+    // RAM-model overhead multipliers (nominal payload -> resident RSS), exposed
+    // as knobs so they can be re-calibrated per machine/allocator without code
+    // surgery (see builder.hpp for the derivation):
+    //   alpha = per-thread buffer pool overhead (recs vector + vector slack)
+    //   beta  = per-bucket compactor pool overhead (hashmap + string keys +
+    //           colors vectors + glibc fragmentation + LZ4 scratch buffers)
+    double alpha = 2.0;
+    double beta = 7.0;
     // Soft RAM budget in GiB. 0 = no budget. When set, the builder
     // auto-picks bucket_log2 (more buckets -> smaller per-bucket data
     // structures) and streams the encoded color bit_vector to a

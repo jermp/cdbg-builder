@@ -5,7 +5,7 @@
 // For every ACGT-only run in every sequence, we slide a window of (k-m+1)
 // m-mers and find the canonical-ntHash minimum. Whenever the window's minimum
 // changes, the current super-k-mer ends and a new one begins. Each super-k-mer
-// is appended to the bucket file selected by `(min_hash >> 1) & (B-1)`,
+// is appended to the bucket file selected by `(min_hash >> 1) % B`,
 // matching GGCAT's bucket-id derivation in cn_nthash.rs.
 //
 // The output is a directory of B bucket files, each holding a stream of
@@ -33,7 +33,7 @@ namespace detail {
 // `bases` holds 2-bit-encoded bases. Records are appended via `sink` to the
 // appropriate bucket files.
 inline void emit_super_kmers(uint8_t const* bases, uint32_t L, uint32_t k, uint32_t m,
-                             uint32_t color, uint32_t bucket_log2,
+                             uint32_t color, uint32_t num_buckets,
                              per_thread_bucket_buffers& sink) {
     if (L < k) return;
     const uint32_t K = L - k + 1;  // number of k-mers; (k-1)-mers indexed 0..K
@@ -48,11 +48,14 @@ inline void emit_super_kmers(uint8_t const* bases, uint32_t L, uint32_t k, uint3
     // internal-branch failures.) It also makes each k-mer's primary bucket
     // intrinsic: X is primary in bucket(min(prefix(X))), foreign elsewhere.
     const uint32_t W = k - m;  // window size, in m-mer indices (a (k-1)-mer)
-    const uint64_t bucket_mask = (uint64_t(1) << bucket_log2) - 1;
 
     auto bucket_of = [&](uint64_t h) -> uint32_t {
         // Skip the bottom bit to match GGCAT's "uniqueness-flag" reservation.
-        return (uint32_t)((h >> 1) & bucket_mask);
+        // num_buckets need not be a power of two -- it's sized from the RAM
+        // model (B = frac*g / (alpha*T*flush + beta*spill)), so map with a
+        // modulo. This runs once per super-k-mer boundary (not per base), so
+        // the divide is negligible against the per-base ntHash/minimizer scan.
+        return (uint32_t)((h >> 1) % num_buckets);
     };
 
     uint64_t fwd = 0, rc = 0;
@@ -131,7 +134,7 @@ inline void emit_super_kmers(uint8_t const* bases, uint32_t L, uint32_t k, uint3
 }
 
 inline void ingest_file_bucketed(std::string const& path, uint32_t k, uint32_t m,
-                                 uint32_t bucket_log2, uint32_t color,
+                                 uint32_t num_buckets, uint32_t color,
                                  per_thread_bucket_buffers& sink) {
     auto& prof = bucket_prof();
     seq_reader r(path);
@@ -153,7 +156,7 @@ inline void ingest_file_bucketed(std::string const& path, uint32_t k, uint32_t m
             if (run_len >= k) {
                 bases_buf.resize(run_len);
                 for (size_t i = 0; i < run_len; ++i) { bases_buf[i] = nuc_to_2bit(s[pos + i]); }
-                emit_super_kmers(bases_buf.data(), (uint32_t)run_len, k, m, color, bucket_log2,
+                emit_super_kmers(bases_buf.data(), (uint32_t)run_len, k, m, color, num_buckets,
                                  sink);
             }
             pos = end;
@@ -169,7 +172,7 @@ inline void ingest_file_bucketed(std::string const& path, uint32_t k, uint32_t m
 // Parallel driver. Spawns `num_threads` workers, each pulling files from a
 // shared queue. `done` (if non-null) is incremented after each file finishes.
 inline void ingest_bucketed(std::vector<std::string> const& files, uint32_t k, uint32_t m,
-                            uint32_t bucket_log2, bucket_writer& writer, uint32_t num_threads,
+                            uint32_t num_buckets, bucket_writer& writer, uint32_t num_threads,
                             std::atomic<uint64_t>* done = nullptr) {
     if (num_threads == 0) num_threads = 1;
     std::atomic<size_t> next{0};
@@ -182,7 +185,7 @@ inline void ingest_bucketed(std::vector<std::string> const& files, uint32_t k, u
             size_t i = next.fetch_add(1);
             if (i >= files.size()) break;
             try {
-                detail::ingest_file_bucketed(files[i], k, m, bucket_log2, (uint32_t)i, bufs);
+                detail::ingest_file_bucketed(files[i], k, m, num_buckets, (uint32_t)i, bufs);
             } catch (std::exception& e) {
                 std::cerr << "error ingesting " << files[i] << ": " << e.what() << '\n';
             }
