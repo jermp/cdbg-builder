@@ -776,14 +776,27 @@ private:
         constexpr uint32_t MIN_BUCKETS = 64;
         constexpr uint32_t MAX_BUCKETS = 1u << 20;  // 1M files cap
         constexpr uint32_t DEFAULT_BUCKETS = 1024;
-        constexpr double OVERHEAD = 3.0;  // tig record + decode vector + maps
+        // Per-resident-bucket RAM is OVERHEAD x its on-disk seq bytes. Measured
+        // on 100K -g16: the plan assumed 3.0x and bounded stitch to 8 GiB, but
+        // stitch actually transient-spiked to ~17 GiB across 48 resident
+        // round-0 buckets -> real ratio ~6.4x. The extra is ext_tig's
+        // per-fragment FIXED overhead (std::vector<color_run> + std::string
+        // headers, ~120 B/tig) which dominates when fragments are short. Use
+        // 7.0x with margin.
+        constexpr double OVERHEAD = 7.0;
         constexpr double SHARE = 0.50;    // stitch's share of -g (across ALL resident buckets)
         if (num_threads == 0) num_threads = 1;
 
         if (max_ram_gb <= 0 || total_frag_seq_bytes == 0)
             return {DEFAULT_BUCKETS, num_threads};  // no budget: user owns the tradeoff
-        const uint64_t budget =
-            (uint64_t)(max_ram_gb * 1024.0 * 1024.0 * 1024.0 * SHARE);
+        // Budget is the share of what REMAINS after the live carry-in (color
+        // dict is freed before stitch via release_index, so this is small now,
+        // but stay correct if that changes).
+        const uint64_t carry_in = current_rss_bytes();
+        const uint64_t budget_total = (uint64_t)(max_ram_gb * 1024.0 * 1024.0 * 1024.0);
+        const uint64_t avail =
+            budget_total > carry_in ? (budget_total - carry_in) : budget_total;
+        const uint64_t budget = (uint64_t)((double)avail * SHARE);
         if (budget == 0) return {DEFAULT_BUCKETS, num_threads};
         const uint64_t needed = (uint64_t)((double)total_frag_seq_bytes * OVERHEAD);
 
