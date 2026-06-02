@@ -577,9 +577,12 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
 // production pipeline passes a frag_unitig_writer that streams
 // fragments to disk so the in-RAM accumulator never reaches its
 // multi-GB peak.
-// `mem_budget_bytes` (0 = unbounded) caps the total kmer_info RAM held by
-// in-flight buckets: a worker waits to "admit" its bucket until the running
-// total + this bucket's estimated cost fits the budget. All num_threads
+// `mem_budget_bytes` (0 = unbounded) is the TOTAL-RSS target for the phase (a
+// fraction of -g). A worker waits to "admit" its bucket until
+//   carry + reserved_kmer_info + live_color_dict + this_bucket_cost <= target
+// where carry is the RSS at phase start and the color dict is re-read live, so
+// the (monotonically growing) dict is reserved for dynamically rather than
+// left to overflow on top of a static kmer_info budget. All num_threads
 // threads stay alive; under a tight budget FEWER (large) buckets load at once,
 // MORE (small) buckets do -- bounding RAM without ever reducing the user's
 // thread count. One bucket is always allowed even if it alone exceeds the
@@ -604,6 +607,12 @@ inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t nu
     std::condition_variable mem_cv;
     uint64_t mem_in_use = 0;
     uint32_t mem_n_admitted = 0;  // how many buckets currently admitted
+    // mem_budget_bytes is the TOTAL-RSS target for the phase (a fraction of
+    // -g), NOT a pre-shrunk kmer_info budget. mem_carry = everything resident
+    // at phase start (frag sink, residual heap); the color dict starts ~empty
+    // here and is reserved for separately and LIVE in the predicate below, so
+    // the admission keeps  carry + reserved_kmer_info + live_dict <= target.
+    const uint64_t mem_carry = (mem_budget_bytes > 0) ? current_rss_bytes() : 0;
 
     auto run = [&]() {
         for (;;) {
@@ -616,7 +625,15 @@ inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t nu
             if (mem_budget_bytes > 0) {
                 std::unique_lock<std::mutex> lk(mem_mu);
                 mem_cv.wait(lk, [&] {
-                    return mem_n_admitted == 0 || mem_in_use + cost <= mem_budget_bytes;
+                    if (mem_n_admitted == 0) return true;  // forward progress
+                    // Reserve dynamically for the live color dict (read
+                    // lock-free; m_classes.size() is a monotone gauge, a benign
+                    // approximate race). As the dict grows, avail shrinks and
+                    // fewer buckets admit -- so the dict never overflows on top.
+                    const uint64_t dyn = mem_carry + global_dict.resident_bytes();
+                    const uint64_t avail =
+                        mem_budget_bytes > dyn ? mem_budget_bytes - dyn : 0;
+                    return mem_in_use + cost <= avail;
                 });
                 mem_in_use += cost;
                 ++mem_n_admitted;

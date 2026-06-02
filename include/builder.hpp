@@ -196,20 +196,20 @@ struct builder {
                 std::atomic<uint64_t> done{0};
                 progress prog("bucket-process", done, num_buckets);
                 // bucket-process holds one bucket's kmer_info resident per
-                // in-flight bucket. Rather than cap the user's -t, we cap the
-                // total kmer_info RAM via a memory-admission gate: workers
-                // (all num_threads of them) wait to load a bucket until it fits
-                // the budget. Under a tight -g this loads FEWER large buckets
-                // at once (and more small ones) -- "load less in RAM at a time"
-                // -- without ever reducing -t. Budget = share of -g remaining
-                // after the live carry-in.
+                // in-flight bucket, PLUS the global color dict, which grows
+                // monotonically through the phase. The admission gate keeps the
+                // whole phase under a total-RSS target: it admits a bucket only
+                // while  carry + reserved_kmer_info + live_dict <= target,
+                // re-reading the live dict each time. So as the dict grows,
+                // fewer buckets load at once -- the dict is reserved for
+                // dynamically, not left to overflow on top of a static
+                // kmer_info budget (the cause of the earlier 20.47 GiB peak).
+                // All num_threads threads stay alive; -t is never reduced.
                 uint64_t bp_budget = 0;
                 if (m_cfg.max_ram_gb > 0) {
                     const uint64_t total =
                         (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0);
-                    const uint64_t carry = current_rss_bytes();
-                    const uint64_t avail = total > carry ? (total - carry) : total;
-                    bp_budget = (uint64_t)((double)avail * 0.80);  // bucket-process share
+                    bp_budget = (uint64_t)(BUCKET_PROCESS_BUDGET_FRAC * (double)total);
                 }
                 process_buckets(*writer, m_cfg.k, m_num_colors, m_cfg.num_threads,
                                 std::ref(frag_sink), global_dict, global_mu, &done,
@@ -413,6 +413,12 @@ private:
     // Good default per-bucket batching payload (good for LZ4 dedup). The bucket
     // COUNT is sized against this; it is no longer auto-tuned down under -g.
     static constexpr size_t DEFAULT_FLUSH_BASES = 64 * 1024;
+
+    // Total-RSS target for bucket-process, as a fraction of -g. The admission
+    // gate keeps  carry + reserved kmer_info + live color dict  under this; the
+    // remaining ~15% is headroom for per-thread merge buffers, the frag sink,
+    // glibc fragmentation, and the kmer_info cost-estimate slop.
+    static constexpr double BUCKET_PROCESS_BUDGET_FRAC = 0.85;
 
     void validate_and_resolve_config() {
         if (m_cfg.filenames_list.empty())
