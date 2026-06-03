@@ -18,7 +18,7 @@
 #include <thread>
 #include <unistd.h>
 
-namespace cdgb {
+namespace cdbg {
 
 // ---- build configuration ----------------------------------------------------
 
@@ -28,8 +28,24 @@ struct build_config {
     uint32_t k = 31;
     uint32_t num_threads = 1;
     uint32_t m = 0;             // minimizer length, 0 = auto (compute_best_m(k))
-    uint32_t bucket_log2 = 0;   // 0 = auto (derived from max_ram_gb if set, else 10)
+    uint32_t bucket_log2 = 0;   // 0 = auto; if set via -b, forces num_buckets = 2^bucket_log2
+    uint32_t num_buckets = 0;   // resolved bucket COUNT (need not be a power of two);
+                                // 0 = auto. Derived in validate_and_resolve_config() from
+                                // the RAM model: B = frac*g / (alpha*T*flush + beta*spill).
     std::string tmp_dir;        // scratch dir; empty -> mkdtemp under $TMPDIR
+    // RAM-model overhead multipliers (nominal payload -> resident RSS), exposed
+    // as knobs so they can be re-calibrated per machine/allocator without code
+    // surgery (see builder.hpp for the derivation):
+    //   alpha = per-thread buffer pool overhead (recs vector + vector slack)
+    //   beta  = per-bucket compactor pool overhead (hashmap + string keys +
+    //           colors vectors + glibc fragmentation + LZ4 scratch buffers)
+    double alpha = 2.0;
+    double beta = 7.0;
+    // Per-bucket batching payloads in bytes (0 = built-in default). flush_bases
+    // = thread->compactor handoff size; spill_bytes = compactor dedup window
+    // before a disk frame. Smaller -> larger derived bucket count B.
+    size_t flush_bases = 0;
+    size_t spill_bytes = 0;
     // Soft RAM budget in GiB. 0 = no budget. When set, the builder
     // auto-picks bucket_log2 (more buckets -> smaller per-bucket data
     // structures) and streams the encoded color bit_vector to a
@@ -158,6 +174,12 @@ class phase_rss_marker {
 public:
     explicit phase_rss_marker(std::string label) : m_label(std::move(label)) {
         m_baseline = process_peak_rss_bytes();
+        // Live RSS at phase entry = memory CARRIED IN from prior phases (e.g.
+        // the global color-set dict, retained heap). The peak delta below is
+        // this phase's own growth; entry-live tells us what it stacks on. Both
+        // matter for the -g budget -- a phase can be "within its share" yet
+        // push the absolute peak over because of the carry-in.
+        m_entry_live = current_rss_bytes();
     }
     ~phase_rss_marker() { stop(); }
 
@@ -168,6 +190,7 @@ public:
         if (m_stopped) return;
         m_stopped = true;
         uint64_t now = process_peak_rss_bytes();
+        uint64_t exit_live = current_rss_bytes();
         if (now == 0) {
             std::cout << "  [" << m_label << " peak RSS] unavailable\n";
             return;
@@ -178,12 +201,21 @@ public:
         } else {
             std::cout << " (+0)";
         }
+        // entry_live / exit_live are LIVE VmRSS (not the monotonic VmHWM
+        // "peak RSS"). They disambiguate which phase's live footprint actually
+        // hits the high-water mark vs a transient that VmHWM carried forward:
+        // if exit_live << peak, the peak was a transient (e.g. a prior phase),
+        // not this phase's steady working set.
+        if (m_entry_live > 0 || exit_live > 0)
+            std::cout << " [live in " << format_bytes(m_entry_live) << " -> out "
+                      << format_bytes(exit_live) << "]";
         std::cout << "\n";
     }
 
 private:
     std::string m_label;
     uint64_t m_baseline = 0;
+    uint64_t m_entry_live = 0;
     bool m_stopped = false;
 };
 
@@ -439,4 +471,4 @@ inline bucket_process_prof& process_prof() {
     return p;
 }
 
-}  // namespace cdgb
+}  // namespace cdbg

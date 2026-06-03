@@ -11,13 +11,13 @@
 //
 // Typical use:
 //
-//   cdgb::build_config cfg;
+//   cdbg::build_config cfg;
 //   cfg.filenames_list = "...";
 //   cfg.out_basename   = "...";
 //   cfg.k = 31;
 //   cfg.num_threads = 8;
 //
-//   cdgb::builder b(cfg);
+//   cdbg::builder b(cfg);
 //   b.build();
 //   // After build():
 //   //   b.num_colors()         -- one per input file
@@ -67,7 +67,7 @@
 #include "unitig_spill.hpp"
 #include "util.hpp"
 
-namespace cdgb {
+namespace cdbg {
 
 struct builder {
     builder() = default;
@@ -85,12 +85,13 @@ struct builder {
             throw std::runtime_error("too many colors (max 2^32 - 1)");
         m_num_colors = (uint32_t)files.size();
 
-        uint32_t const num_buckets = 1u << m_cfg.bucket_log2;
+        uint32_t const num_buckets = m_cfg.num_buckets;
         std::cout << "k = " << m_cfg.k << ", m = " << m_cfg.m << ", num_colors = " << m_num_colors
                   << ", num_threads = " << m_cfg.num_threads << ", num_buckets = " << num_buckets
                   << "\n";
-        std::cout << "  bucket-write tuning: flush_bases=" << format_bytes(m_flush_bases)
-                  << ", spill_bytes=" << format_bytes(m_spill_bytes);
+        std::cout << "  bucket-write model: flush_bases=" << format_bytes(m_flush_bases)
+                  << ", spill_bytes=" << format_bytes(m_spill_bytes)
+                  << ", alpha=" << m_cfg.alpha << ", beta=" << m_cfg.beta;
         if (m_cfg.max_ram_gb > 0 && PLATFORM_RAM_OVERHEAD > 1.0) {
             std::cout << " (platform RAM overhead " << PLATFORM_RAM_OVERHEAD << "x)";
         }
@@ -138,7 +139,7 @@ struct builder {
                 timer _("bucket-write");
                 std::atomic<uint64_t> done{0};
                 progress prog("bucket-write", done, files.size());
-                ingest_bucketed(files, m_cfg.k, m_cfg.m, m_cfg.bucket_log2, *writer,
+                ingest_bucketed(files, m_cfg.k, m_cfg.m, m_cfg.num_buckets, *writer,
                                 m_cfg.num_threads, &done);
                 prog.stop();
             }
@@ -156,7 +157,27 @@ struct builder {
         writer->close();
         std::cout << "  bucket bytes written: " << writer->total_bytes() << " (compressed; "
                   << writer->total_uncompressed_bytes() << " uncompressed)\n";
+        // Per-bucket size distribution: with the bucket-process admission gate,
+        // this previews how many buckets fit in -g at once (the effective
+        // concurrency) and whether a few large outliers dominate the working
+        // set. num_threads = the max buckets that can be resident at once.
+        writer->report_bucket_size_distribution(m_cfg.num_threads);
         bucket_prof().print(m_cfg.num_threads);
+
+        // Free the per-bucket compactors (dedup hashmaps + LZ4 scratch buffers)
+        // now that bucket files are written -- they are not needed by
+        // bucket-process (which reads the files) and otherwise stay alive until
+        // writer.reset() AFTER the phase, pinning glibc's churned arenas.
+        writer->release_compactors();
+        // Return bucket-write's freed memory to the OS BEFORE bucket-process.
+        // The per-thread buffer pool and the just-freed compactors are freed but
+        // glibc holds them in its arenas, so VmRSS still reflects the bucket-write
+        // peak here. bucket-process's admission gate reads current_rss() as its
+        // baseline carry; if that carry still includes the freed-but-unreturned
+        // bucket-write memory, avail collapses and the gate admits ~one bucket at
+        // a time (serial!). Trimming now drops carry to the true live baseline
+        // so the gate admits the full set of buckets and runs -t-parallel.
+        release_free_heap_to_os_();
 
         // Bucket processing emits stitchable fragments AND merges
         // per-bucket color sets into the shared global dict on the
@@ -167,10 +188,11 @@ struct builder {
         // dense pangenome inputs that vector grew to multi-GB during
         // bucket-process and was the dominant peak contributor.
         // Instead each fragment is streamed through a disk-backed
-        // frag_unitig_writer to a single tmp file. Stitch then opens
-        // a mmap-backed frag_unitig_reader over that file and walks
-        // chains in-place via string_view into the kernel page cache;
-        // no full vector<stitchable_unitig> is ever materialised.
+        // frag_unitig_writer to a single tmp file. Stitch then reads
+        // that file back with a streaming frag_unitig_stream_reader that
+        // holds one fragment at a time, so no full
+        // vector<stitchable_unitig> -- and no O(num_fragments) index --
+        // is ever materialised.
         //
         // Streaming dict: encodes each new color set into its bvb at
         // intern() time and immediately flushes complete 64-bit words
@@ -188,16 +210,42 @@ struct builder {
                 timer _("bucket-process");
                 std::atomic<uint64_t> done{0};
                 progress prog("bucket-process", done, num_buckets);
+                // bucket-process holds one bucket's kmer_info resident per
+                // in-flight bucket, PLUS the global color dict, which grows
+                // monotonically through the phase. The admission gate keeps the
+                // whole phase under a total-RSS target: it admits a bucket only
+                // while  carry + reserved_kmer_info + live_dict <= target,
+                // re-reading the live dict each time. So as the dict grows,
+                // fewer buckets load at once -- the dict is reserved for
+                // dynamically, not left to overflow on top of a static
+                // kmer_info budget (the cause of the earlier 20.47 GiB peak).
+                // All num_threads threads stay alive; -t is never reduced.
+                uint64_t bp_budget = 0;
+                if (m_cfg.max_ram_gb > 0) {
+                    const uint64_t total =
+                        (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0);
+                    bp_budget = (uint64_t)(BUCKET_PROCESS_BUDGET_FRAC * (double)total);
+                }
                 process_buckets(*writer, m_cfg.k, m_num_colors, m_cfg.num_threads,
-                                std::ref(frag_sink), global_dict, global_mu, &done);
+                                std::ref(frag_sink), global_dict, global_mu, &done,
+                                bp_budget);
                 prog.stop();
                 std::cout << "  bucket fragments: " << frag_sink.count() << "\n";
                 std::cout << "  distinct color classes: " << global_dict.size() << "\n";
+                std::cout << "  global color dict resident: ~"
+                          << format_bytes(global_dict.resident_bytes())
+                          << " (stays in RAM through stitch + emit)\n";
             }
             rss.stop();
         }
         process_prof().print(m_cfg.num_threads);
         m_num_color_classes = global_dict.size();
+        // Interning is done. Free the dict's dedup index + per-class hash
+        // vector NOW (finalize only needs the class count + the on-disk
+        // bits/offsets). At high class counts this was the dominant cross-
+        // phase carry-in -- it stayed resident through stitch + emit and
+        // pushed stitch over budget (100K -g16: ~15 GiB carried into stitch).
+        global_dict.release_index();
         frag_sink.close_for_writing();
         // bucket_writer's per-bucket compactor state (m_dict_classes
         // and other reuse-friendly buffers) is alive at high-water
@@ -216,47 +264,52 @@ struct builder {
 
         // Stitch streams each finished unitig into a cid-range
         // unitig_bucket_writer. The K bucket count auto-scales so
-        // per-bucket peak at emit stays under ~10% of -g. We
-        // size K up-front from a single index-only walk over the
-        // mmap-backed frag spill (no seq bytes touched here).
+        // per-bucket peak at emit stays under ~10% of -g. We size K
+        // up-front from the frag writer's own seq-byte counter (no walk
+        // over the spill).
         std::unique_ptr<unitig_bucket_writer> uwriter_ptr;
         {
-            // Scope the frag_unitig_reader to just the stitch phase so
-            // its index vector + mmap are released before emit. emit
-            // only needs uwriter (cid-bucketed unitig spill) and
-            // global_dict (streaming color sets).
+            // The stitch reads the frag spill with a STREAMING reader that
+            // holds one fragment at a time -- no O(num_fragments) index. The
+            // total seq bytes (for bucket sizing) and fragment count (for the
+            // progress bar) come from the writer's own counters, so we never
+            // walk an index. emit only needs uwriter (cid-bucketed unitig
+            // spill) and global_dict (streaming color sets).
             phase_rss_marker rss("stitch");
             {
                 timer _("stitch");
-                frag_unitig_reader frag_reader(frag_sink.path());
-
-                uint64_t total_frag_seq_bytes = 0;
-                for (size_t i = 0; i < frag_reader.size(); ++i)
-                    total_frag_seq_bytes += frag_reader.seq_view(i).size();
+                const uint64_t total_frag_seq_bytes = frag_sink.total_seq_bytes();
+                const uint64_t n_frags = frag_sink.count();
 
                 const uint32_t unitig_bucket_count = pick_unitig_bucket_count_(
                     m_num_color_classes, total_frag_seq_bytes, m_cfg.max_ram_gb);
                 uwriter_ptr = std::make_unique<unitig_bucket_writer>(
                     tmp_dir, m_num_color_classes, unitig_bucket_count);
 
+                frag_unitig_stream_reader frag_reader(frag_sink.path());
                 std::atomic<uint64_t> done{0};
-                progress prog("stitch", done, frag_reader.size());
+                progress prog("stitch", done, n_frags);
                 // External-memory iterative-doubling stitch: per-round
-                // tigs are bucketed to LZ4-framed files under tmp_dir,
-                // one bucket resident at a time, so peak RAM is bounded
-                // by the bucket count rather than the fragment count
-                // (the in-RAM stitch's by_junction + adj + visited were
-                // hundreds of GB on the 661k pangenome). num_buckets is
-                // sized so one bucket's tigs fit a share of -g; with no
-                // -g a fixed default keeps small inputs fast.
-                const uint32_t stitch_buckets =
-                    pick_stitch_bucket_count_(total_frag_seq_bytes, m_cfg.max_ram_gb);
-                std::cout << "  stitch buckets: " << stitch_buckets << "\n";
-                stitch_unitigs_extmem_file(frag_reader, m_cfg.k, tmp_dir,
-                                           std::ref(*uwriter_ptr), stitch_buckets, &done);
+                // tigs are bucketed to LZ4-framed files under tmp_dir, and the
+                // parallel round loop holds num_threads buckets resident at
+                // once. We DIMENSION THE BUCKET COUNT (never the user's thread
+                // count) so num_threads resident buckets fit stitch's share of
+                // -g: more, smaller buckets. The user's -t is honored as-is.
+                const uint32_t stitch_buckets = pick_stitch_buckets_(
+                    total_frag_seq_bytes, m_cfg.max_ram_gb, m_cfg.num_threads);
+                std::cout << "  stitch buckets: " << stitch_buckets
+                          << ", threads: " << m_cfg.num_threads << "\n";
+                // Parallel over the per-round bucket loop: buckets are
+                // independent within a round (own waiting-map; content-seeded
+                // RNG), so this fans out cleanly. Output is unchanged --
+                // emit_fasta sorts each cid-bucket, so .fa is identical
+                // regardless of which thread emitted which unitig.
+                stitch_unitigs_extmem_file_stream(frag_reader, m_cfg.k, tmp_dir,
+                                                  std::ref(*uwriter_ptr), stitch_buckets, &done,
+                                                  m_cfg.num_threads);
                 prog.stop();
                 std::cout << "  unitigs after stitching: " << uwriter_ptr->total_unitigs() << "\n";
-                // frag_reader destroyed here -- mmap unmapped, index freed.
+                // frag_reader destroyed here -- file handle closed.
             }
             rss.stop();
         }
@@ -265,8 +318,12 @@ struct builder {
         m_num_unitigs = uwriter_ptr->total_unitigs();
 
         {
-            phase_rss_marker rss("emit");
+            phase_rss_marker rss("emit-fasta");
             emit_fasta(*uwriter_ptr);
+            rss.stop();
+        }
+        {
+            phase_rss_marker rss("emit-colors");
             emit_colors(global_dict);
             rss.stop();
         }
@@ -303,6 +360,48 @@ struct builder {
     uint64_t peak_rss_bytes() const { return m_peak_rss_bytes; }
     build_config const& config() const { return m_cfg; }
 
+    // --- emit-phase microbenchmark entry point (src/emit_bench.cpp) ------
+    // Runs ONLY the emit phase against a pre-populated unitig_bucket_writer
+    // and streaming_color_set_dict, using the SAME emit_fasta / emit_colors
+    // the real pipeline uses, so the RSS measured is faithful. Lets us
+    // reproduce the emit peak at 661k proportions without the ~14 h
+    // ingest/process/stitch upstream. `num_unitigs_total` must equal the
+    // count pushed into `uwriter` (sizes the u2c bit_vector, as build() does).
+    // `out_basename` and `max_ram_gb` are taken from the config passed at
+    // construction.
+    void run_emit_only(unitig_bucket_writer& uwriter, streaming_color_set_dict& dict,
+                       uint64_t num_unitigs_total) {
+        m_num_unitigs = num_unitigs_total;
+        {
+            phase_rss_marker rss("emit-fasta");
+            emit_fasta(uwriter);
+            rss.stop();
+        }
+        {
+            phase_rss_marker rss("emit-colors");
+            emit_colors(dict);
+            rss.stop();
+        }
+        m_peak_rss_bytes = process_peak_rss_bytes();
+        std::cout << "[emit-only peak resident memory] " << format_bytes(m_peak_rss_bytes);
+        if (m_cfg.max_ram_gb > 0) {
+            uint64_t budget = (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0);
+            std::cout << (m_peak_rss_bytes <= budget ? "  (within budget of "
+                                                     : "  (OVER budget of ")
+                      << format_bytes(budget) << ")";
+        }
+        std::cout << "\n";
+    }
+
+    // Public forwarder so the emit-bench harness sizes its unitig bucket
+    // count EXACTLY as build() does (else the emit-fasta read_bucket peak,
+    // which scales with records-per-bucket = num_unitigs / K, is wrong).
+    static uint32_t pick_unitig_bucket_count(uint64_t num_color_classes,
+                                             uint64_t total_seq_bytes_estimate,
+                                             double max_ram_gb) {
+        return pick_unitig_bucket_count_(num_color_classes, total_seq_bytes_estimate, max_ram_gb);
+    }
+
 private:
     // Soft-cap policy. Reads m_cfg.max_ram_gb (0 = unset) and decides:
     //   - bucket_log2 (more buckets -> smaller per-bucket data structures)
@@ -311,8 +410,40 @@ private:
     // upper end) and shrink the bvb spill threshold proportionally.
     // The user-facing CLI override (-b) takes precedence
     // over this auto-tune.
+    // Bounds for the -b power-of-two override only. The auto path computes an
+    // arbitrary (non-power-of-two) count from the RAM model and is bounded by
+    // MIN_AUTO_BUCKETS below and the OS fd limit above.
     static constexpr uint32_t MIN_BUCKETS_LOG2 = 10;
-    static constexpr uint32_t MAX_BUCKETS_LOG2 = 13;
+    static constexpr uint32_t MAX_BUCKETS_LOG2 = 16;
+
+    // Floor for the auto-derived bucket count (avoid degenerate single-bucket
+    // runs at very tight -g; the model can still land here when g is tiny).
+    static constexpr uint32_t MIN_AUTO_BUCKETS = 64;
+
+    // Fraction of -g the bucket-write phase is sized against. 0.50 matches the
+    // long-standing BUCKET_WRITE_SHARE that kept bucket-write lean (~10 GiB at
+    // g16 on the 100K input); 0.85 needlessly let it allocate more. Phase 1
+    // doesn't need most of -g -- only enough that B = M/(alpha*T*flush+beta*
+    // spill) is large enough for a 48-way bucket-process (~10k at 0.50, well
+    // above the ~6.7k needed).
+    static constexpr double BUCKET_WRITE_BUDGET_FRAC = 0.50;
+
+    // Good default per-bucket batching payloads. B is derived as B = frac*g /
+    // (alpha*T*flush + beta*spill), so bucket-write RAM stays at frac*g
+    // regardless of these -- they trade B (parallelism) for dedup. 64K is the
+    // sweet spot: a bigger spill (128K) dedups a bit better (faster load) but
+    // makes B smaller, so each compactor's hashmap is larger and bucket-write's
+    // hashmap/sort-unique cost dominates -- net SLOWER overall (measured: 100K
+    // g16 went 3883s -> 4100s at 128K) and a higher bucket-process peak.
+    // Overridable via --flush / --spill.
+    static constexpr size_t DEFAULT_FLUSH_BASES = 4 * 1024;
+    static constexpr size_t DEFAULT_SPILL_BYTES = 64 * 1024;
+
+    // Total-RSS target for bucket-process, as a fraction of -g. The admission
+    // gate keeps  carry + reserved working set + live color dict  under this,
+    // with a hard live-RSS ceiling as backstop; the remaining ~18% is headroom
+    // for in-flight load lag, the frag sink, and glibc fragmentation.
+    static constexpr double BUCKET_PROCESS_BUDGET_FRAC = 0.82;
 
     void validate_and_resolve_config() {
         if (m_cfg.filenames_list.empty())
@@ -326,215 +457,98 @@ private:
         if (m_cfg.m < 2 || m_cfg.m > m_cfg.k)
             throw std::runtime_error("invalid m=" + std::to_string(m_cfg.m) +
                                      " (need 2 <= m <= k)");
-        if (m_cfg.bucket_log2 == 0) {
-            // User didn't pin -b. Auto-pick.
-            m_cfg.bucket_log2 = auto_bucket_log2();
-        } else if (m_cfg.bucket_log2 < MIN_BUCKETS_LOG2 || m_cfg.bucket_log2 > MAX_BUCKETS_LOG2) {
-            throw std::runtime_error("-b must be in [" +
-                                     std::to_string(MIN_BUCKETS_LOG2) + ", " +
-                                     std::to_string(MAX_BUCKETS_LOG2) + "]");
+        // Per-bucket batching knobs (CLI-overridable). The RAM model sizes the
+        // bucket COUNT against these, so smaller values -> larger B -> smaller
+        // buckets (faster bucket-process) while bucket-write stays in budget.
+        m_flush_bases = m_cfg.flush_bases ? m_cfg.flush_bases : DEFAULT_FLUSH_BASES;
+        m_spill_bytes = m_cfg.spill_bytes ? m_cfg.spill_bytes : DEFAULT_SPILL_BYTES;
+
+        // Resolve the bucket COUNT (need not be a power of two).
+        if (m_cfg.bucket_log2 != 0) {
+            // -b override: forces a power-of-two count, range-checked.
+            if (m_cfg.bucket_log2 < MIN_BUCKETS_LOG2 || m_cfg.bucket_log2 > MAX_BUCKETS_LOG2)
+                throw std::runtime_error("-b must be in [" +
+                                         std::to_string(MIN_BUCKETS_LOG2) + ", " +
+                                         std::to_string(MAX_BUCKETS_LOG2) + "]");
+            m_cfg.num_buckets = 1u << m_cfg.bucket_log2;
+        } else {
+            m_cfg.num_buckets = auto_bucket_count_();
         }
-        // bucket_writer opens one FILE per bucket (LZ4-framed, raw
-        // stdio). Raise the soft FD limit if needed; clamp bucket_log2
-        // if even the hard limit isn't enough.
-        m_cfg.bucket_log2 = ensure_fd_capacity_for_buckets_(m_cfg.bucket_log2);
-        auto_tune_bucket_write_params();
+        // bucket_writer opens one FILE per bucket (LZ4-framed, raw stdio).
+        // Raise the soft FD limit if needed; clamp the count if even the
+        // hard limit isn't enough.
+        m_cfg.num_buckets = ensure_fd_capacity_for_buckets_(m_cfg.num_buckets);
     }
 
-    // Try to raise RLIMIT_NOFILE so we can open `1 << log2` bucket
-    // files plus a small headroom for stdin/stdout/sidecar/inputs. If
-    // even the hard limit is too small, clamp log2 down and warn.
-    static uint32_t ensure_fd_capacity_for_buckets_(uint32_t log2) {
+    // Size the bucket COUNT to the bucket-write budget so both of its pools fit:
+    //
+    //   W = alpha*T*B*flush + beta*B*spill = B*(alpha*T*flush + beta*spill) <= frac*g
+    //   => B = frac*g / (alpha*T*flush + beta*spill)
+    //
+    // This is U-INDEPENDENT (bucket-write RAM doesn't depend on input size), so
+    // there is no up-front estimate to get wrong. bucket-process then gets the
+    // most buckets bucket-write can afford -- the best B for it regardless of U
+    // -- and its runtime admission gate handles the (measured) per-bucket
+    // kmer_info. No -g set -> historical default count.
+    uint32_t auto_bucket_count_() const {
+        if (m_cfg.max_ram_gb <= 0) return 1u << MIN_BUCKETS_LOG2;
+        const double g = m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0;
+        const double M = BUCKET_WRITE_BUDGET_FRAC * g / PLATFORM_RAM_OVERHEAD;
+        const double T = (double)std::max<uint32_t>(1, m_cfg.num_threads);
+        const double per_bucket = m_cfg.alpha * T * (double)m_flush_bases +
+                                  m_cfg.beta * (double)m_spill_bytes;
+        double b = M / per_bucket;
+        // Floor at a small sane minimum (avoid degenerate single-bucket runs at
+        // tiny -g); the fd clamp handles the ceiling. If the model lands below
+        // num_threads, bucket-process simply won't engage every thread -- safe,
+        // just less parallel, and surfaced by the bucket size distribution.
+        uint64_t count = b < 1.0 ? 1 : (uint64_t)b;
+        if (count < MIN_AUTO_BUCKETS) count = MIN_AUTO_BUCKETS;
+        if (count > UINT32_MAX) count = UINT32_MAX;
+        return (uint32_t)count;
+    }
+
+    // Try to raise RLIMIT_NOFILE so we can open `count` bucket files plus a
+    // small headroom for stdin/stdout/sidecar/inputs. If even the hard limit
+    // is too small, clamp the count down and warn.
+    static uint32_t ensure_fd_capacity_for_buckets_(uint32_t count) {
         constexpr uint32_t HEADROOM = 64;
         struct rlimit r;
-        if (::getrlimit(RLIMIT_NOFILE, &r) != 0) return log2;  // best effort
-        uint32_t needed = (1u << log2) + HEADROOM;
-        if (r.rlim_cur >= needed) return log2;
-        rlim_t target = std::min<rlim_t>(needed, r.rlim_max);
+        if (::getrlimit(RLIMIT_NOFILE, &r) != 0) return count;  // best effort
+        uint64_t needed = (uint64_t)count + HEADROOM;
+        if (r.rlim_cur >= needed) return count;
+        rlim_t target = std::min<rlim_t>((rlim_t)needed, r.rlim_max);
         struct rlimit nr = r;
         nr.rlim_cur = target;
         ::setrlimit(RLIMIT_NOFILE, &nr);
         ::getrlimit(RLIMIT_NOFILE, &nr);
-        if (nr.rlim_cur >= needed) return log2;
-        // Hard limit too small. Clamp log2 to what we can actually open.
-        uint32_t avail = (uint32_t)nr.rlim_cur > HEADROOM ? (uint32_t)nr.rlim_cur - HEADROOM : 0;
-        uint32_t fitted = MIN_BUCKETS_LOG2;
-        while (fitted < log2 && (1u << (fitted + 1)) <= avail) ++fitted;
-        if (fitted < log2) {
+        if (nr.rlim_cur >= needed) return count;
+        // Hard limit too small. Clamp the count to what we can actually open.
+        uint32_t avail = (uint32_t)nr.rlim_cur > HEADROOM ? (uint32_t)nr.rlim_cur - HEADROOM : 1;
+        if (avail < count) {
             std::cerr << "warning: RLIMIT_NOFILE hard limit " << nr.rlim_max
-                      << " can't accommodate 2^" << log2 << " buckets; clamping bucket_log2 to "
-                      << fitted << ". Raise the hard limit (e.g. ulimit -Hn) for tighter budgets.\n";
+                      << " can't accommodate " << count << " buckets; clamping to "
+                      << avail << ". Raise the hard limit (e.g. ulimit -Hn) for tighter budgets.\n";
+            return avail;
         }
-        return fitted;
+        return count;
     }
 
-    // Per-platform RAM-overhead multiplier. The auto-tune below models
-    // bucket-write peak using overhead constants calibrated on macOS,
-    // where libsystem_malloc has heavier per-allocation bookkeeping and
-    // RSS accounting includes pages glibc would reclaim. On Linux the
-    // same workload typically sits ~50% lower in RSS for the same
-    // logical state, so we'd over-tighten the auto-tune if we used the
-    // macOS calibration there.
-    //
-    // We compensate by dividing the effective budget that the auto-tune
-    // sees by this constant. A value of 2.0 on macOS means the auto-
-    // tune behaves as if the user passed half their -g (smaller
-    // flush_bases / spill_bytes / fewer buckets) so the resulting
-    // structural footprint actually fits under the original cap once
-    // platform overhead is added back. On Linux the constant is 1.0
-    // (no derating) because the existing constants already match.
-    //
-    // The watcher's HIGH/LOW thresholds are NOT divided by this
-    // multiplier -- the watcher measures real RSS, which is what we
-    // want to cap.
+    // Per-platform RAM-overhead multiplier. The bucket-count model uses
+    // overhead constants (alpha/beta) whose calibration differs by allocator:
+    // macOS libsystem_malloc has heavier per-allocation bookkeeping and counts
+    // pages glibc would reclaim, so the same logical state sits higher in RSS.
+    // We compensate by dividing the budget the model sizes against by this
+    // constant (2.0 on macOS, 1.0 on Linux), so the bucket count comes out
+    // smaller on macOS and the footprint still fits once platform overhead is
+    // added back. The watcher's thresholds are NOT divided by it -- the watcher
+    // measures real RSS, which is what we want to cap.
     static constexpr double PLATFORM_RAM_OVERHEAD =
 #if defined(__APPLE__)
         2.0;
 #else
         1.0;
 #endif
-
-    // Fraction of -g the bucket-write auto-tune is allowed to
-    // plan for (per-thread buffers + compactor + compressor). The
-    // remainder absorbs the bucket-process working set, which on Mac
-    // expands by ~1.75 GiB on the 4546-genome workload (k-mer rsids
-    // map + per-bucket compact_color_set_dict + libsystem_malloc bookkeeping).
-    // We hand bucket-write a smaller slice on Mac so the cap holds
-    // once bucket-process expands on top.
-    static constexpr double BUCKET_WRITE_SHARE =
-#if defined(__APPLE__)
-        0.40;
-#else
-        0.50;
-#endif
-
-    double effective_max_ram_gb() const {
-        return m_cfg.max_ram_gb / PLATFORM_RAM_OVERHEAD;
-    }
-
-    // Pick num_buckets so that the auto-tune can give us spill_bytes
-    // at least TARGET_SPILL_BYTES. Otherwise the bucket files explode
-    // with redundant records:
-    //
-    //   spill_bytes ≈ (SHARE × effective_ram / 2) / (B × COMPACTOR_OVERHEAD)
-    //
-    // is the value the compactor-half of the bucket-write share lets
-    // us afford. Each spill clears the per-bucket dedup state, so a
-    // popular super-k-mer that's hit again after a spill is emitted
-    // as a *separate* on-disk record. The smaller spill_bytes is, the
-    // more often this happens, and on the 4546-genome workload
-    // pushing spill_bytes to its 16 KiB floor produced 1.96 M spills
-    // and 10.6 GB of uncompressed bucket bytes -- vs ~313 K spills
-    // and ~3 GB at "reasonable" spill_bytes. The 3.5x bloat then
-    // overwhelmed any savings from the new compression.
-    //
-    // Strategy: solve for the largest B in [MIN, MAX] such that
-    // B × TARGET_SPILL_BYTES × COMPACTOR_OVERHEAD ≤ (SHARE × eff)/2.
-    // Bigger budgets get more buckets (which helps bucket-process
-    // parallelism); tighter budgets get fewer buckets (so spill_bytes
-    // can stay at the target and each spill carries enough data that
-    // dedup pays off).
-    //
-    // No -g set -> historical 1024 buckets.
-    uint32_t auto_bucket_log2() const {
-        if (m_cfg.max_ram_gb <= 0) return MIN_BUCKETS_LOG2;
-        constexpr double SHARE = BUCKET_WRITE_SHARE;
-        constexpr double COMPACTOR_OVERHEAD = 7.0;
-        constexpr size_t TARGET_SPILL_BYTES = 64 * 1024;  // good for LZ4 dedup
-
-        const double compactor_share_bytes =
-            effective_max_ram_gb() * 1024.0 * 1024.0 * 1024.0 * (SHARE / 2.0);
-        const double max_b =
-            compactor_share_bytes / ((double)TARGET_SPILL_BYTES * COMPACTOR_OVERHEAD);
-
-        uint32_t log2 = MAX_BUCKETS_LOG2;
-        while (log2 > MIN_BUCKETS_LOG2 && (double)((uint64_t)1 << log2) > max_b) {
-            --log2;
-        }
-        return log2;
-    }
-
-    // Joint auto-tune of (flush_bases, spill_bytes) against a fixed
-    // share of -g, given (num_threads, num_buckets).
-    //
-    // Bucket-write peak comes from three terms that we model as:
-    //
-    //   per-thread buffers   ≈ num_threads × num_buckets × flush_bases × BUFFER_OVERHEAD
-    //   compactor footprint  ≈ num_buckets × spill_bytes × COMPACTOR_OVERHEAD
-    //   compressor state     ≈ num_buckets × COMPRESSOR_BYTES_PER_BUCKET
-    //
-    // The overhead factors are empirical: nominal storage substantially
-    // undercounts what the process actually resident-pages because of
-    //   (a) std::vector capacity slack (per-thread buffers retain their
-    //       high-water capacity for the whole phase),
-    //   (b) std::string heap allocations for compactor keys (each ~80 B
-    //       header + bytes + malloc header beyond the 15 B SSO),
-    //   (c) glibc/libsystem_malloc fragmentation across millions of
-    //       small allocs churned by repeated spill cycles,
-    //   (d) ankerl::unordered_dense map structure overhead per entry.
-    //
-    // The compressor term used to dominate (zlib level-1 at ~256-448
-    // KiB per gzFile). With LZ4's block API (LZ4_compress_default is
-    // stateless from the caller's view) there is no persistent
-    // compressor state per bucket -- only the m_batch_buf and
-    // m_out_buf scratch buffers, which are accounted for inside
-    // COMPACTOR_OVERHEAD (raised to 7x). COMPRESSOR_BYTES_PER_BUCKET
-    // here is just a small constant for unmodelled per-bucket
-    // bookkeeping.
-    //
-    // Strategy: reserve a target share (default 50%) of -g for
-    // bucket-write. Subtract the (small) compressor floor. Split what
-    // remains evenly between per-thread buffers and compactor data,
-    // then solve for flush_bases and spill_bytes.
-    //
-    // No -g set -> keep historical defaults (this keeps the
-    // small-input dev path identical and avoids surprising regressions
-    // for users who don't care about a budget).
-    void auto_tune_bucket_write_params() {
-        if (m_cfg.max_ram_gb <= 0) {
-            m_flush_bases = 64 * 1024;
-            m_spill_bytes = DEFAULT_COMPACTOR_SPILL_BYTES;  // 256 KiB
-            return;
-        }
-        constexpr double SHARE = BUCKET_WRITE_SHARE;  // share of budget for bucket-write
-        constexpr double COMPACTOR_OVERHEAD = 7.0;    // compactor: structure + key allocs + frag
-        constexpr double BUFFER_OVERHEAD = 2.0;     // per-thread: capacity slack + recs vec
-        // LZ4 block API has no persistent compressor state -- the
-        // batch and out buffers we hold between spills are accounted
-        // for by COMPACTOR_OVERHEAD (raised from 5x to 7x to cover
-        // them). Keep a small constant here for unmodelled per-bucket
-        // bookkeeping (FILE handle, mutex padding, etc.).
-        constexpr size_t COMPRESSOR_BYTES_PER_BUCKET = 4 * 1024;
-        constexpr size_t MIN_FLUSH_BASES = 4 * 1024;
-        constexpr size_t MIN_SPILL_BYTES = 16 * 1024;
-        constexpr size_t MAX_FLUSH_BASES = 64 * 1024;   // historical default
-        constexpr size_t MAX_SPILL_BYTES = 256 * 1024;  // historical default
-
-        double const effective_ram_gb = effective_max_ram_gb();
-        const uint64_t budget_bytes =
-            (uint64_t)(effective_ram_gb * 1024.0 * 1024.0 * 1024.0 * SHARE);
-        const uint64_t B = 1ull << m_cfg.bucket_log2;
-        const uint64_t T = std::max<uint64_t>(1, m_cfg.num_threads);
-
-        const uint64_t compressor_total = B * (uint64_t)COMPRESSOR_BYTES_PER_BUCKET;
-        uint64_t remainder = budget_bytes > compressor_total ? budget_bytes - compressor_total : 0;
-        uint64_t half = remainder / 2;
-
-        double flush_d =
-            T * B == 0 ? (double)MAX_FLUSH_BASES : (double)half / (T * B * BUFFER_OVERHEAD);
-        size_t flush = (size_t)flush_d;
-        if (flush < MIN_FLUSH_BASES) flush = MIN_FLUSH_BASES;
-        if (flush > MAX_FLUSH_BASES) flush = MAX_FLUSH_BASES;
-
-        double spill_d =
-            B == 0 ? (double)MAX_SPILL_BYTES : (double)half / (B * COMPACTOR_OVERHEAD);
-        size_t spill = (size_t)spill_d;
-        if (spill < MIN_SPILL_BYTES) spill = MIN_SPILL_BYTES;
-        if (spill > MAX_SPILL_BYTES) spill = MAX_SPILL_BYTES;
-
-        m_flush_bases = flush;
-        m_spill_bytes = spill;
-    }
 
     static std::vector<std::string> read_filenames(std::string const& path) {
         std::ifstream in(path);
@@ -553,7 +567,7 @@ private:
     std::string resolve_tmp_dir() {
         if (m_cfg.tmp_dir.empty()) {
             std::string tmpl =
-                (std::filesystem::temp_directory_path() / "cdgb_buckets_XXXXXX").string();
+                (std::filesystem::temp_directory_path() / "cdbg_buckets_XXXXXX").string();
             std::vector<char> buf(tmpl.begin(), tmpl.end());
             buf.push_back('\0');
             if (mkdtemp(buf.data()) == nullptr)
@@ -642,22 +656,50 @@ private:
     // bytes. More buckets -> smaller per-bucket resident set but more
     // round files; fewer buckets -> larger resident set. With no -g a
     // fixed default keeps small inputs in a handful of rounds.
-    static uint32_t pick_stitch_bucket_count_(uint64_t total_frag_seq_bytes, double max_ram_gb) {
+    // Pick the stitch round-store bucket count AND the effective stitch
+    // concurrency together, so peak RSS stays within budget.
+    //
+    // The parallel stitch holds ONE bucket resident per in-flight thread, so
+    // peak ~= effective_threads * (one bucket's tigs). To keep that within
+    // stitch's SHARE of -g we size buckets for `num_threads` resident copies:
+    // count >= needed * num_threads / budget. If that hits the MAX_BUCKETS
+    // (file-count) ceiling, we instead CAP the thread count so
+    // effective_threads * one_bucket still fits. Returns {buckets, threads}.
+    // Dimension the stitch round-store bucket count so `num_threads` buckets
+    // (the parallel round loop holds one decoded bucket per in-flight thread)
+    // fit stitch's share of -g. We size the BUCKET COUNT, never the user's
+    // thread count -- more, smaller buckets keep full -t concurrency.
+    static uint32_t pick_stitch_buckets_(uint64_t total_frag_seq_bytes, double max_ram_gb,
+                                         uint32_t num_threads) {
         constexpr uint32_t MIN_BUCKETS = 64;
-        constexpr uint32_t MAX_BUCKETS = 1u << 20;  // 1M files cap
+        constexpr uint32_t MAX_BUCKETS = 1u << 20;  // 1M files cap (fd headroom)
         constexpr uint32_t DEFAULT_BUCKETS = 1024;
-        constexpr double OVERHEAD = 3.0;  // tig record + decode vector + maps
-        constexpr double SHARE = 0.50;    // stitch's share of -g per resident bucket
-
+        // Per-resident-bucket RAM is OVERHEAD x its on-disk seq bytes. Measured
+        // on 100K -g16: a 3.0x model bounded stitch to 8 GiB but it actually
+        // spiked to ~17 GiB across 48 resident round-0 buckets -> real ~6.4x.
+        // The extra is ext_tig's per-fragment FIXED overhead
+        // (std::vector<color_run> + std::string headers, ~120 B/tig) that
+        // dominates for short fragments. 7.0x with margin (validated: 100K
+        // -g16 stitch peak +1.16 GiB, whole run 15.77 < 16).
+        constexpr double OVERHEAD = 7.0;
+        constexpr double SHARE = 0.50;  // stitch's share of -g, across ALL resident buckets
+        if (num_threads == 0) num_threads = 1;
         if (max_ram_gb <= 0 || total_frag_seq_bytes == 0) return DEFAULT_BUCKETS;
-        const uint64_t per_bucket_budget =
-            (uint64_t)(max_ram_gb * 1024.0 * 1024.0 * 1024.0 * SHARE);
-        if (per_bucket_budget == 0) return DEFAULT_BUCKETS;
+
+        // Share of what REMAINS after the live carry-in (the color dict is
+        // freed before stitch via release_index, so this is small now).
+        const uint64_t carry_in = current_rss_bytes();
+        const uint64_t budget_total = (uint64_t)(max_ram_gb * 1024.0 * 1024.0 * 1024.0);
+        const uint64_t avail =
+            budget_total > carry_in ? (budget_total - carry_in) : budget_total;
+        const uint64_t budget = (uint64_t)((double)avail * SHARE);
+        if (budget == 0) return DEFAULT_BUCKETS;
+
         const uint64_t needed = (uint64_t)((double)total_frag_seq_bytes * OVERHEAD);
-        // Round up to a count where needed/count <= per_bucket_budget.
-        uint64_t count = (needed + per_bucket_budget - 1) / per_bucket_budget;
+        // count s.t. needed/count * num_threads <= budget (num_threads resident).
+        uint64_t count = ((needed * num_threads) + budget - 1) / budget;
         if (count < MIN_BUCKETS) count = MIN_BUCKETS;
-        if (count > MAX_BUCKETS) count = MAX_BUCKETS;
+        if (count > MAX_BUCKETS) count = MAX_BUCKETS;  // hard fd ceiling; see note below
         return (uint32_t)count;
     }
 
@@ -706,42 +748,50 @@ private:
         size_t emitted = 0;
         uint64_t prev_cid = 0;
 
-        std::vector<unitig_bucket_writer::record> records;
-        for (uint32_t b = 0; b < uwriter.num_buckets(); ++b) {
-            uwriter.read_bucket(b, records);
-            std::sort(records.begin(), records.end(),
-                      [](unitig_bucket_writer::record const& x,
-                         unitig_bucket_writer::record const& y) { return x.cid < y.cid; });
-            for (auto const& r : records) {
-                // Mark the final unitig of the previous run. emitted > 0
-                // guards the first unitig overall; cid != prev_cid is
-                // true on every group boundary because we iterate
-                // buckets in ascending cid range and sort within each.
-                if (emitted > 0 && r.cid != prev_cid) {
-                    u2c_bvb.set(emitted - 1, 1);
-                }
-                prev_cid = r.cid;
-                ++emitted;
+        // Per-bucket RAM cap for the cid-sort. read_bucket_sorted sorts in RAM
+        // when a bucket fits this, else external merge-sorts -- so the
+        // emit-fasta peak is bounded by this cap REGARDLESS of cid skew (which
+        // otherwise made one low-cid bucket dominate; 661k: +36 GiB). Use a
+        // modest share of -g; fall back to a fixed cap with no -g.
+        const uint64_t emit_mem_cap =
+            m_cfg.max_ram_gb > 0
+                ? (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0 * 0.10)
+                : (uint64_t)(1ull << 30);  // 1 GiB default
 
-                reserve(22);  // '>' + up to 20 digits (uint64_t) + '\n'
-                buf[pos++] = '>';
-                auto rr = std::to_chars(buf.data() + pos, buf.data() + pos + 20, r.cid);
-                pos = (size_t)(rr.ptr - buf.data());
-                buf[pos++] = '\n';
-                size_t s_pos = 0;
-                while (s_pos < r.seq.size()) {
-                    if (pos == BUF_BYTES) flush_buf();
-                    size_t take = std::min(BUF_BYTES - pos, r.seq.size() - s_pos);
-                    std::memcpy(buf.data() + pos, r.seq.data() + s_pos, take);
-                    pos += take;
-                    s_pos += take;
-                }
-                reserve(1);
-                buf[pos++] = '\n';
+        auto emit_record = [&](uint64_t cid, std::string_view seq) {
+            // Mark the final unitig of the previous run. cid is globally
+            // non-decreasing (buckets ascending by cid range, sorted within),
+            // so cid != prev_cid is exactly a color-set group boundary.
+            if (emitted > 0 && cid != prev_cid) u2c_bvb.set(emitted - 1, 1);
+            prev_cid = cid;
+            ++emitted;
+
+            reserve(22);  // '>' + up to 20 digits (uint64_t) + '\n'
+            buf[pos++] = '>';
+            auto rr = std::to_chars(buf.data() + pos, buf.data() + pos + 20, cid);
+            pos = (size_t)(rr.ptr - buf.data());
+            buf[pos++] = '\n';
+            size_t s_pos = 0;
+            while (s_pos < seq.size()) {
+                if (pos == BUF_BYTES) flush_buf();
+                size_t take = std::min(BUF_BYTES - pos, seq.size() - s_pos);
+                std::memcpy(buf.data() + pos, seq.data() + s_pos, take);
+                pos += take;
+                s_pos += take;
             }
+            reserve(1);
+            buf[pos++] = '\n';
+        };
+
+        for (uint32_t b = 0; b < uwriter.num_buckets(); ++b) {
+            uwriter.read_bucket_sorted(b, emit_mem_cap, emit_record);
         }
         flush_buf();
         std::fclose(fa);
+
+        std::cout << "  [emit-fasta] " << uwriter.num_buckets()
+                  << " buckets, cid-sort RAM cap " << format_bytes(emit_mem_cap)
+                  << " (external merge-sort if a bucket exceeds it)\n";
 
         // Close out the very last run.
         if (emitted > 0) u2c_bvb.set(emitted - 1, 1);
@@ -768,9 +818,10 @@ private:
     uint64_t m_num_unitigs = 0;
     uint64_t m_num_color_classes = 0;
     uint64_t m_peak_rss_bytes = 0;
-    // bucket-write knobs picked by auto_tune_bucket_write_params().
+    // bucket-write batching payload, fixed at good defaults in
+    // validate_and_resolve_config(); the bucket COUNT is sized against these.
     size_t m_flush_bases = 0;
     size_t m_spill_bytes = 0;
 };
 
-}  // namespace cdgb
+}  // namespace cdbg

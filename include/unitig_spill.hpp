@@ -28,14 +28,13 @@
 //    File format: a sequence of records, one per fragment, until EOF:
 //      [u32 cid][u8 open_flags][u32 seq_len][seq_len bytes raw ACGT]
 //
-// 3) frag_unitig_reader  -- mmap-backed view over (2)'s file
-//    Used by stitch. Walks the spill file once to build a 16 B/entry
-//    index of (cid, open_flags+seq_len packed, seq_offset). mmaps
-//    the file PROT_READ + MADV_RANDOM so seq bytes are accessible as
-//    std::string_view directly into the kernel page cache; no full
-//    vector<stitchable_unitig> is materialised. Index size on
-//    salmonella-25K (~26.6 M fragments) is ~425 MB vs ~2.8 GB for an
-//    in-RAM std::vector<stitchable_unitig> at the same scale.
+// 3) frag_unitig_stream_reader  -- sequential, no-index view over (2)'s file
+//    Used by the production stitch. Pulls fragments one at a time via
+//    next(), holding only ONE fragment resident -- no per-fragment index
+//    at all. The stitch seeds round 0 by reading every fragment once in
+//    order and never revisits the spill, so a random-access index would be
+//    pure overhead; at 5.7e9 fragments a 24 B/entry index was ~137 GB,
+//    the last O(num_fragments) structure in the stitch. This removes it.
 
 #include <algorithm>
 #include <cerrno>
@@ -50,14 +49,9 @@
 #include <system_error>
 #include <vector>
 
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
 #include "bucket_walker.hpp"  // stitchable_unitig
 
-namespace cdgb {
+namespace cdbg {
 
 class unitig_bucket_writer {
 public:
@@ -96,9 +90,9 @@ public:
 
     // The sink callable used by stitch_unitigs_streaming.
     void operator()(stitchable_unitig&& u) {
-        const uint32_t b = bucket_for_cid(u.cid);
+        const uint64_t cid = u.mono_cid();  // post-split: monochromatic
+        const uint32_t b = bucket_for_cid(cid);
         std::FILE* f = m_files[b];
-        const uint64_t cid = u.cid;
         const uint32_t seq_len = (uint32_t)u.seq.size();
         if (std::fwrite(&cid, sizeof(cid), 1, f) != 1)
             throw std::runtime_error("short write of unitig cid to bucket " + std::to_string(b));
@@ -156,6 +150,122 @@ public:
                                          std::to_string(b));
             }
             out.push_back({cid, std::move(seq)});
+        }
+    }
+
+    // Stream bucket b's records in cid-ASCENDING order, calling
+    // emit(cid, seq_view) for each, using at most ~mem_cap bytes of RAM
+    // regardless of bucket size. This replaces "load whole bucket + in-RAM
+    // sort", whose peak was the FATTEST bucket -- and cid skew (unitigs
+    // cluster in low cids; cid ranges are equal-width) made one bucket
+    // dominate (661k emit-fasta: +36 GiB).
+    //
+    // Common case (bucket <= mem_cap): one in-RAM chunk, sort, emit -- no
+    // spill, same speed as before. Large bucket: read in <=mem_cap chunks,
+    // sort each, spill as a sorted run file, then k-way merge the runs to the
+    // sink. Order WITHIN a cid is irrelevant (verify compares unitig sets; u2c
+    // only needs each cid's unitigs contiguous, which cid-order guarantees).
+    template <typename Emit>
+    void read_bucket_sorted(uint32_t b, uint64_t mem_cap, Emit&& emit) {
+        std::FILE* f = m_files[b];
+        if (!f) throw std::runtime_error("read_bucket_sorted: file already closed");
+        std::fflush(f);
+        std::rewind(f);
+        if (mem_cap < (1u << 20)) mem_cap = 1u << 20;  // sane floor
+
+        std::vector<record> chunk;
+        uint64_t chunk_bytes = 0;
+        std::vector<std::string> run_paths;  // spilled sorted-run files
+
+        auto read_one = [&](std::FILE* fp, record& r) -> bool {
+            uint32_t seq_len = 0;
+            if (std::fread(&r.cid, sizeof(r.cid), 1, fp) != 1) {
+                if (std::feof(fp)) return false;
+                throw std::runtime_error("short read of cid in bucket " + std::to_string(b));
+            }
+            if (std::fread(&seq_len, sizeof(seq_len), 1, fp) != 1)
+                throw std::runtime_error("short read of len in bucket " + std::to_string(b));
+            r.seq.resize(seq_len);
+            if (seq_len > 0 &&
+                std::fread(r.seq.data(), 1, seq_len, fp) != (size_t)seq_len)
+                throw std::runtime_error("short read of seq in bucket " + std::to_string(b));
+            return true;
+        };
+        auto write_one = [&](std::FILE* fp, record const& r) {
+            uint32_t seq_len = (uint32_t)r.seq.size();
+            if (std::fwrite(&r.cid, sizeof(r.cid), 1, fp) != 1 ||
+                std::fwrite(&seq_len, sizeof(seq_len), 1, fp) != 1 ||
+                (seq_len > 0 && std::fwrite(r.seq.data(), 1, seq_len, fp) != (size_t)seq_len))
+                throw std::runtime_error("short write of run record for bucket " +
+                                         std::to_string(b));
+        };
+        auto sort_chunk = [&]() {
+            std::sort(chunk.begin(), chunk.end(),
+                      [](record const& x, record const& y) { return x.cid < y.cid; });
+        };
+        auto spill_chunk = [&]() {
+            std::string p = m_dir + "/unitig_run_" + std::to_string(b) + "_" +
+                            std::to_string(run_paths.size()) + ".bin";
+            std::FILE* rf = std::fopen(p.c_str(), "wb");
+            if (!rf) throw std::runtime_error("cannot open unitig run file: " + p);
+            for (auto const& r : chunk) write_one(rf, r);
+            std::fclose(rf);
+            run_paths.push_back(std::move(p));
+            chunk.clear();
+            chunk_bytes = 0;
+        };
+
+        // Pass 1: read in chunks; sort each. If it all fits one chunk and no
+        // prior runs, emit directly (the no-spill fast path).
+        record r;
+        while (read_one(f, r)) {
+            chunk_bytes += sizeof(record) + r.seq.size();
+            chunk.push_back(std::move(r));
+            r.seq.clear();
+            if (chunk_bytes >= mem_cap) { sort_chunk(); spill_chunk(); }
+        }
+        if (run_paths.empty()) {
+            // Whole bucket fit in RAM: sort + emit, no temp files.
+            sort_chunk();
+            for (auto const& rec : chunk) emit(rec.cid, std::string_view(rec.seq));
+            return;
+        }
+        if (!chunk.empty()) { sort_chunk(); spill_chunk(); }  // final partial run
+
+        // Pass 2: k-way merge the sorted runs. One record per run resident +
+        // a heap -- bounded by (#runs * one record). #runs = bucket/mem_cap.
+        struct cursor {
+            std::FILE* fp;
+            record cur;
+            bool live;
+        };
+        std::vector<cursor> cur(run_paths.size());
+        for (size_t i = 0; i < run_paths.size(); ++i) {
+            cur[i].fp = std::fopen(run_paths[i].c_str(), "rb");
+            if (!cur[i].fp) throw std::runtime_error("cannot reopen run: " + run_paths[i]);
+            cur[i].live = read_one(cur[i].fp, cur[i].cur);
+        }
+        // Min-heap of run indices by current cid.
+        auto worse = [&](size_t a, size_t c) { return cur[a].cur.cid > cur[c].cur.cid; };
+        std::vector<size_t> heap;
+        heap.reserve(cur.size());
+        for (size_t i = 0; i < cur.size(); ++i)
+            if (cur[i].live) heap.push_back(i);
+        std::make_heap(heap.begin(), heap.end(), worse);
+        while (!heap.empty()) {
+            std::pop_heap(heap.begin(), heap.end(), worse);
+            size_t i = heap.back();
+            heap.pop_back();
+            emit(cur[i].cur.cid, std::string_view(cur[i].cur.seq));
+            if (read_one(cur[i].fp, cur[i].cur)) {
+                heap.push_back(i);
+                std::push_heap(heap.begin(), heap.end(), worse);
+            }
+        }
+        for (size_t i = 0; i < cur.size(); ++i) {
+            if (cur[i].fp) std::fclose(cur[i].fp);
+            std::error_code ec;
+            std::filesystem::remove(run_paths[i], ec);
         }
     }
 
@@ -231,23 +341,34 @@ public:
 
     void operator()(stitchable_unitig&& u) {
         std::lock_guard<std::mutex> lk(m_mu);
-        const uint64_t cid = u.cid;
         const uint8_t flags = u.open_flags;
+        const uint32_t nruns = (uint32_t)u.runs.size();
         const uint32_t seq_len = (uint32_t)u.seq.size();
-        if (std::fwrite(&cid, sizeof(cid), 1, m_file) != 1 ||
-            std::fwrite(&flags, sizeof(flags), 1, m_file) != 1 ||
-            std::fwrite(&seq_len, sizeof(seq_len), 1, m_file) != 1)
+        if (std::fwrite(&flags, sizeof(flags), 1, m_file) != 1 ||
+            std::fwrite(&nruns, sizeof(nruns), 1, m_file) != 1)
+            throw std::runtime_error("short write to " + m_path);
+        for (auto const& r : u.runs) {
+            if (std::fwrite(&r.cid, sizeof(r.cid), 1, m_file) != 1 ||
+                std::fwrite(&r.num_kmers, sizeof(r.num_kmers), 1, m_file) != 1)
+                throw std::runtime_error("short write to " + m_path);
+        }
+        if (std::fwrite(&seq_len, sizeof(seq_len), 1, m_file) != 1)
             throw std::runtime_error("short write to " + m_path);
         if (seq_len > 0 &&
             std::fwrite(u.seq.data(), 1, seq_len, m_file) != (size_t)seq_len)
             throw std::runtime_error("short write to " + m_path);
         ++m_count;
+        m_total_seq_bytes += seq_len;
         // Free the merged seq's backing storage in place: the caller
         // already moved into us.
         std::string().swap(u.seq);
     }
 
     uint64_t count() const { return m_count; }
+    // Total raw seq bytes across all fragments written. Lets the stitch
+    // size its bucket count without an index-walk over the spill (the old
+    // O(num_fragments) frag_unitig_reader index).
+    uint64_t total_seq_bytes() const { return m_total_seq_bytes; }
     std::string const& path() const { return m_path; }
 
     // Close the writer side. Call before reads.
@@ -269,22 +390,32 @@ public:
         std::FILE* f = std::fopen(m_path.c_str(), "rb");
         if (!f) throw std::runtime_error("cannot reopen frag spill: " + m_path);
         for (;;) {
-            uint32_t cid = 0;
-            size_t got = std::fread(&cid, sizeof(cid), 1, f);
+            uint8_t flags = 0;
+            size_t got = std::fread(&flags, sizeof(flags), 1, f);
             if (got != 1) {
                 if (std::feof(f)) break;
                 std::fclose(f);
-                throw std::runtime_error("short read of cid from " + m_path);
+                throw std::runtime_error("short read of flags from " + m_path);
             }
-            uint8_t flags = 0;
-            uint32_t seq_len = 0;
-            if (std::fread(&flags, sizeof(flags), 1, f) != 1 ||
-                std::fread(&seq_len, sizeof(seq_len), 1, f) != 1) {
+            uint32_t nruns = 0;
+            if (std::fread(&nruns, sizeof(nruns), 1, f) != 1) {
                 std::fclose(f);
-                throw std::runtime_error("short read of header from " + m_path);
+                throw std::runtime_error("short read of nruns from " + m_path);
             }
             stitchable_unitig u;
-            u.cid = cid;
+            u.runs.resize(nruns);
+            for (uint32_t r = 0; r < nruns; ++r) {
+                if (std::fread(&u.runs[r].cid, sizeof(uint64_t), 1, f) != 1 ||
+                    std::fread(&u.runs[r].num_kmers, sizeof(uint32_t), 1, f) != 1) {
+                    std::fclose(f);
+                    throw std::runtime_error("short read of run from " + m_path);
+                }
+            }
+            uint32_t seq_len = 0;
+            if (std::fread(&seq_len, sizeof(seq_len), 1, f) != 1) {
+                std::fclose(f);
+                throw std::runtime_error("short read of seq_len from " + m_path);
+            }
             u.open_flags = flags;
             u.seq.resize(seq_len);
             if (seq_len > 0 &&
@@ -309,125 +440,72 @@ private:
     std::FILE* m_file = nullptr;
     std::mutex m_mu;
     uint64_t m_count = 0;
+    uint64_t m_total_seq_bytes = 0;
 };
 
 // ----------------------------------------------------------------------------
-// mmap-backed read-only view over a frag_unitig_writer's spill file.
-// Builds an in-memory index of (cid, open_flags, seq_offset, seq_len) per
-// fragment and mmaps the file so seq bytes are accessible as
-// std::string_view directly into the kernel page cache. With this, stitch
-// can run without ever loading all fragment seqs into RAM as
-// std::string's: the OS pages in seq bytes on demand and reclaims them
-// under memory pressure.
+// Streaming (no-index) reader over a frag_unitig_writer's spill file.
 //
-// Memory cost: ~24 B per fragment for the index; for 26.6 M fragments
-// that's ~640 MB (vs ~2.8 GB for an in-memory std::vector<stitchable_unitig>
-// at the same scale). Mmap pages don't count toward RSS until accessed
-// and dirty pages aren't ours -- the kernel can evict file-backed read-
-// only pages without involving us.
+// The stitch seeds round 0 by reading every fragment exactly once, in order,
+// and nothing afterward revisits the original spill (later rounds live in the
+// round_store). So the random-access frag_unitig_reader index -- a
+// std::vector<entry> at 24 B/fragment, ~137 GB at 5.7e9 fragments, the last
+// O(num_fragments) in-RAM structure in the stitch -- is pure overhead in
+// production. This reader keeps only ONE fragment resident: a pull `next()`
+// decodes the next record into reused buffers. Peak RAM is one fragment, not
+// num_fragments.
 //
-// Used by the stitch phase via the templated stitch_unitigs_streaming.
-// frag_unitig_reader satisfies the Source interface (size / cid /
-// open_flags / seq_view).
-
-class frag_unitig_reader {
+// It deliberately does NOT satisfy the random-access Source interface (size /
+// runs(i) / seq_view(i)); it exposes a pull `next(open_flags, runs, seq)` that
+// the stitch's streaming seed path consumes. Record format matches
+// frag_unitig_writer exactly:
+//   [u8 flags][u32 nruns][nruns x (u64 cid + u32 num_kmers)][u32 seq_len][seq]
+class frag_unitig_stream_reader {
 public:
-    explicit frag_unitig_reader(std::string path) : m_path(std::move(path)) {
-        m_fd = ::open(m_path.c_str(), O_RDONLY);
-        if (m_fd < 0)
-            throw std::runtime_error("open failed for frag spill: " + m_path + ": " +
-                                     std::strerror(errno));
-        struct stat st;
-        if (::fstat(m_fd, &st) < 0) {
-            ::close(m_fd);
-            throw std::runtime_error("fstat failed on " + m_path);
-        }
-        m_mmap_size = (size_t)st.st_size;
-        if (m_mmap_size > 0) {
-            void* p = ::mmap(nullptr, m_mmap_size, PROT_READ, MAP_PRIVATE, m_fd, 0);
-            if (p == MAP_FAILED) {
-                ::close(m_fd);
-                throw std::runtime_error("mmap failed on " + m_path);
-            }
-            m_mmap_base = (uint8_t const*)p;
-            // Walk_chain accesses fragments in chain order, which has
-            // no spatial locality with the on-disk layout. MADV_RANDOM
-            // tells the kernel to stop prefetching surrounding pages
-            // and to reclaim resident pages more aggressively under
-            // memory pressure -- both reduce stitch-phase peak RSS.
-            ::madvise((void*)m_mmap_base, m_mmap_size, MADV_RANDOM);
-        }
-        // Walk the file once to populate the index. Records are
-        // [u32 cid][u8 flags][u32 seq_len][seq_len bytes]. Sequential
-        // access -- kernel readahead handles the I/O cost.
-        size_t off = 0;
-        while (off < m_mmap_size) {
-            if (off + 8 + 1 + 4 > m_mmap_size)
-                throw std::runtime_error("truncated frag spill header in " + m_path);
-            uint64_t cid;
-            std::memcpy(&cid, m_mmap_base + off, 8);
-            off += 8;
-            uint8_t flags = m_mmap_base[off];
-            off += 1;
-            uint32_t seq_len;
-            std::memcpy(&seq_len, m_mmap_base + off, 4);
-            off += 4;
-            if (off + seq_len > m_mmap_size)
-                throw std::runtime_error("truncated frag spill seq in " + m_path);
-            if (seq_len > MAX_SEQ_LEN)
-                throw std::runtime_error("seq_len exceeds 30-bit cap in " + m_path);
-            entry e;
-            e.cid = cid;
-            e.flags_and_len = ((uint32_t)flags << 30) | (seq_len & MAX_SEQ_LEN);
-            e.seq_offset = off;
-            m_entries.push_back(e);
-            off += seq_len;
-        }
+    explicit frag_unitig_stream_reader(std::string path) : m_path(std::move(path)) {
+        m_file = std::fopen(m_path.c_str(), "rb");
+        if (!m_file) throw std::runtime_error("cannot open frag spill: " + m_path);
     }
-
-    ~frag_unitig_reader() {
-        if (m_mmap_base) {
-            ::munmap((void*)m_mmap_base, m_mmap_size);
-        }
-        if (m_fd >= 0) {
-            ::close(m_fd);
-        }
+    ~frag_unitig_stream_reader() {
+        if (m_file) std::fclose(m_file);
     }
+    frag_unitig_stream_reader(frag_unitig_stream_reader const&) = delete;
+    frag_unitig_stream_reader& operator=(frag_unitig_stream_reader const&) = delete;
 
-    frag_unitig_reader(frag_unitig_reader const&) = delete;
-    frag_unitig_reader& operator=(frag_unitig_reader const&) = delete;
-
-    // Source interface for stitch_unitigs_streaming.
-    size_t size() const { return m_entries.size(); }
-    uint64_t cid(size_t i) const { return m_entries[i].cid; }
-    uint8_t open_flags(size_t i) const {
-        return (uint8_t)(m_entries[i].flags_and_len >> 30);
-    }
-    std::string_view seq_view(size_t i) const {
-        auto const& e = m_entries[i];
-        return std::string_view((char const*)m_mmap_base + e.seq_offset,
-                                e.flags_and_len & MAX_SEQ_LEN);
+    // Decode the next fragment into the caller's buffers. Returns false at EOF.
+    // `runs` and `seq` are resized to this fragment's contents (capacity reused
+    // across calls, so steady-state is alloc-free).
+    bool next(uint8_t& open_flags, std::vector<color_run>& runs, std::string& seq) {
+        uint8_t flags = 0;
+        size_t got = std::fread(&flags, sizeof(flags), 1, m_file);
+        if (got != 1) {
+            if (std::feof(m_file)) return false;
+            throw std::runtime_error("short read of flags from " + m_path);
+        }
+        uint32_t nruns = 0;
+        if (std::fread(&nruns, sizeof(nruns), 1, m_file) != 1)
+            throw std::runtime_error("short read of nruns from " + m_path);
+        runs.resize(nruns);
+        for (uint32_t r = 0; r < nruns; ++r) {
+            if (std::fread(&runs[r].cid, sizeof(uint64_t), 1, m_file) != 1 ||
+                std::fread(&runs[r].num_kmers, sizeof(uint32_t), 1, m_file) != 1)
+                throw std::runtime_error("short read of run from " + m_path);
+        }
+        uint32_t seq_len = 0;
+        if (std::fread(&seq_len, sizeof(seq_len), 1, m_file) != 1)
+            throw std::runtime_error("short read of seq_len from " + m_path);
+        open_flags = flags;
+        seq.resize(seq_len);
+        if (seq_len > 0 &&
+            std::fread(seq.data(), 1, seq_len, m_file) != (size_t)seq_len)
+            throw std::runtime_error("short read of seq from " + m_path);
+        return true;
     }
 
 private:
-    // 24-byte entry: cid (8) + flags-and-len (4: 2 bits flags + 30 bits
-    // seq_len) + seq_offset (8), padded to 24. cid widened to 64-bit to
-    // support >4.29e9 color classes; costs +8 B/fragment of index RAM
-    // (e.g. ~46 GB extra at 5.7e9 fragments) -- revisit if the
-    // external-memory stitch redesign changes the reader.
-    static constexpr uint32_t MAX_SEQ_LEN = (1u << 30) - 1;
-    struct entry {
-        uint64_t cid;
-        uint32_t flags_and_len;  // top 2 bits: open_flags; bottom 30 bits: seq_len
-        uint64_t seq_offset;
-    };
-    static_assert(sizeof(entry) == 24, "frag_unitig_reader::entry must be 24 bytes");
-
     std::string m_path;
-    int m_fd = -1;
-    uint8_t const* m_mmap_base = nullptr;
-    size_t m_mmap_size = 0;
-    std::vector<entry> m_entries;
+    std::FILE* m_file = nullptr;
 };
 
-}  // namespace cdgb
+
+}  // namespace cdbg

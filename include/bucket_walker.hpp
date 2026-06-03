@@ -20,6 +20,7 @@
 #include <atomic>
 #include <cstdint>
 #include <iostream>
+#include <condition_variable>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -34,7 +35,7 @@
 #include "super_kmer.hpp"
 #include "util.hpp"
 
-namespace cdgb {
+namespace cdbg {
 
 // Per-k-mer color accumulator. We don't store raw colors here. Instead,
 // each bucket maintains a `record_sets` compact_color_set_dict that
@@ -72,26 +73,81 @@ struct kmer_entry {
 inline constexpr uint8_t UNITIG_OPEN_LEFT = 1u << 0;
 inline constexpr uint8_t UNITIG_OPEN_RIGHT = 1u << 1;
 
+// A run of consecutive k-mers along a tig that share one color class.
+// num_kmers counts k-mers (a length-L tig of L = seq.size()-k+1 k-mers has
+// runs summing to L). This is the RLE color sequence GGCAT carries on a
+// topological unitig (UnitigColorData); the monochromatic split at emit
+// time cuts a tig at its run boundaries.
+//
+// INVARIANT: sum of num_kmers over a tig's runs == its seq k-mer count. Every
+// k-mer carries exactly one run unit, INCLUDING a foreign boundary k-mer at an
+// open end (whose color is owned by the adjacent bucket): it gets a run with
+// cid == COLOR_RUN_FOREIGN as a placeholder so seq and runs stay aligned. The
+// stitch reconciles that placeholder to the real color when the open end joins
+// its primary-side partner (ext_concat_runs); a fully closed (sunk) tig has had
+// every boundary joined, so it contains no foreign placeholders.
+inline constexpr uint64_t COLOR_RUN_FOREIGN = UINT64_MAX;
+struct color_run {
+    uint64_t cid;        // local during process_bucket, global after remap
+    uint32_t num_kmers;  // number of k-mers covered by this run (>= 1)
+};
+
 struct stitchable_unitig {
     std::string seq;  // ACGT characters
-    // Color-class id. While process_bucket is emitting unitigs, this is
-    // a *local* cid into that bucket's local_dict; process_buckets then
-    // remaps it to a global cid as it merges each bucket's local_dict
-    // into the shared global streaming_color_set_dict. By the time stitch_unitigs
-    // and the FASTA emitter run, all cids are global.
-    uint64_t cid = UINT64_MAX;
+    // Colorless/topological tig: extension follows graph topology only
+    // (GGCAT hashmap.rs:230), never breaking on color. The per-k-mer color
+    // classes ride along as an RLE run sequence, joined at each stitch merge
+    // and cut into monochromatic unitigs at emit. `runs` covers exactly the
+    // tig's k-mers in 5'->3' order; while process_bucket emits, the cids are
+    // *local* (into the bucket's local_dict) and process_buckets remaps each
+    // to a global cid. For a monochromatic tig `runs` has a single element.
+    std::vector<color_run> runs;
     uint8_t open_flags = 0;  // bits from UNITIG_OPEN_*
+
+    // Convenience: a freshly walked or post-split tig is monochromatic.
+    uint64_t mono_cid() const { return runs.empty() ? UINT64_MAX : runs.front().cid; }
+    // Set a single color run covering all of this tig's k-mers (seq must
+    // already be assigned). Used by tests that build monochromatic frags.
+    void set_mono(uint64_t cid, uint32_t k) {
+        uint32_t nk = (seq.size() >= k) ? (uint32_t)(seq.size() - k + 1) : 1;
+        runs.assign(1, color_run{cid, nk});
+    }
 };
 
 namespace detail {
 
-// Per-canonical-k-mer flags for phantom edges, in canonical orientation.
-inline constexpr uint8_t KMER_PHANTOM_LEFT = 1u << 0;   // phantom predecessor exists
-inline constexpr uint8_t KMER_PHANTOM_RIGHT = 1u << 1;  // phantom successor exists
+// Per-canonical-k-mer cross-bucket boundary flags (GGCAT hashmap.rs:382-398),
+// accumulated (OR) over every super-k-mer occurrence of the k-mer in this
+// bucket. bit0 marks a boundary on the k-mer's canonical-LEFT side, bit1 on its
+// canonical-RIGHT side. With k-base super overlap a boundary k-mer is the LAST
+// k-mer of one super (end-ignored) and the FIRST of the next (begin-ignored);
+// those occurrences set the corresponding side bit.
+inline constexpr uint8_t KMER_BOUND_LEFT = 1u << 0;
+inline constexpr uint8_t KMER_BOUND_RIGHT = 1u << 1;
+
+// A k-mer is a cross-bucket contig boundary iff EXACTLY one side bit is set
+// (flags == 1 or == 2): the unitig ends there and continues into the adjacent
+// bucket, so that end is emitted OPEN with the full boundary k-mer included for
+// the stitch to match. flags == 3 (both sides, e.g. a length-1 super shared on
+// both ends) is NOT a break -- the k-mer is walked THROUGH as interior; flags
+// == 0 is a plain interior k-mer. (GGCAT hashmap.rs:291-292.)
+inline bool is_contig_break(uint8_t flags) {
+    return flags == KMER_BOUND_LEFT || flags == KMER_BOUND_RIGHT;
+}
 
 struct bucket_kmer_info {
     kmer_entry colors;
-    uint8_t phantom = 0;
+    uint8_t flags = 0;
+    // GGCAT primary/foreign distinction. A canonical k-mer is PRIMARY in the
+    // bucket of its own minimizer, where every occurrence routes that is not a
+    // begin-ignored overlap copy; there it is colored (full union over all its
+    // occurrences/genomes) and walk-seeded. In an ADJACENT bucket it appears
+    // only as the begin-ignored idx-0 overlap copy of the next super -- FOREIGN:
+    // a node (for the walk to find the boundary and carry the full k-mer at an
+    // open end) but NOT colored and NOT seeded. At a stitch join the primary
+    // side's colored copy is kept and the foreign side's copy is dropped, so the
+    // boundary k-mer is colored exactly once with its union color.
+    bool primary = false;
 };
 
 using bucket_kmer_map = ankerl::unordered_dense::map<kmer_int_t, bucket_kmer_info, kmer_hasher>;
@@ -129,47 +185,63 @@ inline void load_bucket(std::string const& path, uint32_t k, bucket_kmer_map& ou
             rc = (rc >> 2) | ((kmer_int_t)(v ^ 3) << k_minus_1_x2);
         }
 
-        kmer_int_t first_can = 0, last_can = 0;
-        bool first_is_fwd = true, last_is_fwd = true;
-        bool have_first = false;
+        // GGCAT per-k-mer boundary flags (hashmap.rs:382-398). A k-mer is
+        // begin-ignored if it is the super's FIRST k-mer (idx 0) and the super
+        // does not begin an ACGT run (IS_ACGT_BEGIN clear) -- i.e. it is the
+        // overlap k-mer duplicated from the predecessor super in the adjacent
+        // bucket. Symmetrically end-ignored is the LAST k-mer of a super whose
+        // run does not end here. Each contributes a side bit oriented to the
+        // k-mer's canonical frame: a forward (canonical) k-mer's begin is its
+        // LEFT side and its end is its RIGHT; a reverse-canonical k-mer's are
+        // swapped (GGCAT's `<< (!is_forward)` / `<< is_forward`). Every k-mer --
+        // boundary or not -- is inserted and colored uniformly; the flag, not a
+        // separate node class, marks the cross-bucket boundary, and the same
+        // boundary k-mer is present (and colored) in BOTH adjacent buckets, the
+        // stitch reconciling the two copies on the full-k-mer key.
+        const bool begin_incl = (flags & SK_FLAG_IS_ACGT_BEGIN) != 0;
+        const bool end_incl = (flags & SK_FLAG_IS_ACGT_END) != 0;
+        const bool owns_first = (flags & SK_FLAG_OWNS_FIRST) != 0;
+        const bool owns_last = (flags & SK_FLAG_OWNS_LAST) != 0;
+        const uint32_t n_kmers = (uint32_t)(bases.size() - (k - 1));
+        const uint32_t last_idx = n_kmers - 1;
 
-        for (uint32_t i = k - 1; i < bases.size(); ++i) {
+        uint32_t idx = 0;
+        for (uint32_t i = k - 1; i < bases.size(); ++i, ++idx) {
             uint8_t v = bases[i];
             fwd = ((fwd << 2) | v) & mask;
             rc = (rc >> 2) | ((kmer_int_t)(v ^ 3) << k_minus_1_x2);
             bool is_fwd = (fwd <= rc);
             kmer_int_t can = is_fwd ? fwd : rc;
-            out[can].colors.add(rsid);
-            if (!have_first) {
-                first_can = can;
-                first_is_fwd = is_fwd;
-                have_first = true;
-            }
-            last_can = can;
-            last_is_fwd = is_fwd;
-        }
-        if (!have_first) continue;
 
-        // Boundary phantom edges. The super-k-mer's first k-mer (in input
-        // order) has a predecessor in another bucket iff IS_ACGT_BEGIN is
-        // not set. Likewise the last k-mer for IS_ACGT_END.
-        if ((flags & SK_FLAG_IS_ACGT_BEGIN) == 0) {
-            // The phantom edge enters first_kmer's input "back" side.
-            // In canonical orientation: input-back maps to canonical-left if
-            // input == canonical, else canonical-right.
-            uint8_t bit = first_is_fwd ? KMER_PHANTOM_LEFT : KMER_PHANTOM_RIGHT;
-            out[first_can].phantom |= bit;
-        }
-        if ((flags & SK_FLAG_IS_ACGT_END) == 0) {
-            // Phantom edge exits last_kmer on its input "fwd" side.
-            uint8_t bit = last_is_fwd ? KMER_PHANTOM_RIGHT : KMER_PHANTOM_LEFT;
-            out[last_can].phantom |= bit;
+            uint8_t contrib = 0;
+            if (!begin_incl && idx == 0) contrib |= is_fwd ? KMER_BOUND_LEFT : KMER_BOUND_RIGHT;
+            if (!end_incl && idx == last_idx) contrib |= is_fwd ? KMER_BOUND_RIGHT : KMER_BOUND_LEFT;
+
+            bucket_kmer_info& info = out[can];
+            info.flags |= contrib;
+            // Color (mark primary) this occurrence iff THIS bucket owns the
+            // k-mer (BCALM2: the boundary k-mer is colored in bucket(min(lmin,
+            // rmin)) only). Interior k-mers (neither first nor last) are always
+            // owned -- they are not cross-bucket boundaries. The first/last
+            // k-mers are owned per the SK_FLAG_OWNS_* bits set at ingest. This
+            // makes each k-mer primary in EXACTLY one bucket, so its color is the
+            // full union over its occurrences there (no partial-color split).
+            const bool is_first = (idx == 0);
+            const bool is_last = (idx == last_idx);
+            bool owned = true;
+            if (is_first && !owns_first) owned = false;
+            if (is_last && !owns_last) owned = false;
+            if (owned) {
+                info.colors.add(rsid);
+                info.primary = true;
+            }
         }
     }
 }
 
 // 8-bit local extension mask, bits 0..3 = forward-side successors of `can`,
 // bits 4..7 = back-side predecessors (= forward-side successors of rc(can)).
+// Counts EVERY neighbor present in the map (owned or ignored).
 inline uint8_t local_ext_mask(kmer_int_t can, uint32_t k, bucket_kmer_map const& m) {
     uint8_t out = 0;
     kmer_int_t fwd = can;
@@ -188,12 +260,18 @@ inline uint8_t local_ext_mask(kmer_int_t can, uint32_t k, bucket_kmer_map const&
 inline uint8_t fwd_nibble(uint8_t m, bool rc) { return (uint8_t)((rc ? (m >> 4) : m) & 0xf); }
 inline uint8_t back_nibble(uint8_t m, bool rc) { return (uint8_t)((rc ? m : (m >> 4)) & 0xf); }
 
-// Phantom on the forward / back side in walking orientation.
-inline bool phantom_on_fwd(uint8_t phantom, bool rc) {
-    return rc ? (phantom & KMER_PHANTOM_LEFT) : (phantom & KMER_PHANTOM_RIGHT);
+// Local degree of `can` (walking orientation `rc`) on the forward / back side.
+// Counts neighbours present in THIS bucket; a cross-bucket boundary edge is not
+// counted (its partner lives in the adjacent bucket). Used to distinguish a
+// genuine cross-bucket simple-path boundary (this-side local degree <= 1, so the
+// only continuation crosses buckets -> emit OPEN) from a k-mer that is BOTH a
+// cross-bucket boundary AND a local branch (this-side local degree >= 2 -> a real
+// branch; must be CLOSED, not stitched, or the stitch joins past the branch).
+inline int local_fwd_degree(kmer_int_t can, bool rc, uint32_t k, bucket_kmer_map const& m) {
+    return __builtin_popcount(fwd_nibble(local_ext_mask(can, k, m), rc));
 }
-inline bool phantom_on_back(uint8_t phantom, bool rc) {
-    return rc ? (phantom & KMER_PHANTOM_RIGHT) : (phantom & KMER_PHANTOM_LEFT);
+inline int local_back_degree(kmer_int_t can, bool rc, uint32_t k, bucket_kmer_map const& m) {
+    return __builtin_popcount(back_nibble(local_ext_mask(can, k, m), rc));
 }
 
 struct b_step {
@@ -215,46 +293,31 @@ inline b_step bstep(kmer_int_t can, bool rc, uint32_t k, uint8_t nt) {
     return r;
 }
 
-// Returns true iff (can, rc) is the start of a maximal monochromatic
-// unitig (no straight-line predecessor in walking orientation, considering
-// both local and phantom edges + color-set agreement). Also reports whether
-// the back-side reason for being a left-end was a phantom-only edge — that
-// makes the resulting unitig OPEN_LEFT.
-struct left_end_check {
-    bool is_left_end;
-    bool back_is_phantom_only;  // true => unitig will be open-left
-};
-inline left_end_check classify_left_end(
-    kmer_int_t can, bool rc, uint32_t cid, uint32_t k, bucket_kmer_map const& m,
-    ankerl::unordered_dense::map<kmer_int_t, uint32_t, kmer_hasher> const& cid_of) {
-    auto it = m.find(can);
-    uint8_t phantom = it->second.phantom;
+// One clean unitig extension step from (can, rc) in walking orientation.
+// `forward` picks the forward side (else the back side). A step is clean iff
+// this side has exactly ONE present neighbor (GGCAT count==1) AND that neighbor
+// has exactly one present neighbor facing back toward us (ocount==1, no incoming
+// branch). Returns false (no extension) otherwise. Boundary flags are NOT
+// consulted here -- the caller stops at a contig-break k-mer after stepping.
+inline bool walk_step(kmer_int_t can, bool rc, bool forward, uint32_t k,
+                      bucket_kmer_map const& m, b_step& out) {
     uint8_t mask = local_ext_mask(can, k, m);
-    uint8_t back = back_nibble(mask, rc);
-    int local_back_n = __builtin_popcount(back);
-    int phantom_back_n = phantom_on_back(phantom, rc) ? 1 : 0;
-    int total_back = local_back_n + phantom_back_n;
-    if (total_back != 1) return {true, false};
-    if (local_back_n == 0) {
-        // Only edge is phantom: this is a left-end and the unitig is open.
-        return {true, true};
+    uint8_t nib = forward ? fwd_nibble(mask, rc) : back_nibble(mask, rc);
+    if (__builtin_popcount(nib) != 1) return false;
+    uint8_t nt = (uint8_t)__builtin_ctz(nib);
+    b_step s;
+    if (forward) {
+        s = bstep(can, rc, k, nt);
+    } else {
+        s = bstep(can, !rc, k, nt);
+        s.next_rc = !s.next_rc;
     }
-    // total_back == 1 and edge is local. Walk to predecessor and check that
-    // *its* forward in walking orientation is also degree 1 and color matches.
-    uint8_t nt = (uint8_t)__builtin_ctz(back);
-    auto sr = bstep(can, !rc, k, nt);
-    kmer_int_t pred_can = sr.next_can;
-    bool pred_rc = !sr.next_rc;
-    auto pit = m.find(pred_can);
-    if (pit == m.end()) return {true, false};  // shouldn't happen: local_back_n said it does
-    uint8_t pred_phantom = pit->second.phantom;
-    uint8_t pred_mask = local_ext_mask(pred_can, k, m);
-    int pred_local_fwd = __builtin_popcount(fwd_nibble(pred_mask, pred_rc));
-    int pred_phantom_fwd = phantom_on_fwd(pred_phantom, pred_rc) ? 1 : 0;
-    if (pred_local_fwd + pred_phantom_fwd != 1) return {true, false};
-    auto cit = cid_of.find(pred_can);
-    if (cit == cid_of.end() || cit->second != cid) return {true, false};
-    return {false, false};
+    // The neighbor's count on the side facing back toward `can` must be 1.
+    uint8_t nmask = local_ext_mask(s.next_can, k, m);
+    uint8_t facing = forward ? back_nibble(nmask, s.next_rc) : fwd_nibble(nmask, s.next_rc);
+    if (__builtin_popcount(facing) != 1) return false;
+    out = s;
+    return true;
 }
 
 inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_colors,
@@ -308,6 +371,11 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
         std::vector<uint32_t> rsids_scratch;
         std::vector<uint32_t> merged_scratch;
         for (auto& kv : kmer_info) {
+            // Only PRIMARY k-mers carry color (an rsid); foreign overlap copies
+            // have no rsid and get no cid -- their colored copy lives in the
+            // adjacent bucket. Skipping them also avoids indexing rsid_to_cid
+            // with NO_RSID. The walk never reads cid_of for a foreign k-mer.
+            if (!kv.second.primary) continue;
             kmer_entry& e = kv.second.colors;
             uint32_t cid;
             if (e.rest.empty()) {
@@ -348,82 +416,135 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
     ankerl::unordered_dense::map<kmer_int_t, uint8_t, kmer_hasher> visited;
     visited.reserve(kmer_info.size());
 
-    auto extend_and_emit = [&](kmer_int_t start_can, bool start_rc, uint32_t cid, bool open_left) {
-        stitchable_unitig u;
-        kmer_int_t cur = start_rc ? reverse_complement(start_can, k) : start_can;
-        u.seq = kmer_to_string(cur, k);
-        // Local cid; process_buckets remaps to global after merging the
-        // local_dict into the shared global dict. The actual color list
-        // lives in out_local_dict and is moved into the global dict
-        // there -- we never copy a color vector into the unitig.
-        u.cid = cid;
-        if (open_left) u.open_flags |= UNITIG_OPEN_LEFT;
+    // Append one k-mer's cid to the RLE run sequence, merging with the back
+    // run if equal. This is GGCAT's extend_forward (colors/managers/multiple.rs).
+    auto push_cid = [](std::vector<color_run>& runs, uint64_t cid) {
+        if (!runs.empty() && runs.back().cid == cid)
+            runs.back().num_kmers += 1;
+        else
+            runs.push_back({cid, 1});
+    };
 
-        kmer_int_t can = start_can;
-        bool rc = start_rc;
-        visited[can] = 1;
+    // Walk one maximal unitig containing `seed` (treated in its canonical
+    // forward orientation), extending backward then forward (GGCAT
+    // hashmap.rs:455-545). Degree is uniform over all present neighbors; the
+    // boundary k-mer is INCLUDED at an open end and the walk stops there. A
+    // side is OPEN iff it ended on a cross-bucket contig break (the seed's own
+    // boundary flag, or a contig-break k-mer reached by extension); a side that
+    // ended on a branch / dead-end / cycle is CLOSED.
+    auto emit_from_seed = [&](kmer_int_t seed) {
+        visited[seed] = 1;
+        const uint8_t sflags = kmer_info.find(seed)->second.flags;
 
-        for (;;) {
-            auto it = kmer_info.find(can);
-            uint8_t phantom = it->second.phantom;
-            uint8_t mask = local_ext_mask(can, k, kmer_info);
-            uint8_t fwd_n = fwd_nibble(mask, rc);
-            int local_fwd = __builtin_popcount(fwd_n);
-            int phantom_fwd = phantom_on_fwd(phantom, rc) ? 1 : 0;
-            if (local_fwd + phantom_fwd != 1) break;  // closed (branch / dead end)
-            if (local_fwd == 0) {                     // open right
-                u.open_flags |= UNITIG_OPEN_RIGHT;
-                break;
+        // Step lists in walking orientation. `bw` is nearest-first (it is later
+        // reversed so the unitig reads left->right); `fw` is in order.
+        std::vector<std::pair<kmer_int_t, bool>> bw, fw;
+        bool open_left = false, open_right = false;
+
+        // A boundary k-mer should be emitted OPEN (for cross-bucket stitching)
+        // ONLY when its local degree on the boundary side is <= 1: then the
+        // single continuation truly crosses into the adjacent bucket. If the
+        // boundary side also has >= 2 local neighbours, the k-mer is a genuine
+        // branch and must be CLOSED -- otherwise the stitch joins one local
+        // branch arm past the branch point (the strict-topology internal-branch
+        // failures on tandem-repeat k-mers).
+        // Backward. Seed shortcut: if the seed itself is a left boundary it is
+        // the open-left end already -- do not extend back (subject to the
+        // degree guard above).
+        if (sflags == KMER_BOUND_LEFT) {
+            open_left = (local_back_degree(seed, false, k, kmer_info) <= 1);
+        } else {
+            kmer_int_t can = seed;
+            bool rc = false;
+            for (;;) {
+                b_step s;
+                if (!walk_step(can, rc, /*forward=*/false, k, kmer_info, s)) break;  // closed
+                if (visited.find(s.next_can) != visited.end()) break;                // cycle
+                visited[s.next_can] = 1;
+                bw.push_back({s.next_can, s.next_rc});
+                can = s.next_can;
+                rc = s.next_rc;
+                if (is_contig_break(kmer_info.find(can)->second.flags)) {
+                    open_left = (local_back_degree(can, rc, k, kmer_info) <= 1);
+                    break;
+                }
             }
-            uint8_t nt = (uint8_t)__builtin_ctz(fwd_n);
-            auto sr = bstep(can, rc, k, nt);
-            // Successor must (a) have back-side degree exactly 1 in walking
-            // orientation (no incoming branch) and (b) carry the same cid.
-            auto nit = kmer_info.find(sr.next_can);
-            if (nit == kmer_info.end()) break;
-            uint8_t next_phantom = nit->second.phantom;
-            uint8_t next_mask = local_ext_mask(sr.next_can, k, kmer_info);
-            int next_local_back = __builtin_popcount(back_nibble(next_mask, sr.next_rc));
-            int next_phantom_back = phantom_on_back(next_phantom, sr.next_rc) ? 1 : 0;
-            if (next_local_back + next_phantom_back != 1) break;
-            if (cid_of[sr.next_can] != cid) break;
-            if (visited.find(sr.next_can) != visited.end()) break;  // cycle closure
-            visited[sr.next_can] = 1;
-            u.seq.push_back(twobit_to_nuc(nt));
-            can = sr.next_can;
-            rc = sr.next_rc;
         }
+
+        // Forward. Symmetric seed shortcut for a right boundary.
+        if (sflags == KMER_BOUND_RIGHT) {
+            open_right = (local_fwd_degree(seed, false, k, kmer_info) <= 1);
+        } else {
+            kmer_int_t can = seed;
+            bool rc = false;
+            for (;;) {
+                b_step s;
+                if (!walk_step(can, rc, /*forward=*/true, k, kmer_info, s)) break;
+                if (visited.find(s.next_can) != visited.end()) break;
+                visited[s.next_can] = 1;
+                fw.push_back({s.next_can, s.next_rc});
+                can = s.next_can;
+                rc = s.next_rc;
+                if (is_contig_break(kmer_info.find(can)->second.flags)) {
+                    open_right = (local_fwd_degree(can, rc, k, kmer_info) <= 1);
+                    break;
+                }
+            }
+        }
+
+        // Assemble left->right: reverse(bw), seed, fw. Consecutive entries are
+        // forward dBG edges (overlap k-1), so the sequence appends one base per
+        // step and the cid RLE pushes one run element per k-mer.
+        stitchable_unitig u;
+        auto walk_kmer = [&](std::pair<kmer_int_t, bool> const& p) -> kmer_int_t {
+            return p.second ? reverse_complement(p.first, k) : p.first;
+        };
+        bool first = true;
+        auto append_kmer = [&](std::pair<kmer_int_t, bool> const& p) {
+            if (first) {
+                u.seq = kmer_to_string(walk_kmer(p), k);
+                first = false;
+            } else {
+                u.seq.push_back(twobit_to_nuc((uint8_t)(walk_kmer(p) & 3)));
+            }
+            // Every k-mer gets exactly one run unit so sum(runs)==seq k-mers.
+            // A foreign boundary k-mer (open end, colored by the adjacent
+            // bucket) gets a COLOR_RUN_FOREIGN placeholder; the stitch replaces
+            // it with the real color from the primary-side partner at the join.
+            bool prim = kmer_info.find(p.first)->second.primary;
+            push_cid(u.runs, prim ? cid_of[p.first] : COLOR_RUN_FOREIGN);
+        };
+        for (auto it = bw.rbegin(); it != bw.rend(); ++it) append_kmer(*it);
+        append_kmer({seed, false});
+        for (auto const& p : fw) append_kmer(p);
+
+        if (open_left) u.open_flags |= UNITIG_OPEN_LEFT;
+        if (open_right) u.open_flags |= UNITIG_OPEN_RIGHT;
         out_local.emplace_back(std::move(u));
     };
 
-    // First pass: start from k-mers that look like a left-end of some unitig.
+    // Seed every k-mer present in this bucket once -- NOT just the color-owned
+    // (primary) ones. Every super-k-mer record in this bucket lives here (it
+    // was written to bucket_of(its own minimizer)), so all of its k-mers must
+    // be walked here; ownership gates COLORING only (an unowned/foreign k-mer
+    // gets a COLOR_RUN_FOREIGN run unit at emit, reconciled by the stitch).
+    //
+    // Gating the seed on `primary` strands degenerate supers that own none of
+    // their k-mers: a short super [F,X] sandwiched between two smaller-
+    // minimizer neighbors has owns_first==owns_last==0 (both k-mers colored in
+    // the adjacent buckets), so neither is primary. It is exactly the bridge
+    // fragment whose open ends are the stitch partners of F (in F's owner
+    // bucket) and X (in X's owner bucket); never walking it leaves both F and X
+    // with a lonely, partnerless open end -- the cross-bucket joins then fail
+    // and unitigs come out fragmented (salmonella-10: 440k unitigs instead of
+    // 87,297). Boundary k-mers are shared between two buckets by construction;
+    // each is seeded in both and emitted as the open end of each side's
+    // fragment, which is precisely what the full-k-mer stitch joins on. The
+    // `visited` set still prevents re-walking within a bucket, so each bucket
+    // emits each of its fragments exactly once.
     for (auto& kv : kmer_info) {
-        kmer_int_t can = kv.first;
-        if (visited.find(can) != visited.end()) continue;
-        uint32_t cid = cid_of[can];
-        // Try both orientations.
-        auto le_f = classify_left_end(can, false, cid, k, kmer_info, cid_of);
-        auto le_r = classify_left_end(can, true, cid, k, kmer_info, cid_of);
-        bool start_rc;
-        bool open_left;
-        if (le_f.is_left_end) {
-            start_rc = false;
-            open_left = le_f.back_is_phantom_only;
-        } else if (le_r.is_left_end) {
-            start_rc = true;
-            open_left = le_r.back_is_phantom_only;
-        } else
-            continue;
-        extend_and_emit(can, start_rc, cid, open_left);
-    }
-
-    // Second pass: anything still unvisited is on a pure cycle inside the
-    // bucket. Pick an arbitrary k-mer to break it; both ends will be CLOSED
-    // (since by definition no left-end exists, but we've torn the cycle).
-    for (auto& kv : kmer_info) {
-        kmer_int_t can = kv.first;
-        if (visited.find(can) != visited.end()) continue;
-        extend_and_emit(can, false, cid_of[can], /*open_left=*/false);
+        if (visited.find(kv.first) != visited.end()) continue;
+        emit_from_seed(kv.first);
     }
     prof.ns_walk.fetch_add(bucket_process_prof::since(t_walk), std::memory_order_relaxed);
     prof.n_unitigs.fetch_add((uint64_t)out_local.size(), std::memory_order_relaxed);
@@ -456,21 +577,79 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
 // production pipeline passes a frag_unitig_writer that streams
 // fragments to disk so the in-RAM accumulator never reaches its
 // multi-GB peak.
+// `mem_budget_bytes` (0 = unbounded) is the TOTAL-RSS target for the phase (a
+// fraction of -g). A worker waits to "admit" its bucket until
+//   carry + reserved_kmer_info + live_color_dict + this_bucket_cost <= target
+// where carry is the RSS at phase start and the color dict is re-read live, so
+// the (monotonically growing) dict is reserved for dynamically rather than
+// left to overflow on top of a static kmer_info budget. All num_threads
+// threads stay alive; under a tight budget FEWER (large) buckets load at once,
+// MORE (small) buckets do -- bounding RAM without ever reducing the user's
+// thread count. One bucket is always allowed even if it alone exceeds the
+// budget (forward progress).
 template <typename Sink>
 inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t num_colors,
                             uint32_t num_threads, Sink&& sink,
                             streaming_color_set_dict& global_dict, std::mutex& global_mu,
-                            std::atomic<uint64_t>* done = nullptr) {
+                            std::atomic<uint64_t>* done = nullptr,
+                            uint64_t mem_budget_bytes = 0) {
     if (num_threads == 0) num_threads = 1;
     const uint32_t B = writer.num_buckets();
     std::atomic<uint32_t> next{0};
     std::vector<std::thread> workers;
     workers.reserve(num_threads);
 
+    // Per-bucket resident WORKING SET as a multiple of the bucket's uncompressed
+    // on-disk bytes. This must cover everything an in-flight bucket holds at its
+    // walk-phase peak, not just kmer_info: kmer_info + cid_of + visited +
+    // bucket_unitigs (emitted fragments) + local_dict. Measured on 100K -g16:
+    // peak/reserved was 1.20x at small buckets and 1.37x at large ones with a
+    // 16x kmer_info-only estimate -> the full working set is ~24x. Under-
+    // reserving here over-admits and busts -g; the live-RSS ceiling below is the
+    // backstop for whatever this still misses (fragment volume is graph-shaped).
+    constexpr double WORKING_SET_OVERHEAD = 24.0;
+    std::mutex mem_mu;
+    std::condition_variable mem_cv;
+    uint64_t mem_in_use = 0;
+    uint32_t mem_n_admitted = 0;  // how many buckets currently admitted
+    // mem_budget_bytes is the TOTAL-RSS target for the phase (a fraction of
+    // -g), NOT a pre-shrunk kmer_info budget. mem_carry = everything resident
+    // at phase start (frag sink, residual heap); the color dict starts ~empty
+    // here and is reserved for separately and LIVE in the predicate below, so
+    // the admission keeps  carry + reserved_working_set + live_dict <= target.
+    const uint64_t mem_carry = (mem_budget_bytes > 0) ? current_rss_bytes() : 0;
+
     auto run = [&]() {
         for (;;) {
             uint32_t b = next.fetch_add(1);
             if (b >= B) break;
+            const uint64_t cost =
+                (uint64_t)(WORKING_SET_OVERHEAD * (double)writer.bucket_unc_bytes(b));
+            // Admission: wait until this bucket fits the budget, or it would be
+            // the only one running (so an oversized bucket never deadlocks).
+            if (mem_budget_bytes > 0) {
+                std::unique_lock<std::mutex> lk(mem_mu);
+                mem_cv.wait(lk, [&] {
+                    if (mem_n_admitted == 0) return true;  // forward progress
+                    // Hard live-RSS ceiling: never admit if the actual resident
+                    // set plus this bucket's estimated working set would exceed
+                    // the budget. current_rss() already includes carry, the live
+                    // dict, every loaded bucket's FULL footprint, and glibc
+                    // fragmentation -- so this catches whatever WORKING_SET_
+                    // OVERHEAD under-reserves, workload-independently.
+                    if (current_rss_bytes() + cost > mem_budget_bytes) return false;
+                    // Reservation (lag-safe): bound concurrent admits before
+                    // their loads register in RSS. Reserve dynamically for the
+                    // live color dict (read lock-free; m_classes.size() is a
+                    // monotone gauge, a benign approximate race).
+                    const uint64_t dyn = mem_carry + global_dict.resident_bytes();
+                    const uint64_t avail =
+                        mem_budget_bytes > dyn ? mem_budget_bytes - dyn : 0;
+                    return mem_in_use + cost <= avail;
+                });
+                mem_in_use += cost;
+                ++mem_n_admitted;
+            }
             std::vector<stitchable_unitig> bucket_unitigs;
             // Hybrid-encoded local dict: per-bucket footprint shrinks
             // ~10-30x vs the live-vector dict, so N threads in flight
@@ -483,6 +662,9 @@ inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t nu
             } catch (std::exception& e) {
                 std::cerr << "error processing bucket " << b << ": " << e.what() << '\n';
             }
+            // Release the admitted memory once kmer_info/local_dict for this
+            // bucket are gone (they go out of scope at the end of this loop
+            // iteration; release after the merge below, before next bucket).
             // Merge this bucket's local dict into the shared global
             // dict. The previous version did decode + wyhash + fnv1a
             // + dedup-find + (on miss) encode all under global_mu;
@@ -543,8 +725,19 @@ inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t nu
                                                   std::memory_order_relaxed);
             }
             for (auto& u : bucket_unitigs) {
-                u.cid = local_to_global[u.cid];
+                for (auto& r : u.runs)
+                    if (r.cid != COLOR_RUN_FOREIGN) r.cid = local_to_global[r.cid];
                 sink(std::move(u));
+            }
+            // Release this bucket's memory admission: kmer_info + local_dict +
+            // bucket_unitigs for bucket b are done (kmer_info/local_dict freed
+            // inside process_bucket and at scope end; bucket_unitigs just
+            // drained to the sink). Wake any worker waiting to admit.
+            if (mem_budget_bytes > 0) {
+                std::lock_guard<std::mutex> lk(mem_mu);
+                mem_in_use -= cost;
+                --mem_n_admitted;
+                mem_cv.notify_all();
             }
             process_prof().n_buckets.fetch_add(1, std::memory_order_relaxed);
             if (done) done->fetch_add(1, std::memory_order_relaxed);
@@ -555,4 +748,4 @@ inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t nu
     for (auto& w : workers) w.join();
 }
 
-}  // namespace cdgb
+}  // namespace cdbg

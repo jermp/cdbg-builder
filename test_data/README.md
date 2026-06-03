@@ -1,6 +1,6 @@
 # test_data
 
-End-to-end correctness test for `cdgb-build`.
+End-to-end correctness test for `cdbg-build`.
 
 ## Layout
 
@@ -13,11 +13,11 @@ End-to-end correctness test for `cdgb-build`.
   K-mers are 2-bit packed into Python ints so the verifier scales to the
   ~7 M unique canonical k-mers in this dataset.
 - `run_test.sh` — generates a filenames list pointing at the gzipped
-  inputs, runs `cdgb-build` with `k = 31`, then runs `verify.py`.
+  inputs, runs `cdbg-build` with `k = 31`, then runs `verify.py`.
 
 ## Running
 
-After building the project (so `build/cdgb-build` exists):
+After building the project (so `build/cdbg-build` exists):
 
 ```bash
 ./test_data/run_test.sh             # uses 4 threads

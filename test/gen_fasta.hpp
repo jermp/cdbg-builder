@@ -25,7 +25,7 @@
 #include <string>
 #include <vector>
 
-namespace cdgb_test {
+namespace cdbg_test {
 
 struct pangenome_params {
     uint64_t num_genomes = 10;     // = number of colors
@@ -127,4 +127,4 @@ inline std::vector<std::string> generate_pangenome(pangenome_params const& param
     return paths;
 }
 
-}  // namespace cdgb_test
+}  // namespace cdbg_test
