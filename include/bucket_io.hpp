@@ -376,9 +376,9 @@ public:
         // distribution: bucket-process holds ONE bucket's kmer_info resident
         // per in-flight thread, so the peak working set is driven by the
         // LARGEST buckets, not the average. The distribution (and the sum of
-        // the top-`report_threads` buckets) tells us whether a few outliers
-        // dominate (resplit fixes it) or the load is broad (need more buckets
-        // / a concurrency cap). Cheap: one stat()/accessor per bucket at close.
+        // the top-`report_threads` buckets) tells us how the bucket-process
+        // admission gate will behave -- how many buckets fit in -g at once, and
+        // thus the effective concurrency. Cheap: one stat()/accessor per bucket.
         uint64_t total_compressed = 0;
         uint64_t total_uncompressed = 0;
         std::vector<uint64_t> unc;

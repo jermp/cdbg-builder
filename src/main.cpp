@@ -28,7 +28,7 @@ bool parse_args(int argc, char** argv, cdbg::build_config& cfg) {
                "-d", false);
     parser.add("max_ram_gb",
                "Soft RAM budget in GiB. The builder sizes the bucket count from the model"
-               " B = 0.85*g / (alpha*T*flush + beta*spill) so bucket-write fits, and spills"
+               " B = 0.50*g / (alpha*T*flush + beta*spill) so bucket-write fits, and spills"
                " the color bit_vector to disk; the actual peak RSS is reported at the end"
                " (no hard kill if exceeded).",
                "-g", false);
