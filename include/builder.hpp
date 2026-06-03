@@ -428,14 +428,15 @@ private:
     // above the ~6.7k needed).
     static constexpr double BUCKET_WRITE_BUDGET_FRAC = 0.50;
 
-    // Good default per-bucket batching payloads. SMALL on purpose: B is derived
-    // as B = frac*g / (alpha*T*flush + beta*spill), so small flush/spill -> large
-    // B -> small (few-MiB) buckets, which keeps bucket-process parallel and
-    // cache-friendly. They cost bucket-write lock traffic (flush) and dedup /
-    // file size (spill), not budget -- the buffer pool 2*T*B*flush stays < M by
-    // construction. Overridable via --flush / --spill.
+    // Good default per-bucket batching payloads. B is derived as B = frac*g /
+    // (alpha*T*flush + beta*spill), so bucket-write RAM stays at frac*g
+    // regardless of these -- they trade B (parallelism) for dedup. spill=128K
+    // gives better dedup (fewer records -> faster bucket-process load) than 64K
+    // while B stays large enough for ~48-way at generous -g; at very tight -g it
+    // halves B, so override with --spill 65536 there. Overridable via --flush /
+    // --spill.
     static constexpr size_t DEFAULT_FLUSH_BASES = 4 * 1024;
-    static constexpr size_t DEFAULT_SPILL_BYTES = 64 * 1024;
+    static constexpr size_t DEFAULT_SPILL_BYTES = 128 * 1024;
 
     // Total-RSS target for bucket-process, as a fraction of -g. The admission
     // gate keeps  carry + reserved working set + live color dict  under this,
