@@ -396,6 +396,20 @@ public:
         m_closed = true;
     }
 
+    // Free the per-bucket compactor objects (dedup hashmaps + LZ4 scratch
+    // buffers) after close(). The on-disk bucket files and the cached per-bucket
+    // sizes (m_bucket_unc_sizes) remain, so bucket_path()/bucket_unc_bytes()/
+    // num_buckets() still work and process_buckets can read every bucket. Call
+    // this before bucket-process: the compactors hold hundreds of MB - GBs of
+    // buffers and pin glibc's churned arenas, so leaving them alive inflates the
+    // RSS that bucket-process's live-RSS admission gate reads as its baseline
+    // carry -- which starves admission (it would admit ~one bucket at a time).
+    // Requires close() first; flush()/close() must not be called afterwards.
+    void release_compactors() {
+        m_compactors.clear();
+        m_compactors.shrink_to_fit();
+    }
+
     // Print the per-bucket (uncompressed) size distribution and the estimated
     // bucket-process working set. `concurrency` is the number of buckets
     // processed at once (num_threads). Call after close().

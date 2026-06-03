@@ -164,16 +164,19 @@ struct builder {
         writer->report_bucket_size_distribution(m_cfg.num_threads);
         bucket_prof().print(m_cfg.num_threads);
 
+        // Free the per-bucket compactors (dedup hashmaps + LZ4 scratch buffers)
+        // now that bucket files are written -- they are not needed by
+        // bucket-process (which reads the files) and otherwise stay alive until
+        // writer.reset() AFTER the phase, pinning glibc's churned arenas.
+        writer->release_compactors();
         // Return bucket-write's freed memory to the OS BEFORE bucket-process.
-        // The per-thread buffer pool (gigabytes) is freed when ingest_bucketed
-        // returns, but glibc holds it in its arenas, so VmRSS still reflects the
-        // ~13 GiB bucket-write peak here. bucket-process's admission gate reads
-        // current_rss() as its baseline carry and subtracts it from the budget;
-        // if that carry still includes the freed-but-unreturned bucket-write
-        // memory, avail collapses to ~0 and the gate admits one bucket at a time
-        // (serial!). Trimming now drops carry to the true live baseline (the
-        // still-alive writer's compactor buffers + frag sink), so the gate can
-        // admit the full set of buckets and bucket-process runs -t-parallel.
+        // The per-thread buffer pool and the just-freed compactors are freed but
+        // glibc holds them in its arenas, so VmRSS still reflects the bucket-write
+        // peak here. bucket-process's admission gate reads current_rss() as its
+        // baseline carry; if that carry still includes the freed-but-unreturned
+        // bucket-write memory, avail collapses and the gate admits ~one bucket at
+        // a time (serial!). Trimming now drops carry to the true live baseline
+        // so the gate admits the full set of buckets and runs -t-parallel.
         release_free_heap_to_os_();
 
         // Bucket processing emits stitchable fragments AND merges
