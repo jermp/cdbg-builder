@@ -351,6 +351,11 @@ public:
     uint32_t num_buckets() const { return m_num_buckets; }
     // Per-thread, per-bucket buffer threshold in *bases* (2-bit values).
     size_t flush_bases() const { return m_flush_bases; }
+    // Per-thread aggregate buffered-bases cap (SIZE_MAX = unbounded). When a
+    // thread's total buffered bases cross this it drains all its buckets, so
+    // the per-thread buffer pool is bounded independently of the bucket count.
+    size_t per_thread_buffer_cap() const { return m_per_thread_buffer_cap; }
+    void set_per_thread_buffer_cap(size_t c) { m_per_thread_buffer_cap = c; }
 
     std::string bucket_path(uint32_t b) const {
         return m_dir + "/bucket_" + std::to_string(b) + ".bin";
@@ -555,6 +560,7 @@ private:
 
     std::string m_dir;
     uint32_t m_num_buckets;
+    size_t m_per_thread_buffer_cap = SIZE_MAX;  // aggregate per-thread buffer bound
     size_t m_flush_bases;
     std::vector<std::unique_ptr<bucket_compactor>> m_compactors;
     std::atomic<uint64_t> m_total_compressed{0};
@@ -587,9 +593,17 @@ struct per_thread_bucket_buffers {
     std::vector<std::vector<bucket_compactor::pending_record>> recs;
     std::vector<std::vector<uint8_t>> bases;
     bucket_writer* sink = nullptr;
+    // Aggregate bases currently buffered across ALL this thread's buckets, and
+    // the cap that triggers a full drain. This bounds the per-thread buffer
+    // RAM to ~`agg_cap` regardless of the bucket count B -- the buffer pool no
+    // longer scales as T*B*flush, so B can be made large (small, parallel,
+    // cache-friendly bucket-process buckets) without bucket-write overflowing.
+    size_t agg_bytes = 0;
+    size_t agg_cap = SIZE_MAX;  // SIZE_MAX -> unbounded (legacy / no -g)
 
     explicit per_thread_bucket_buffers(bucket_writer& w)
-        : recs(w.num_buckets()), bases(w.num_buckets()), sink(&w) {}
+        : recs(w.num_buckets()), bases(w.num_buckets()), sink(&w),
+          agg_cap(w.per_thread_buffer_cap()) {}
 
     void append(uint32_t b, uint8_t flags, uint32_t color, uint8_t const* sk_bases, uint32_t len) {
         auto& bbuf = bases[b];
@@ -601,13 +615,21 @@ struct per_thread_bucket_buffers {
         // cold) bytes from the writer's bases_storage.
         uint64_t h = bucket_compactor::hash_bases(sk_bases, len);
         recs[b].push_back({h, color, off, len, (uint8_t)(flags & 0xfu)});
-        if (bbuf.size() >= sink->flush_bases()) sink->flush(b, recs[b], bbuf);
+        agg_bytes += len;
+        if (bbuf.size() >= sink->flush_bases()) {
+            agg_bytes -= bbuf.size();  // flush() clears bbuf
+            sink->flush(b, recs[b], bbuf);
+        } else if (agg_bytes >= agg_cap) {
+            // Aggregate cap hit: drain every non-empty bucket to bound RAM.
+            flush_all();
+        }
     }
 
     void flush_all() {
         for (uint32_t b = 0; b < (uint32_t)recs.size(); ++b) {
             if (!recs[b].empty()) sink->flush(b, recs[b], bases[b]);
         }
+        agg_bytes = 0;
     }
 };
 
