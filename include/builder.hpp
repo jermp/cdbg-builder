@@ -430,13 +430,14 @@ private:
 
     // Good default per-bucket batching payloads. B is derived as B = frac*g /
     // (alpha*T*flush + beta*spill), so bucket-write RAM stays at frac*g
-    // regardless of these -- they trade B (parallelism) for dedup. spill=128K
-    // gives better dedup (fewer records -> faster bucket-process load) than 64K
-    // while B stays large enough for ~48-way at generous -g; at very tight -g it
-    // halves B, so override with --spill 65536 there. Overridable via --flush /
-    // --spill.
+    // regardless of these -- they trade B (parallelism) for dedup. 64K is the
+    // sweet spot: a bigger spill (128K) dedups a bit better (faster load) but
+    // makes B smaller, so each compactor's hashmap is larger and bucket-write's
+    // hashmap/sort-unique cost dominates -- net SLOWER overall (measured: 100K
+    // g16 went 3883s -> 4100s at 128K) and a higher bucket-process peak.
+    // Overridable via --flush / --spill.
     static constexpr size_t DEFAULT_FLUSH_BASES = 4 * 1024;
-    static constexpr size_t DEFAULT_SPILL_BYTES = 128 * 1024;
+    static constexpr size_t DEFAULT_SPILL_BYTES = 64 * 1024;
 
     // Total-RSS target for bucket-process, as a fraction of -g. The admission
     // gate keeps  carry + reserved working set + live color dict  under this,
