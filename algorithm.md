@@ -79,6 +79,61 @@ K cid-range unitig_bucket files                           ← stitch
 out.fa + out.u2c + finalize out.color_sets                ← emit
 ```
 
+### 2.1 Phase I/O contracts
+
+Each phase communicates with the next **only through on-disk artifacts** —
+there is no shared in-RAM state across phases (the one exception is the
+streaming color dict, noted below). This is what lets a phase be
+optimized, or even swapped, in isolation: as long as it honors the
+artifact contract, the rest of the pipeline is unaffected.
+
+**Phase 1 — bucket-write** (`bucket_io.hpp`, `bucket_ingester.hpp`)
+- *Reads:* the `N` input gzip-FASTA files (one **color** per file).
+- *Produces:* `tmp/bucket_<b>.bin`, `b ∈ [0, B)` — one LZ4-framed file per
+  bucket, each a stream of compacted `super_kmer` records
+  `{2-bit bases, 4-bit flags, color list}`. Colors are local file indices,
+  deduped (union per identical super-k-mer) **within the bucket**.
+- *Why it's the natural handoff:* minimizer bucketing (§3.2) routes every
+  dBG edge and branch into a single bucket, so each `bucket_<b>.bin` is an
+  **independent dBG sub-problem** — phase 2 can process buckets in any
+  order, in parallel, with no cross-bucket coordination.
+
+**Phase 2 — bucket-process** (`bucket_walker.hpp`)
+- *Reads:* the `B` `tmp/bucket_<b>.bin` files (one bucket per worker).
+- *Produces two artifacts:*
+  - `tmp/frag_unitigs.bin` — a single stream of **open-ended fragments**
+    `{ACGT seq, open_flags (which ends are still extendable), color-run
+    sequence}`. The color runs reference **global** cids (the per-bucket
+    local→global merge, §4.7, runs before each fragment is written).
+  - `<out>.color_sets` — the distinct **global color classes**, interned
+    and streamed to disk incrementally during the phase (the only artifact
+    written progressively rather than at phase end; finalized by phase 4).
+- *Why it's the natural handoff:* fragments are maximal colorless
+  (topological) pieces whose open ends each carry their boundary k-mer, so
+  phase 3 only has to match boundary k-mers — and global cids decouple the
+  (large) color storage from the (small) topology that still needs joining.
+
+**Phase 3 — stitch** (`stitch_extmem.hpp`)
+- *Reads:* `tmp/frag_unitigs.bin` (streamed one fragment at a time).
+- *Produces:* `tmp/unitig_bucket_<k>.bin`, `k ∈ [0, K)` — **finished,
+  monochromatic** unitigs `{ACGT seq, cid}`, partitioned so bucket `k`
+  holds every unitig whose `cid` falls in `k`'s range.
+- *Why it's the natural handoff:* joining open ends by full boundary-k-mer
+  match yields complete unitigs; cid-**range** bucketing means phase 4 can
+  emit in strict cid order by walking buckets `0..K-1` (sorting only within
+  a bucket), with no global sort over all unitigs.
+
+**Phase 4 — emit** (`builder.hpp`, `unitig_spill.hpp`)
+- *Reads:* `tmp/unitig_bucket_<k>.bin` (cid order) **and** `<out>.color_sets`
+  (to finalize it).
+- *Produces:* `<out>.fa` (cid-ascending FASTA), `<out>.u2c`
+  (unitig→color-set bit_vector), and the finalized `<out>.color_sets`
+  (bits + Elias–Fano offsets + header). These three are the tool's outputs
+  (consumed downstream by Fulgor, §1).
+
+All `tmp/*` artifacts live under the scratch dir and are removed at the
+end of `build()`; only the three `<out>.*` files persist.
+
 ---
 
 ## 3. Phase 1: bucket-write (`include/bucket_io.hpp`, `bucket_ingester.hpp`)
