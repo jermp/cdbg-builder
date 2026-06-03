@@ -420,10 +420,13 @@ private:
     // runs at very tight -g; the model can still land here when g is tiny).
     static constexpr uint32_t MIN_AUTO_BUCKETS = 64;
 
-    // Fraction of -g the bucket-write phase is sized against. It's phase 1 with
-    // minimal carry-in, so it gets most of the budget; the remainder (plus the
-    // alpha/beta model's ~7% undercount) is headroom the runtime watcher backs.
-    static constexpr double BUCKET_WRITE_BUDGET_FRAC = 0.85;
+    // Fraction of -g the bucket-write phase is sized against. 0.50 matches the
+    // long-standing BUCKET_WRITE_SHARE that kept bucket-write lean (~10 GiB at
+    // g16 on the 100K input); 0.85 needlessly let it allocate more. Phase 1
+    // doesn't need most of -g -- only enough that B = M/(alpha*T*flush+beta*
+    // spill) is large enough for a 48-way bucket-process (~10k at 0.50, well
+    // above the ~6.7k needed).
+    static constexpr double BUCKET_WRITE_BUDGET_FRAC = 0.50;
 
     // Good default per-bucket batching payloads. SMALL on purpose: B is derived
     // as B = frac*g / (alpha*T*flush + beta*spill), so small flush/spill -> large
