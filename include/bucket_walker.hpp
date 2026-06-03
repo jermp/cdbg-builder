@@ -599,10 +599,15 @@ inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t nu
     std::vector<std::thread> workers;
     workers.reserve(num_threads);
 
-    // kmer_info RAM is ~a fixed multiple of a bucket's uncompressed on-disk
-    // bytes. Calibrated on 100K -g16: bucket-process +4.64 GiB at 32 in-flight
-    // buckets averaging ~10.7 MiB unc -> ~14x. Use 16x with margin.
-    constexpr double KMER_INFO_OVERHEAD = 16.0;
+    // Per-bucket resident WORKING SET as a multiple of the bucket's uncompressed
+    // on-disk bytes. This must cover everything an in-flight bucket holds at its
+    // walk-phase peak, not just kmer_info: kmer_info + cid_of + visited +
+    // bucket_unitigs (emitted fragments) + local_dict. Measured on 100K -g16:
+    // peak/reserved was 1.20x at small buckets and 1.37x at large ones with a
+    // 16x kmer_info-only estimate -> the full working set is ~24x. Under-
+    // reserving here over-admits and busts -g; the live-RSS ceiling below is the
+    // backstop for whatever this still misses (fragment volume is graph-shaped).
+    constexpr double WORKING_SET_OVERHEAD = 24.0;
     std::mutex mem_mu;
     std::condition_variable mem_cv;
     uint64_t mem_in_use = 0;
@@ -611,7 +616,7 @@ inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t nu
     // -g), NOT a pre-shrunk kmer_info budget. mem_carry = everything resident
     // at phase start (frag sink, residual heap); the color dict starts ~empty
     // here and is reserved for separately and LIVE in the predicate below, so
-    // the admission keeps  carry + reserved_kmer_info + live_dict <= target.
+    // the admission keeps  carry + reserved_working_set + live_dict <= target.
     const uint64_t mem_carry = (mem_budget_bytes > 0) ? current_rss_bytes() : 0;
 
     auto run = [&]() {
@@ -619,17 +624,24 @@ inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t nu
             uint32_t b = next.fetch_add(1);
             if (b >= B) break;
             const uint64_t cost =
-                (uint64_t)(KMER_INFO_OVERHEAD * (double)writer.bucket_unc_bytes(b));
+                (uint64_t)(WORKING_SET_OVERHEAD * (double)writer.bucket_unc_bytes(b));
             // Admission: wait until this bucket fits the budget, or it would be
             // the only one running (so an oversized bucket never deadlocks).
             if (mem_budget_bytes > 0) {
                 std::unique_lock<std::mutex> lk(mem_mu);
                 mem_cv.wait(lk, [&] {
                     if (mem_n_admitted == 0) return true;  // forward progress
-                    // Reserve dynamically for the live color dict (read
-                    // lock-free; m_classes.size() is a monotone gauge, a benign
-                    // approximate race). As the dict grows, avail shrinks and
-                    // fewer buckets admit -- so the dict never overflows on top.
+                    // Hard live-RSS ceiling: never admit if the actual resident
+                    // set plus this bucket's estimated working set would exceed
+                    // the budget. current_rss() already includes carry, the live
+                    // dict, every loaded bucket's FULL footprint, and glibc
+                    // fragmentation -- so this catches whatever WORKING_SET_
+                    // OVERHEAD under-reserves, workload-independently.
+                    if (current_rss_bytes() + cost > mem_budget_bytes) return false;
+                    // Reservation (lag-safe): bound concurrent admits before
+                    // their loads register in RSS. Reserve dynamically for the
+                    // live color dict (read lock-free; m_classes.size() is a
+                    // monotone gauge, a benign approximate race).
                     const uint64_t dyn = mem_carry + global_dict.resident_bytes();
                     const uint64_t avail =
                         mem_budget_bytes > dyn ? mem_budget_bytes - dyn : 0;

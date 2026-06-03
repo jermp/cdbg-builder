@@ -432,10 +432,10 @@ private:
     static constexpr size_t DEFAULT_SPILL_BYTES = 64 * 1024;
 
     // Total-RSS target for bucket-process, as a fraction of -g. The admission
-    // gate keeps  carry + reserved kmer_info + live color dict  under this; the
-    // remaining ~15% is headroom for per-thread merge buffers, the frag sink,
-    // glibc fragmentation, and the kmer_info cost-estimate slop.
-    static constexpr double BUCKET_PROCESS_BUDGET_FRAC = 0.85;
+    // gate keeps  carry + reserved working set + live color dict  under this,
+    // with a hard live-RSS ceiling as backstop; the remaining ~18% is headroom
+    // for in-flight load lag, the frag sink, and glibc fragmentation.
+    static constexpr double BUCKET_PROCESS_BUDGET_FRAC = 0.82;
 
     void validate_and_resolve_config() {
         if (m_cfg.filenames_list.empty())
