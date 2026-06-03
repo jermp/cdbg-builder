@@ -51,8 +51,14 @@ the rest is mmap-fault-wait reading 150 GB of compressed input).
 
 The four phases are strictly serial: each consumes the prior phase's
 on-disk output and finishes before the next starts. Within a phase,
-work is parallelized over either input files (bucket-write) or buckets
-(bucket-process). Stitch and emit are single-threaded.
+work is parallelized over input files (bucket-write) or buckets
+(bucket-process and stitch). Only emit is single-threaded.
+
+> The table's stitch/total figures predate the **external-memory**
+> stitch (§5), which trades the old in-RAM stitch's speed for a peak
+> bounded by `num_threads` resident buckets instead of the fragment
+> count — on 100K/g16/48t it is ~1100–1400 s, with the whole pipeline
+> ~3900 s and peak RSS within `-g`.
 
 The data flow in one picture:
 
@@ -98,8 +104,9 @@ Within an ACGT run of length `L ≥ k`, slide a window of size
 m-mer whose `canonical_mhash` (canonical ntHash; symmetric under RC) is
 minimum across its window. Each maximal run of consecutive (k−1)-mers
 sharing one minimizer defines a **super-k-mer**; its bucket id is
-`(min_hash >> 1) & (B − 1)` (the low bit is reserved to match GGCAT's
-`cn_nthash.rs` convention).
+`(min_hash >> 1) % B` (the low bit is reserved to match GGCAT's
+`cn_nthash.rs` convention; `B = num_buckets` need not be a power of two,
+so a modulo — not a mask — maps the hash, see §3.7).
 
 Minimizing over **(k−1)-mers**, not k-mers, is what keeps the de Bruijn
 graph correct under bucketing (the BCALM2 rule, matching GGCAT's
@@ -140,9 +147,9 @@ bases bytes + **precomputes a wyhash of the super-k-mer bases** while
 they're still hot in L1 from the buffer write — no lock, no hashmap.
 The hash is stashed in `pending_record::hash` so the compactor's
 later dedup-find doesn't have to re-touch the (typically cold) bases
-bytes. When a bucket's bases-buffer crosses `flush_bases` (auto-
-tuned, typically 8–64 KiB), the thread acquires that bucket's mutex
-and calls `bucket_compactor::insert_batch`.
+bytes. When a bucket's bases-buffer crosses `flush_bases` (a fixed
+good default of 4 KiB, overridable via `--flush`; §3.7), the thread
+acquires that bucket's mutex and calls `bucket_compactor::insert_batch`.
 
 ### 3.4 Per-bucket compactor (online dedup)
 
@@ -169,7 +176,8 @@ spill.
 ### 3.5 Spill: serialize, LZ4-compress, write a frame
 
 When `m_dedup`'s tracked-byte counter crosses `spill_bytes`
-(auto-tuned, typically 16–256 KiB), `spill_locked` runs:
+(a fixed good default of 64 KiB, overridable via `--spill`; §3.7),
+`spill_locked` runs:
 
 1. For each entry: sort+unique its `colors`, write a `super_kmer`
    record (varint num_colors + varint color deltas + varint
@@ -199,22 +207,43 @@ If `/proc/self/status` is unavailable (macOS, sandbox), the watcher
 falls back to monotonic `getrusage` peak; pressure becomes sticky once
 tripped (less efficient but still correct).
 
-### 3.7 Auto-tune
+### 3.7 Sizing the bucket count from the RAM budget
 
-Three knobs (`auto_bucket_log2`, `auto_tune_bucket_write_params`):
+`flush_bases` and `spill_bytes` are **fixed good defaults** (4 KiB /
+64 KiB), not auto-tuned; the **bucket count `B` is derived from them**
+and the `-g` budget (`builder::auto_bucket_count_`). bucket-write's two
+RAM pools are modelled as
 
-- `num_buckets = 2^bucket_log2`. Picked as the largest B such that
-  `B × TARGET_SPILL_BYTES × COMPACTOR_OVERHEAD ≤ (BUCKET_WRITE_SHARE
-  × max_ram) / 2`. Forces each bucket to afford a spill big enough
-  for dedup to pay off. For 4 GB / 16 threads typical = 2048;
-  scales with budget.
-- `flush_bases`, `spill_bytes`. Joint-tuned against the same share,
-  splitting it 50/50 between per-thread buffers and per-bucket
-  compactor data. Empirical overhead factors:
-  `BUFFER_OVERHEAD = 2x` (vector capacity slack), `COMPACTOR_OVERHEAD
-  = 7x` (string allocs + map structure + glibc fragmentation).
-- `BUCKET_WRITE_SHARE`: 0.50 on Linux, 0.40 on macOS (libsystem_malloc
-  retains pages glibc would reclaim, so the auto-tune budgets less).
+```
+buffer pool    ≈ alpha * T * B * flush     (per-thread per-bucket buffers)
+compactor pool ≈ beta  * B * spill         (per-bucket dedup hashmaps)
+```
+
+with empirical overhead factors `alpha = 2` (recs vector + vector
+capacity slack) and `beta = 7` (std::string keys + map structure +
+glibc fragmentation + LZ4 scratch). Holding the sum to a share `M =
+BUCKET_WRITE_BUDGET_FRAC × g` of the budget and solving for B:
+
+```
+B = M / (alpha * T * flush + beta * spill)
+```
+
+So a **larger** spill (better dedup) yields a **smaller** B, and the
+peak stays pinned at `M` *by construction* — the knobs trade B
+(bucket-process parallelism, §4.9) for dedup quality (bucket-process
+`load` speed), not budget. `BUCKET_WRITE_BUDGET_FRAC = 0.50`; the rest
+of `-g` is left for the phases that follow and for the model's ~25 %
+real-vs-modelled undercount, which the RSS watcher (§3.6) backs at
+runtime. On macOS the budget is additionally divided by
+`PLATFORM_RAM_OVERHEAD = 2` (libsystem_malloc retains more pages).
+
+`alpha`, `beta`, `flush`, and `spill` are all overridable on the CLI
+(`--alpha/--beta/--flush/--spill`) for per-machine recalibration. `-b`
+still forces a power-of-two `B = 2^bucket_log2` override. Because B is
+an arbitrary integer (not a power of two), bucketing maps the minimizer
+hash with a modulo, `(h >> 1) % B` (§3.2) — the divide is once per
+super-k-mer, negligible against the per-base ntHash scan. No `-g` set →
+historical `B = 1024`.
 
 ### 3.8 Output
 
@@ -413,14 +442,40 @@ Plus counts: `n_buckets`, `n_records`, `n_kmers`, `n_local_classes`,
 `n_unitigs`. Overhead is well under 1 % of bucket-process wall and is
 left enabled by default.
 
-### 4.9 Auto-cap on concurrency (none today)
+### 4.9 Memory-admission gate (keeps the phase in `-g`, never caps threads)
 
-The user explicitly asks for `--threads N`. bucket-process spawns N
-worker threads; each pops the next bucket from a shared atomic
-counter. There is **no** auto-cap — if the per-thread walker state
-won't fit in `-g / N`, the process simply runs over budget. A
-clean abort with a "lower --threads or raise -g" message is
-listed as future work in §11.
+bucket-process spawns the user's `T` worker threads; each pops the next
+bucket from a shared atomic counter. Rather than reduce `T` when the
+working set is large, an **admission gate** bounds how many buckets are
+resident *at once* — `T` always stays alive, but under a tight `-g`
+fewer (large) buckets load concurrently and more (small) ones do.
+
+Before taking a bucket, a worker waits on a condition variable until
+both hold (`process_buckets`):
+
+1. **Reservation** — `carry + Σ reserved_working_set + live_dict +
+   this_bucket ≤ BUCKET_PROCESS_BUDGET_FRAC × g` (0.82·g). Each bucket's
+   reserved cost is `WORKING_SET_OVERHEAD (24) × its uncompressed bytes`
+   — the *full* in-flight footprint (kmer_info + cid_of + visited +
+   emitted fragments + local_dict), not just kmer_info. `carry` is the
+   RSS measured at phase start and the color dict's resident size is
+   re-read **live** each admission, so the monotonically-growing dict is
+   reserved for dynamically instead of overflowing on top.
+2. **Hard live-RSS ceiling** — `current_rss() + this_bucket ≤ budget`.
+   Live RSS already includes carry, the dict, every loaded bucket's real
+   footprint, and glibc fragmentation, so this backstops whatever the
+   `24×` estimate under-reserves — *workload-independently*, which is why
+   bucket-process stays in budget even at scales the constant wasn't
+   calibrated on. One bucket is always admitted (forward progress).
+
+For the gate's `carry` baseline to be honest, bucket-write's memory must
+be released first: `builder` calls `writer->release_compactors()` (frees
+the per-bucket dedup hashmaps + LZ4 buffers; the on-disk files and cached
+sizes remain) and `release_free_heap_to_os_()` (`malloc_trim`) **before**
+the phase. Skipping either leaves glibc holding bucket-write's pages, so
+`current_rss()` reads near the budget and the gate starves to one bucket
+at a time (serial). The bucket size distribution printed after
+bucket-write (§3.8) previews how many buckets will fit at once.
 
 ---
 
@@ -428,8 +483,11 @@ listed as future work in §11.
 
 External-memory, GGCAT-faithful hash-bucketed iterative join
 (`extend_unitigs.rs`). It glues the open-ended fragments from §4 into
-maximal unitigs while holding only **one hash bucket at a time** in RAM,
-so peak memory is bounded by the bucket count, not the fragment count.
+maximal unitigs while holding only **`num_threads` hash buckets at a
+time** in RAM (the per-round bucket loop runs `T`-way parallel; buckets
+are independent within a round), so peak memory is bounded by the bucket
+count, not the fragment count. The bucket count is dimensioned (not the
+thread count) so `T` resident round-buckets fit stitch's share of `-g`.
 (The older in-RAM stitch — one global junction map + a per-fragment
 adjacency array, O(num_fragments) resident — was retired; `stitch.hpp`
 now holds only shared helpers, §1.)
@@ -471,8 +529,9 @@ never met its primary partner is dropped (the owning bucket emits it).
 
 **Stores.** Two interchangeable round stores share the loop:
 `round_store_mem` (in-RAM rounds; tests/dev) and `round_store_file`
-(LZ4-framed files, one bucket resident at a time; the production
-external-memory path, `stitch_unitigs_extmem_file`).
+(LZ4-framed files; the production external-memory path,
+`stitch_unitigs_extmem_file_stream`, which fans the per-round bucket loop
+across `num_threads`, holding one decoded bucket per in-flight thread).
 
 ---
 
@@ -633,25 +692,25 @@ See §6.4 for the byte layout. Decoding one color set:
 
 ## 9. Memory model
 
-Bucket-write peak (planned by `auto_tune_bucket_write_params`) is:
+Bucket-write peak (§3.7) is modelled as
 
 ```
-T * B * flush_bases * BUFFER_OVERHEAD       ← per-thread per-bucket buffers
-+ B * spill_bytes * COMPACTOR_OVERHEAD      ← per-bucket dedup hashmaps
-+ B * COMPRESSOR_BYTES_PER_BUCKET           ← small constant per bucket
+alpha * T * B * flush_bases    ← per-thread per-bucket buffers (alpha = 2)
++ beta * B * spill_bytes       ← per-bucket dedup hashmaps     (beta  = 7)
 ```
 
-with `T = num_threads`, `B = num_buckets`, BUFFER_OVERHEAD = 2x,
-COMPACTOR_OVERHEAD = 7x. Auto-tune solves this for `flush_bases` and
-`spill_bytes` against `BUCKET_WRITE_SHARE × -g`. The RSS
-pressure watcher provides a runtime safety net.
+with `T = num_threads`, `B = num_buckets`. Here `flush_bases` and
+`spill_bytes` are **fixed**, and the model is solved instead for **B**
+against `BUCKET_WRITE_BUDGET_FRAC × -g` (0.50·g). The RSS pressure
+watcher (§3.6) is the runtime safety net for the model's ~25 %
+real-vs-modelled undercount.
 
 Independently of the RAM model, bucket-write also holds `B` open
 `FILE*` handles concurrently (one per bucket file). This is why
 `builder::ensure_fd_capacity_for_buckets_` raises `RLIMIT_NOFILE`
 to the largest value the OS allows before bucket-write starts and
-caps `bucket_log2` if the soft+hard limit can't accommodate
-`2^bucket_log2 + slack` descriptors.
+clamps the bucket *count* down if the soft+hard limit can't accommodate
+`B + slack` descriptors (relevant at scale: ~40 k buckets at 661 k/g64).
 
 Bucket-process peak per in-flight thread:
 
@@ -670,12 +729,22 @@ during the chain walk). The §4.7 batched merge keeps a small
 per-thread buffer (32 decoded classes) so the local-dict decode +
 hash work can run lock-free.
 
-Stitch peak: one hash bucket's fragments + its boundary-k-mer hash
-table, resident one bucket at a time (`round_store_file`). No global
-per-fragment index or junction map — round 0 seeds from the frag spill
-through a `frag_unitig_stream_reader` that holds one fragment at a time
-(not a mmap-backed index), so peak scales with the bucket count, not the
-total fragment count.
+The **total** across in-flight buckets — plus the carried color dict
+and the per-thread merge batches — is what the §4.9 admission gate holds
+to `0.82·g`, enforced by a hard live-RSS ceiling so the phase stays in
+budget regardless of how well the `24×` per-bucket estimate matches a
+given input. The dict (`streaming_color_set_dict`) carries forward into
+stitch + emit, so its index is freed (`release_index`) right after this
+phase.
+
+Stitch peak: `num_threads` hash buckets' fragments + their boundary-k-mer
+hash tables resident at once (`round_store_file`, the `T`-way parallel
+round loop). No global per-fragment index or junction map — round 0 seeds
+from the frag spill through a `frag_unitig_stream_reader` that holds one
+fragment at a time (not a mmap-backed index), so peak scales with the
+bucket count, not the total fragment count. Stitch is sized by model
+only (no live-RSS ceiling), so it is the phase most likely to graze `-g`
+at scale (§11.4).
 
 Emit peak: one cid-range bucket of records loaded for sorting (~3 MB
 on salmonella-25K), plus the u2c bit_vector builder.
@@ -691,8 +760,8 @@ compressed bit count.
 | phase | parallelism | sync |
 |---|---|---|
 | bucket-write | T worker threads, one input file each at a time; per-thread per-bucket buffers; per-bucket mutex guards `bucket_compactor` | per-bucket mutex + RSS watcher's `try_spill` sweep |
-| bucket-process | T worker threads pop next bucket from atomic counter; each owns one bucket end-to-end | per-bucket: thread-local; `global_mu` only during local→global merge |
-| stitch | single-threaded round loop, one hash bucket at a time | n/a |
+| bucket-process | T worker threads pop next bucket from atomic counter; each owns one bucket end-to-end | per-bucket: thread-local; `global_mu` only during local→global merge; `mem_mu`/cv admission gate (§4.9) bounds resident buckets |
+| stitch | T worker threads over the per-round bucket loop (buckets independent within a round) | per-bucket waiting-map is thread-local; round barrier between rounds |
 | emit | single-threaded | n/a |
 
 Inter-phase: each phase finishes before the next begins. There is no
@@ -735,19 +804,32 @@ per-record encoding cost ~6× because raw records have to be
 varint-encoded and 2-bit-packed even when they would have deduped
 away.
 
-### 11.2 No bucket-process concurrency cap
+### 11.2 Stitch has no live-RSS enforcement
 
-See §4.9.
+bucket-write (model + RSS watcher) and bucket-process (model + hard
+live-RSS ceiling, §4.9) both hold their phase in `-g`. **Stitch does
+not** — it sizes its round-bucket count from a model only, so when the
+model under-estimates (its real footprint runs ~2× its `0.50·g` target,
+plus the carried color dict on top) it can graze or exceed `-g`. On
+100K/g16 the pipeline peak is stitch at ~16 GiB. Giving stitch the same
+live-RSS-aware treatment as bucket-process — or tightening its budget
+and reserving for the carried dict — is the next hardening step,
+especially before larger runs (661K/g64) where the dict is ~6 GB.
 
 ### 11.3 bucket-process `load` at 100K
 
-On 100K, `load` is 636 s wall-equiv = 56 % of bucket-process. It's
-26 B canonical-k-mer hashmap operations into a per-bucket
-`bucket_kmer_map` that grows to millions of entries. The probe cost
-is cache-miss-bound. Two avenues:
+On 100K/g16, `load` is ~700 s wall-equiv = ~55 % of bucket-process.
+It's billions of canonical-k-mer hashmap operations into a per-bucket
+`bucket_kmer_map`; the probe cost is cache-miss-bound and the volume is
+driven by the number of on-disk records (worse dedup = more records).
+Two avenues:
 
-- Increase `num_buckets` so each bucket's map shrinks and fits more
-  into L2/L3. Free win if the per-bucket file overhead stays small.
+- **Better dedup** so fewer records reach load: a larger `spill` dedups
+  more (fewer records), but in the §3.7 model it *shrinks* B, enlarging
+  each bucket's map — measured net **slower** (the bigger-map hashmap
+  cost outweighs the load saving), which is why the default stays at
+  64 KiB. The clean win needs the spill (dedup) decoupled from B, which
+  bucket-write's pool model does not currently allow.
 - Pre-sort each bucket's records by canonical k-mer at load time so
   hashmap inserts go in (mostly) sorted order, replacing random
   probes with sequential ones. More involved.
@@ -758,12 +840,16 @@ iteration over `kmer_info` plus per-rsid color-list decode in
 `claude/bucket-process-prof` but neither moved the needle, so the
 branch was reset to just the batched-merge commit.
 
-### 11.4 Single-threaded stitch and emit
+### 11.4 Single-threaded emit
 
-Stitch (the external-memory round loop) and emit are single-threaded.
-The stitch's per-round work is dominated by sequential bucket I/O and
-the per-bucket hash-table joins; it converges in O(log L) rounds for
-chains of length L. Both are unparallelized today; not a priority.
+Stitch's per-round bucket loop now runs `T`-way parallel (buckets are
+independent within a round; it converges in O(log L) rounds for chains
+of length L). **Emit** is still single-threaded — `emit_fasta` is a
+sequential walk writing one `.fa`, and `emit_colors` is a `finalize()`
+of an already-streamed file. On 100K emit is ~110 s (negligible);
+parallelizing the `emit_fasta` cid-bucket loop is possible (buckets are
+independent; only the final append + u2c ordering need care) but low
+priority.
 
 ### 11.5 Per-bucket walker `kmer_info` is the largest RSS residual
 
@@ -777,10 +863,10 @@ cost to encode the rsid lists more compactly. Both are substantial.
 ### 11.6 External-memory stitch is sequential-I/O friendly
 
 The round-based stitch streams whole LZ4-framed bucket files
-sequentially (read one bucket, join, write the next round's buckets),
+sequentially (read buckets, join, write the next round's buckets),
 rather than random-accessing a global mmap'd fragment index. Peak RAM is
-one bucket's fragments + its hash table, and the I/O pattern is
-large sequential reads/writes — friendly to both SSD and HDD.
+`num_threads` buckets' fragments + their hash tables, and the I/O pattern
+is large sequential reads/writes — friendly to both SSD and HDD.
 
 ### 11.7 Wall-time vs GGCAT
 
