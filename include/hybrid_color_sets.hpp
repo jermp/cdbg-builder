@@ -36,7 +36,7 @@
 #include <cassert>
 #include <cstdint>
 
-namespace cdgb {
+namespace cdbg {
 
 struct hybrid_builder {
     // Append one color set's bits to `out_bvb` using the sparse /
@@ -95,4 +95,4 @@ struct hybrid_builder {
     }
 };
 
-}  // namespace cdgb
+}  // namespace cdbg

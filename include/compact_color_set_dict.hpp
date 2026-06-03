@@ -44,7 +44,7 @@
 
 #include "hybrid_color_sets.hpp"
 
-namespace cdgb {
+namespace cdbg {
 
 struct compact_color_set_dict {
     explicit compact_color_set_dict(uint32_t num_colors)
@@ -202,4 +202,4 @@ private:
     ankerl::unordered_dense::set<uint32_t, hasher, key_eq> m_index;
 };
 
-}  // namespace cdgb
+}  // namespace cdbg

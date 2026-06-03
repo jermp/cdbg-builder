@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.13)
-project(cdgb-builder C CXX)
+project(cdbg-builder C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -87,9 +87,15 @@ add_subdirectory(${LIBDEFLATE_DIR} ${CMAKE_BINARY_DIR}/libdeflate EXCLUDE_FROM_A
 
 find_package(Threads REQUIRED)
 
-add_executable(cdgb-build src/main.cpp)
-target_link_libraries(cdgb-build PRIVATE Threads::Threads lz4_static libdeflate_static)
-target_include_directories(cdgb-build PRIVATE ${LIBDEFLATE_DIR})
+add_executable(cdbg-build src/main.cpp)
+target_link_libraries(cdbg-build PRIVATE Threads::Threads lz4_static libdeflate_static)
+target_include_directories(cdbg-build PRIVATE ${LIBDEFLATE_DIR})
+
+# Emit-phase microbenchmark: reproduce the emit peak RSS at arbitrary scale
+# (e.g. 661k proportions) without the upstream ingest/process/stitch.
+add_executable(emit-bench src/emit_bench.cpp)
+target_link_libraries(emit-bench PRIVATE Threads::Threads lz4_static libdeflate_static)
+target_include_directories(emit-bench PRIVATE ${LIBDEFLATE_DIR})
 
 # Per-phase correctness / scaling tests on synthetic data.
 option(CDGB_BUILD_TESTS "Build the per-phase test executables" ON)

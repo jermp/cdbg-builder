@@ -33,7 +33,7 @@
 #include <string>
 #include <vector>
 
-namespace cdgb {
+namespace cdbg {
 
 // ---- 2-bit packing helpers ---------------------------------------------------
 
@@ -84,6 +84,17 @@ inline uint64_t varint_read(uint8_t const* buf, size_t buf_len, size_t& pos) {
 
 inline constexpr uint8_t SK_FLAG_IS_ACGT_BEGIN = 1u << 0;
 inline constexpr uint8_t SK_FLAG_IS_ACGT_END = 1u << 1;
+// BCALM2 boundary-k-mer ownership. A boundary k-mer X (shared by k-overlap
+// between two adjacent super-k-mers) is colored in exactly ONE bucket: the
+// bucket of min(lmin(X), rmin(X)) where lmin/rmin are the minimizers of X's
+// prefix/suffix (k-1)-mers (intrinsic to X, so all of X's occurrences agree on
+// it). At a split between an ending super (run minimizer cur_min) and a starting
+// super (new_min), the shared k-mer is the ending super's LAST k-mer and the
+// starting super's FIRST k-mer; the ending super owns it iff cur_min < new_min.
+// These two bits record, per super, whether it owns its first / last boundary
+// k-mer; the walker colors a boundary k-mer only in the bucket that owns it.
+inline constexpr uint8_t SK_FLAG_OWNS_FIRST = 1u << 2;
+inline constexpr uint8_t SK_FLAG_OWNS_LAST = 1u << 3;
 
 // Serialize a compacted super-k-mer record (one or more colors) into `out`.
 // `colors` must be sorted ascending and contain no duplicates.
@@ -96,7 +107,9 @@ inline void write_super_kmer(uint8_t flags, uint32_t const* colors, uint32_t num
         varint_write((uint64_t)(c - prev), out);
         prev = c;
     }
-    varint_write(((uint64_t)len << 2) | (flags & 0x3u), out);
+    // 4 low bits carry flags (BEGIN, END, OWNS_FIRST, OWNS_LAST); len is shifted
+    // up by 4. (Was 2 bits / 0x3 -- the OWNS ownership bits were being dropped.)
+    varint_write(((uint64_t)len << 4) | (flags & 0xfu), out);
     pack_2bit(bases, len, out);
 }
 
@@ -118,12 +131,12 @@ inline size_t read_super_kmer(uint8_t const* buf, size_t buf_len, uint8_t& out_f
     }
     if (p >= buf_len) return 0;
     uint64_t lenflags = varint_read(buf, buf_len, p);
-    uint64_t len = lenflags >> 2;
-    out_flags = (uint8_t)(lenflags & 0x3u);
+    uint64_t len = lenflags >> 4;
+    out_flags = (uint8_t)(lenflags & 0xfu);
     size_t base_bytes = (size_t)((len + 3) / 4);
     if (p + base_bytes > buf_len) return 0;
     unpack_2bit(buf + p, (size_t)len, out_bases);
     return p + base_bytes;
 }
 
-}  // namespace cdgb
+}  // namespace cdbg
