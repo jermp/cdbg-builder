@@ -110,13 +110,6 @@ struct builder {
 
         auto writer = std::make_unique<bucket_writer>(tmp_dir, num_buckets, m_flush_bases,
                                                       m_spill_bytes);
-        // Bound the per-thread buffer pool independently of B (decoupling): a
-        // thread drains all its buckets once its aggregate buffered bases cross
-        // this cap, so the pool is ~BUFFER_POOL_FRAC*M total regardless of how
-        // large B is. Leaves bucket-write's budget for the compactor pool, which
-        // is what sizes B -- so B can be large (parallel bucket-process) without
-        // the buffers overflowing. No -g -> unbounded (legacy behavior).
-        if (size_t cap = per_thread_buffer_cap_bytes_()) writer->set_per_thread_buffer_cap(cap);
         // When -g is set, arm a background RSS watcher with
         // hysteresis. Bucket-write must leave room for what comes
         // after: bucket-process adds ~1 GiB on top on multi-thousand-
@@ -429,19 +422,14 @@ private:
     // alpha/beta model's ~7% undercount) is headroom the runtime watcher backs.
     static constexpr double BUCKET_WRITE_BUDGET_FRAC = 0.85;
 
-    // Per-bucket batching payloads. With the per-thread buffer pool DECOUPLED
-    // from B (bounded to a fixed share of -g, below), flush no longer constrains
-    // the bucket count, so it can stay large for good batches; B is sized from
-    // the compactor budget alone, so spill picks B (smaller spill -> larger B)
-    // AND dedup quality together. 128 KiB spill gives B~10k at 100K/g16 (48-way
-    // bucket-process) with decent dedup (fast load). Overridable via --flush /
-    // --spill.
-    static constexpr size_t DEFAULT_FLUSH_BASES = 64 * 1024;
-    static constexpr size_t DEFAULT_SPILL_BYTES = 128 * 1024;
-
-    // Share of the bucket-write budget given to the (B-independent) per-thread
-    // buffer pool; the remainder is the compactor pool beta*B*spill that sets B.
-    static constexpr double BUFFER_POOL_FRAC = 0.30;
+    // Good default per-bucket batching payloads. SMALL on purpose: B is derived
+    // as B = frac*g / (alpha*T*flush + beta*spill), so small flush/spill -> large
+    // B -> small (few-MiB) buckets, which keeps bucket-process parallel and
+    // cache-friendly. They cost bucket-write lock traffic (flush) and dedup /
+    // file size (spill), not budget -- the buffer pool 2*T*B*flush stays < M by
+    // construction. Overridable via --flush / --spill.
+    static constexpr size_t DEFAULT_FLUSH_BASES = 4 * 1024;
+    static constexpr size_t DEFAULT_SPILL_BYTES = 64 * 1024;
 
     // Total-RSS target for bucket-process, as a fraction of -g. The admission
     // gate keeps  carry + reserved working set + live color dict  under this,
@@ -494,33 +482,14 @@ private:
     // most buckets bucket-write can afford -- the best B for it regardless of U
     // -- and its runtime admission gate handles the (measured) per-bucket
     // kmer_info. No -g set -> historical default count.
-    // Bucket-write RAM budget M = share of -g (platform-derated).
-    double bucket_write_budget_bytes_() const {
-        const double g = m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0;
-        return BUCKET_WRITE_BUDGET_FRAC * g / PLATFORM_RAM_OVERHEAD;
-    }
-
-    // Per-thread aggregate buffered-BASES cap. The buffer pool gets BUFFER_POOL
-    // _FRAC of M as RAM; RAM ~= alpha * buffered_bases, so the bases cap per
-    // thread is (BUFFER_POOL_FRAC*M)/(alpha*T). Bounds buffer RAM independently
-    // of B. 0 (returned when no -g) -> caller leaves it unbounded.
-    size_t per_thread_buffer_cap_bytes_() const {
-        if (m_cfg.max_ram_gb <= 0) return 0;
-        const double M = bucket_write_budget_bytes_();
-        const double T = (double)std::max<uint32_t>(1, m_cfg.num_threads);
-        const double alpha = m_cfg.alpha > 0 ? m_cfg.alpha : 2.0;
-        return (size_t)(BUFFER_POOL_FRAC * M / (alpha * T));
-    }
-
     uint32_t auto_bucket_count_() const {
         if (m_cfg.max_ram_gb <= 0) return 1u << MIN_BUCKETS_LOG2;
-        const double M = bucket_write_budget_bytes_();
-        // Buffer pool is bounded to BUFFER_POOL_FRAC*M independently of B; the
-        // rest funds the compactor pool beta*B*spill. So B = (1-frac)*M /
-        // (beta*spill) -- flush no longer constrains B. Smaller spill -> larger
-        // B AND weaker dedup, so spill alone trades parallelism vs load speed.
-        const double compactor_budget = (1.0 - BUFFER_POOL_FRAC) * M;
-        double b = compactor_budget / (m_cfg.beta * (double)m_spill_bytes);
+        const double g = m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0;
+        const double M = BUCKET_WRITE_BUDGET_FRAC * g / PLATFORM_RAM_OVERHEAD;
+        const double T = (double)std::max<uint32_t>(1, m_cfg.num_threads);
+        const double per_bucket = m_cfg.alpha * T * (double)m_flush_bases +
+                                  m_cfg.beta * (double)m_spill_bytes;
+        double b = M / per_bucket;
         // Floor at a small sane minimum (avoid degenerate single-bucket runs at
         // tiny -g); the fd clamp handles the ceiling. If the model lands below
         // num_threads, bucket-process simply won't engage every thread -- safe,
