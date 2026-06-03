@@ -1,0 +1,22 @@
+build/
+build-*/
+*.o
+*.a
+*.so
+*.dylib
+*.dSYM/
+.cache/
+.vscode/
+.idea/
+compile_commands.json
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# tmp / output artefacts
+*.fa
+*.fa.gz
+*.cdbg
+*.cdbg.colors
+test_output/
