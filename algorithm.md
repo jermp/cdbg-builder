@@ -29,6 +29,22 @@ reverse complement). Two adjacent canonical k-mers that share a (k−1)
 suffix/prefix in some orientation form a dBG edge. A **unitig** is a
 maximal path with internal nodes of in-degree = out-degree = 1.
 
+### 1.1 What "correct" means (and a count footgun)
+
+Correctness is **exact unitig-set equality** against an independently
+built naive ccdBG, checked by `test_data/verify.py` (coverage,
+monochromaticity, topology, *and* maximality). On `salmonella_10` the
+correct colored compacted dBG has **86,630 unitigs**.
+
+> ⚠️ A historical `main` over-split 626 unitigs into 1293 (cutting at
+> provably simple-path points — no internal branch, no color change,
+> unique junction k-mers with real edges), reporting **87,297**. **That
+> count is wrong** — do not "fix" the builder to reproduce it. (Two
+> earlier walker/stitch bugs had inflated it further to ~440k: walk
+> *every* k-mer, not only color-owned ones, and coalesce reconciled color
+> runs — both fixed.) The shipped pipeline produces exactly 86,630;
+> `verify.py` is the oracle.
+
 ---
 
 ## 2. Pipeline overview
@@ -859,17 +875,30 @@ per-record encoding cost ~6× because raw records have to be
 varint-encoded and 2-bit-packed even when they would have deduped
 away.
 
-### 11.2 Stitch has no live-RSS enforcement
+### 11.2 Phases without live-RSS enforcement (stitch, emit)
 
-bucket-write (model + RSS watcher) and bucket-process (model + hard
-live-RSS ceiling, §4.9) both hold their phase in `-g`. **Stitch does
-not** — it sizes its round-bucket count from a model only, so when the
-model under-estimates (its real footprint runs ~2× its `0.50·g` target,
-plus the carried color dict on top) it can graze or exceed `-g`. On
-100K/g16 the pipeline peak is stitch at ~16 GiB. Giving stitch the same
-live-RSS-aware treatment as bucket-process — or tightening its budget
-and reserving for the carried dict — is the next hardening step,
-especially before larger runs (661K/g64) where the dict is ~6 GB.
+bucket-write (model + RSS watcher, §3.6/§3.7) and bucket-process (model +
+hard live-RSS ceiling, §4.9) actively hold their phase in `-g`. **Stitch
+and emit are model-sized only** — no live ceiling — so they rely on their
+models being right.
+
+- **Stitch.** Its reported VmHWM can look high (e.g. ~16 GiB on 100K/g16),
+  but that is largely a transient peak: live-in/out instrumentation on the
+  661K run showed *sustained* stitch RSS ~5 GiB, and the streaming round
+  store is bounded by the round-bucket count (validated at 6.08e9
+  fragments, `+0` over the prior phase). So stitch is probably **not** the
+  real binding phase; still, it has no enforcement, so a live-RSS ceiling
+  (as in §4.9) would make it robust rather than merely "usually fine".
+- **Emit.** Historically the *actual* peak at 661K (~117 GiB), from two
+  sources, **both now mitigated**: (a) `emit_fasta` cid-skew — one
+  low-cid bucket dominating the in-RAM sort (+36 GiB) → now an external
+  merge-sort capped at a `-g` share (§6.2); (b) the color-dict dedup index
+  (~15 GiB) carried through to emit → now freed by `release_index()` right
+  after bucket-process (§9). What remains **unverified at scale** is the
+  EF build over hundreds of millions of per-class offsets at `finalize()`.
+  Emit is the last phase, so an overrun there wastes the whole run —
+  watch its RSS on the next full 661K run; give it a live-RSS ceiling if
+  it grazes.
 
 ### 11.3 bucket-process `load` at 100K
 
@@ -931,6 +960,19 @@ super-k-mer hash, and the batched + pre-hashed global merge each
 contributed. On larger inputs (50K, 100K) we have no apples-to-
 apples GGCAT number; the residual gap on 100K is dominated by
 bucket-write disk I/O, not bucket-process compute.
+
+### 11.8 Bucket resplit for fat-tailed minimizer buckets (not built)
+
+The bucket-process working set is the *sum* of `num_threads` co-resident
+buckets, not the single largest, and on the measured pangenome inputs the
+bucket-size distribution is **broad** (max ~2.6× the median), not
+fat-tailed — so splitting the largest buckets (GGCAT `kmers-transform`
+style resplit) would *not* reduce the co-resident sum and is **not** on
+the critical path; the §4.9 admission gate is the right tool for a broad
+distribution. Resplit (re-partitioning whole super-k-mer records into
+more, smaller bucket files, reconnected by the same cross-bucket stitch)
+would only help a future input with a genuinely fat-tailed bucket; it is
+documented here as a known lever but deliberately unbuilt.
 
 ---
 
