@@ -3,7 +3,6 @@
 This document describes how `cdbg-builder` constructs a **colored compacted
 de Bruijn graph (ccdBG)** and how it builds and compresses the color sets.
 
----
 
 ## 1. What the tool produces
 
@@ -29,52 +28,23 @@ reverse complement). Two adjacent canonical k-mers that share a (k−1)
 suffix/prefix in some orientation form a dBG edge. A **unitig** is a
 maximal path with internal nodes of in-degree = out-degree = 1.
 
-### 1.1 What "correct" means (and a count footgun)
+### What "correct" means (and a count footgun)
 
 Correctness is **exact unitig-set equality** against an independently
 built naive ccdBG, checked by `test_data/verify.py` (coverage,
 monochromaticity, topology, *and* maximality). On `salmonella_10` the
 correct colored compacted dBG has **86,630 unitigs**.
 
-> ⚠️ A historical `main` over-split 626 unitigs into 1293 (cutting at
-> provably simple-path points — no internal branch, no color change,
-> unique junction k-mers with real edges), reporting **87,297**. **That
-> count is wrong** — do not "fix" the builder to reproduce it. (Two
-> earlier walker/stitch bugs had inflated it further to ~440k: walk
-> *every* k-mer, not only color-owned ones, and coalesce reconciled color
-> runs — both fixed.) The shipped pipeline produces exactly 86,630;
-> `verify.py` is the oracle.
 
----
 
 ## 2. Pipeline overview
 
-The build runs in four sequential phases. Wall-time numbers below come
-from three reference benchmarks on bacterial pangenome inputs
-(k = 31, m = 12, `-g` set to ~16 % of input size):
-
-| phase | 25K (16 t / 4 GB) | 50K (32 t / 16 GB) | 100K (32 t / 16 GB) | files written |
-|---|---|---|---|---|
-| **bucket-write** | ~280 s | ~287 s | ~1964 s | `tmp/bucket_*.bin` (LZ4) |
-| **bucket-process** | ~286 s | ~364 s | ~1126 s | `tmp/frag_unitigs.bin` ; `out.color_sets` (streamed) |
-| **stitch** | ~16 s  | ~27 s | ~57 s | `tmp/unitig_bucket_*.bin` |
-| **emit** | ~4 s   | ~12 s | ~13 s | `out.fa`, `out.u2c`, `out.color_sets` |
-| **total** | **~589 s** | **~690 s** | **~3164 s** | |
-
-The 100K bucket-write number is dominated by disk I/O reading the
-input files (the per-thread profile sums to only ~500 s wall-equiv,
-the rest is mmap-fault-wait reading 150 GB of compressed input).
+The build runs in four sequential phases: (1) bucket-write, (2) bucket-process, (3) stitch, (4) emit.
 
 The four phases are strictly serial: each consumes the prior phase's
 on-disk output and finishes before the next starts. Within a phase,
 work is parallelized over input files (bucket-write) or buckets
 (bucket-process and stitch). Only emit is single-threaded.
-
-> The table's stitch/total figures predate the **external-memory**
-> stitch (§5), which trades the old in-RAM stitch's speed for a peak
-> bounded by `num_threads` resident buckets instead of the fragment
-> count — on 100K/g16/48t it is ~1100–1400 s, with the whole pipeline
-> ~3900 s and peak RSS within `-g`.
 
 The data flow in one picture:
 
@@ -104,6 +74,7 @@ optimized, or even swapped, in isolation: as long as it honors the
 artifact contract, the rest of the pipeline is unaffected.
 
 **Phase 1 — bucket-write** (`bucket_io.hpp`, `bucket_ingester.hpp`)
+
 - *Reads:* the `N` input gzip-FASTA files (one **color** per file).
 - *Produces:* `tmp/bucket_<b>.bin`, `b ∈ [0, B)` — one LZ4-framed file per
   bucket, each a stream of compacted `super_kmer` records
@@ -115,6 +86,7 @@ artifact contract, the rest of the pipeline is unaffected.
   order, in parallel, with no cross-bucket coordination.
 
 **Phase 2 — bucket-process** (`bucket_walker.hpp`)
+
 - *Reads:* the `B` `tmp/bucket_<b>.bin` files (one bucket per worker).
 - *Produces two artifacts:*
   - `tmp/frag_unitigs.bin` — a single stream of **open-ended fragments**
@@ -130,6 +102,7 @@ artifact contract, the rest of the pipeline is unaffected.
   (large) color storage from the (small) topology that still needs joining.
 
 **Phase 3 — stitch** (`stitch_extmem.hpp`)
+
 - *Reads:* `tmp/frag_unitigs.bin` (streamed one fragment at a time).
 - *Produces:* `tmp/unitig_bucket_<k>.bin`, `k ∈ [0, K)` — **finished,
   monochromatic** unitigs `{ACGT seq, cid}`, partitioned so bucket `k`
@@ -140,6 +113,7 @@ artifact contract, the rest of the pipeline is unaffected.
   a bucket), with no global sort over all unitigs.
 
 **Phase 4 — emit** (`builder.hpp`, `unitig_spill.hpp`)
+
 - *Reads:* `tmp/unitig_bucket_<k>.bin` (cid order) **and** `<out>.color_sets`
   (to finalize it).
 - *Produces:* `<out>.fa` (cid-ascending FASTA), `<out>.u2c`
@@ -853,6 +827,7 @@ is mmap-fault wait reading 150 GB of compressed input. Software has
 limited room here; storage matters more than code.
 
 Levers that *could* help (in the I/O-bound regime):
+
 - Pre-fetch input files in a producer pool of K threads while the
   remaining T-K threads do compute on already-decompressed buffers.
   Useful when CPU is partially idle waiting for disk.
@@ -862,6 +837,7 @@ Levers that *could* help (in the I/O-bound regime):
 In the CPU-bound regime (warm cache, SSD), the residual hot lines
 are `flush.hashmap` (per-record `m_dedup` find) and `compute`
 (ntHash + minimizer queue). Levers ordered by experimental value:
+
 - Different hashmap (`folly::F14`, `phmap::flat_hash_map`). Modest.
 - Vectorize `nthash_roll` and `canonical_mhash`. Modest; the
   byte-by-byte loops were already auto-vectorized by gcc -O3 (a
