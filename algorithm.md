@@ -282,6 +282,42 @@ real-vs-modelled undercount, which the RSS watcher (§3.6) backs at
 runtime. On macOS the budget is additionally divided by
 `PLATFORM_RAM_OVERHEAD = 2` (libsystem_malloc retains more pages).
 
+**Why `B` is the *derived* knob, not `spill`/`flush` (and why
+bucket-write does not scale with RAM).** All `B` dedup maps are resident
+*simultaneously*: bucket-write streams every input file concurrently and
+routes each super-k-mer to whichever of the `B` buckets its minimizer
+selects, so at any instant all `B` compactors hold live state. The RAM
+constraint is therefore `B × (alpha·T·flush + beta·spill) ≤ M`, and that
+budget could in principle be spent on `B`, on `spill`, or on `flush`. We
+fix the two structure sizes and solve for `B` because enlarging *either*
+structure makes the hot loop slower:
+
+- **`spill_bytes` is pinned to fit L2 cache, not RAM.** The dominant
+  bucket-write cost is the dedup hashmap (random `find`/`insert` over
+  `m_dedup` — ~32 s of an 87 s phase on 661K/g64). It is *cache-bound*:
+  ~64 KiB of accounted content plus the map's own slack keeps the working
+  set in L2. Enlarge the map and it falls out of L2, every insert starts
+  missing to DRAM, and hashing slows *more* than the deeper dedup saves —
+  measured: 100K/g16 went 3883 s → 4100 s at `spill = 128 KiB`. The map
+  *wants* to be cache-sized, and cache size is fixed by the CPU, not `-g`.
+- **`flush_bases` bigger is pure waste.** Its only job is to amortise the
+  per-bucket mutex acquisition, and `lock_wait` is already ~1 s of that
+  87 s. Growing it just burns `T × B × flush` RAM and *delays* dedup
+  (records sit thread-private, unmerged) — no speed to gain.
+
+So `B` is the only dial that absorbs a larger budget without raising the
+per-operation cost — which is exactly **why bucket-write's wall-clock is
+flat in `-g`**. The binding resource for its dominant step is L2 cache
+(CPU-fixed); a bigger `-g` buys *more cache-sized maps in parallel* (more
+buckets), never a *faster* map. Total hashing work (insert count) and
+minimizer work (record count) are `B`-independent, so the budget is a
+*ceiling on `B`*, not a throughput dial. The levers that actually move
+bucket-write time — thread count `T`, and the dedup key/hash
+representation — are orthogonal to `-g`. (If L2 were the size of `-g` the
+trade would flip: hold `B` fixed, grow `spill` to swallow a whole bucket
+in one map, spill once, dedup perfectly — *that* would scale with RAM.
+The hardware is what forbids it.)
+
 `alpha`, `beta`, `flush`, and `spill` are all overridable on the CLI
 (`--alpha/--beta/--flush/--spill`) for per-machine recalibration. `-b`
 still forces a power-of-two `B = 2^bucket_log2` override. Because B is
@@ -745,10 +781,12 @@ alpha * T * B * flush_bases    ← per-thread per-bucket buffers (alpha = 2)
 ```
 
 with `T = num_threads`, `B = num_buckets`. Here `flush_bases` and
-`spill_bytes` are **fixed**, and the model is solved instead for **B**
-against `BUCKET_WRITE_BUDGET_FRAC × -g` (0.50·g). The RSS pressure
-watcher (§3.6) is the runtime safety net for the model's ~25 %
-real-vs-modelled undercount.
+`spill_bytes` are **fixed** (the dedup map is sized to fit L2, not `-g`;
+see §3.7 for why `B` — not the structure sizes — is the knob solved for,
+and why this makes bucket-write wall-clock flat in the budget), and the
+model is solved instead for **B** against `BUCKET_WRITE_BUDGET_FRAC × -g`
+(0.50·g). The RSS pressure watcher (§3.6) is the runtime safety net for
+the model's ~25 % real-vs-modelled undercount.
 
 Independently of the RAM model, bucket-write also holds `B` open
 `FILE*` handles concurrently (one per bucket file). This is why
