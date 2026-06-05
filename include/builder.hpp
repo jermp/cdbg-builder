@@ -360,48 +360,6 @@ struct builder {
     uint64_t peak_rss_bytes() const { return m_peak_rss_bytes; }
     build_config const& config() const { return m_cfg; }
 
-    // --- emit-phase microbenchmark entry point (src/emit_bench.cpp) ------
-    // Runs ONLY the emit phase against a pre-populated unitig_bucket_writer
-    // and streaming_color_set_dict, using the SAME emit_fasta / emit_colors
-    // the real pipeline uses, so the RSS measured is faithful. Lets us
-    // reproduce the emit peak at 661k proportions without the ~14 h
-    // ingest/process/stitch upstream. `num_unitigs_total` must equal the
-    // count pushed into `uwriter` (sizes the u2c bit_vector, as build() does).
-    // `out_basename` and `max_ram_gb` are taken from the config passed at
-    // construction.
-    void run_emit_only(unitig_bucket_writer& uwriter, streaming_color_set_dict& dict,
-                       uint64_t num_unitigs_total) {
-        m_num_unitigs = num_unitigs_total;
-        {
-            phase_rss_marker rss("emit-fasta");
-            emit_fasta(uwriter);
-            rss.stop();
-        }
-        {
-            phase_rss_marker rss("emit-colors");
-            emit_colors(dict);
-            rss.stop();
-        }
-        m_peak_rss_bytes = process_peak_rss_bytes();
-        std::cout << "[emit-only peak resident memory] " << format_bytes(m_peak_rss_bytes);
-        if (m_cfg.max_ram_gb > 0) {
-            uint64_t budget = (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0);
-            std::cout << (m_peak_rss_bytes <= budget ? "  (within budget of "
-                                                     : "  (OVER budget of ")
-                      << format_bytes(budget) << ")";
-        }
-        std::cout << "\n";
-    }
-
-    // Public forwarder so the emit-bench harness sizes its unitig bucket
-    // count EXACTLY as build() does (else the emit-fasta read_bucket peak,
-    // which scales with records-per-bucket = num_unitigs / K, is wrong).
-    static uint32_t pick_unitig_bucket_count(uint64_t num_color_classes,
-                                             uint64_t total_seq_bytes_estimate,
-                                             double max_ram_gb) {
-        return pick_unitig_bucket_count_(num_color_classes, total_seq_bytes_estimate, max_ram_gb);
-    }
-
 private:
     // Soft-cap policy. Reads m_cfg.max_ram_gb (0 = unset) and decides:
     //   - bucket_log2 (more buckets -> smaller per-bucket data structures)
