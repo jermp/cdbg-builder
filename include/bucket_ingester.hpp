@@ -181,7 +181,9 @@ inline void ingest_file_bucketed(std::string const& path, uint32_t k, uint32_t m
 // shared queue. `done` (if non-null) is incremented after each file finishes.
 inline void ingest_bucketed(std::vector<std::string> const& files, uint32_t k, uint32_t m,
                             uint32_t num_buckets, bucket_writer& writer, uint32_t num_threads,
-                            std::atomic<uint64_t>* done = nullptr) {
+                            std::atomic<uint64_t>* done = nullptr,
+                            std::vector<uint64_t> const* file_sizes = nullptr,
+                            std::atomic<uint64_t>* done_bytes = nullptr) {
     if (num_threads == 0) num_threads = 1;
     std::atomic<size_t> next{0};
     std::vector<std::thread> workers;
@@ -198,6 +200,11 @@ inline void ingest_bucketed(std::vector<std::string> const& files, uint32_t k, u
                 std::cerr << "error ingesting " << files[i] << ": " << e.what() << '\n';
             }
             if (done) done->fetch_add(1, std::memory_order_relaxed);
+            // Advance the byte-based progress by this file's on-disk size, so
+            // the bar tracks work (bytes) rather than file count -- files vary
+            // ~3x in size, so file-% badly misreports true progress.
+            if (done_bytes && file_sizes && i < file_sizes->size())
+                done_bytes->fetch_add((*file_sizes)[i], std::memory_order_relaxed);
         }
         bufs.flush_all();
     };
