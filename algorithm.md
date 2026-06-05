@@ -789,7 +789,8 @@ from the frag spill through a `frag_unitig_stream_reader` that holds one
 fragment at a time (not a mmap-backed index), so peak scales with the
 bucket count, not the total fragment count. Stitch is sized by model
 only (no live-RSS ceiling), so it is the phase most likely to graze `-g`
-at scale (§11.4).
+at scale (it was the pipeline peak — 41 GiB — on the 661K run; see
+`todo.md`).
 
 Emit peak: one cid-range bucket of records loaded for sorting (~3 MB
 on salmonella-25K), plus the u2c bit_vector builder.
@@ -815,144 +816,7 @@ running concurrently with bucketing).
 
 ---
 
-## 11. Known weaknesses and optimization surfaces
-
-### 11.1 bucket-write disk-I/O dominance at scale
-
-On 25K and 50K (with files in page cache from prior runs)
-bucket-write is CPU-bound and the per-thread profile sums close to
-wall. On 100K (cold cache, files on HDD) the per-thread profile sums
-to ~500 s wall-equiv but actual wall is 1964 s — the missing ~1465 s
-is mmap-fault wait reading 150 GB of compressed input. Software has
-limited room here; storage matters more than code.
-
-Levers that *could* help (in the I/O-bound regime):
-
-- Pre-fetch input files in a producer pool of K threads while the
-  remaining T-K threads do compute on already-decompressed buffers.
-  Useful when CPU is partially idle waiting for disk.
-- Sort the input file list by inode/disk-position before processing
-  to reduce HDD seek time.
-
-In the CPU-bound regime (warm cache, SSD), the residual hot lines
-are `flush.hashmap` (per-record `m_dedup` find) and `compute`
-(ntHash + minimizer queue). Levers ordered by experimental value:
-
-- Different hashmap (`folly::F14`, `phmap::flat_hash_map`). Modest.
-- Vectorize `nthash_roll` and `canonical_mhash`. Modest; the
-  byte-by-byte loops were already auto-vectorized by gcc -O3 (a
-  dedicated SIMD ACGT/2-bit branch was tried and dropped because the
-  compiler had already done the same work).
-
-The architectural lever (GGCAT-style background compactor that
-removes dedup from the bucketing critical path) was tried on the
-`claude/append-only-bucketing` branch and rejected: it inflated the
-per-record encoding cost ~6× because raw records have to be
-varint-encoded and 2-bit-packed even when they would have deduped
-away.
-
-### 11.2 Phases without live-RSS enforcement (stitch, emit)
-
-bucket-write (model + RSS watcher, §3.6/§3.7) and bucket-process (model +
-hard live-RSS ceiling, §4.9) actively hold their phase in `-g`. **Stitch
-and emit are model-sized only** — no live ceiling — so they rely on their
-models being right.
-
-- **Stitch.** Its reported VmHWM can look high (e.g. ~16 GiB on 100K/g16),
-  but that is largely a transient peak: live-in/out instrumentation on the
-  661K run showed *sustained* stitch RSS ~5 GiB, and the streaming round
-  store is bounded by the round-bucket count (validated at 6.08e9
-  fragments, `+0` over the prior phase). So stitch is probably **not** the
-  real binding phase; still, it has no enforcement, so a live-RSS ceiling
-  (as in §4.9) would make it robust rather than merely "usually fine".
-- **Emit.** Historically the *actual* peak at 661K (~117 GiB), from two
-  sources, **both now mitigated**: (a) `emit_fasta` cid-skew — one
-  low-cid bucket dominating the in-RAM sort (+36 GiB) → now an external
-  merge-sort capped at a `-g` share (§6.2); (b) the color-dict dedup index
-  (~15 GiB) carried through to emit → now freed by `release_index()` right
-  after bucket-process (§9). What remains **unverified at scale** is the
-  EF build over hundreds of millions of per-class offsets at `finalize()`.
-  Emit is the last phase, so an overrun there wastes the whole run —
-  watch its RSS on the next full 661K run; give it a live-RSS ceiling if
-  it grazes.
-
-### 11.3 bucket-process `load` at 100K
-
-On 100K/g16, `load` is ~700 s wall-equiv = ~55 % of bucket-process.
-It's billions of canonical-k-mer hashmap operations into a per-bucket
-`bucket_kmer_map`; the probe cost is cache-miss-bound and the volume is
-driven by the number of on-disk records (worse dedup = more records).
-Two avenues:
-
-- **Better dedup** so fewer records reach load: a larger `spill` dedups
-  more (fewer records), but in the §3.7 model it *shrinks* B, enlarging
-  each bucket's map — measured net **slower** (the bigger-map hashmap
-  cost outweighs the load saving), which is why the default stays at
-  64 KiB. The clean win needs the spill (dedup) decoupled from B, which
-  bucket-write's pool model does not currently allow.
-- Pre-sort each bucket's records by canonical k-mer at load time so
-  hashmap inserts go in (mostly) sorted order, replacing random
-  probes with sequential ones. More involved.
-
-`resolve` (340 s on 100K) is dominated by per-k-mer hashmap
-iteration over `kmer_info` plus per-rsid color-list decode in
-`record_sets.at`; we tried hash-skip and bit-copy variants on
-`claude/bucket-process-prof` but neither moved the needle, so the
-branch was reset to just the batched-merge commit.
-
-### 11.4 Single-threaded emit
-
-Stitch's per-round bucket loop now runs `T`-way parallel (buckets are
-independent within a round; it converges in O(log L) rounds for chains
-of length L). **Emit** is still single-threaded — `emit_fasta` is a
-sequential walk writing one `.fa`, and `emit_colors` is a `finalize()`
-of an already-streamed file. On 100K emit is ~110 s (negligible);
-parallelizing the `emit_fasta` cid-bucket loop is possible (buckets are
-independent; only the final append + u2c ordering need care) but low
-priority.
-
-### 11.5 Per-bucket walker `kmer_info` is the largest RSS residual
-
-`compact_color_set_dict` cut `record_sets` and `local_dict` ~10×.
-What remains is `kmer_info`, which is the per-canonical-k-mer
-hashtable used during the dBG walk. Compressing it would require
-either (a) restructuring the walker to be a streaming-online
-algorithm rather than load-then-walk, or (b) accepting some CPU
-cost to encode the rsid lists more compactly. Both are substantial.
-
-### 11.6 External-memory stitch is sequential-I/O friendly
-
-The round-based stitch streams whole LZ4-framed bucket files
-sequentially (read buckets, join, write the next round's buckets),
-rather than random-accessing a global mmap'd fragment index. Peak RAM is
-`num_threads` buckets' fragments + their hash tables, and the I/O pattern
-is large sequential reads/writes — friendly to both SSD and HDD.
-
-### 11.7 Wall-time vs GGCAT
-
-On 25K we are now **faster** than GGCAT (~589 s vs ~620 s reported
-for the same dataset). The libdeflate gzip backend, the precomputed
-super-k-mer hash, and the batched + pre-hashed global merge each
-contributed. On larger inputs (50K, 100K) we have no apples-to-
-apples GGCAT number; the residual gap on 100K is dominated by
-bucket-write disk I/O, not bucket-process compute.
-
-### 11.8 Bucket resplit for fat-tailed minimizer buckets (not built)
-
-The bucket-process working set is the *sum* of `num_threads` co-resident
-buckets, not the single largest, and on the measured pangenome inputs the
-bucket-size distribution is **broad** (max ~2.6× the median), not
-fat-tailed — so splitting the largest buckets (GGCAT `kmers-transform`
-style resplit) would *not* reduce the co-resident sum and is **not** on
-the critical path; the §4.9 admission gate is the right tool for a broad
-distribution. Resplit (re-partitioning whole super-k-mer records into
-more, smaller bucket files, reconnected by the same cross-bucket stitch)
-would only help a future input with a genuinely fat-tailed bucket; it is
-documented here as a known lever but deliberately unbuilt.
-
----
-
-## 12. File index
+## 11. File index
 
 | file | role |
 |---|---|
