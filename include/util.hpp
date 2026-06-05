@@ -329,6 +329,10 @@ struct bucket_write_prof {
     // including its calls into the per-thread buffer and any flushes).
     // Subtract ns_flush below to isolate pure compute (parse + minimizer).
     std::atomic<uint64_t> ns_loop_body{0};
+    // Subset of ns_loop_body: the ACGT-run scan + 2-bit conversion only
+    // (the part a SIMD FASTX parser like helicase would replace). Excludes
+    // emit_super_kmers (ntHash + minimizer + append).
+    std::atomic<uint64_t> ns_scan2bit{0};
 
     // ---- bucket-writer / compactor stages (subsets of ns_loop_body) ----
     // Total time inside bucket_writer::flush() (= insert_batch + spills).
@@ -368,12 +372,14 @@ struct bucket_write_prof {
             "[bucket-write profile] (per-thread time, ns/threads -> wall-equiv):\n"
             "  seq_read     %6.2fs   (libdeflate gzip + kseq parsing)\n"
             "  compute      %6.2fs   (ACGT scan + 2-bit + ntHash + minimizer + per-thread append)\n"
+            "    scan2bit   %6.2fs   (ACGT-run scan + 2-bit only; helicase's domain)\n"
             "  flush        %6.2fs   (writer.flush total = lock + hashmap + spill)\n"
             "    lock_wait  %6.2fs\n"
             "    hashmap    %6.2fs\n"
             "    spill      %6.2fs   (sort+unique + write_super_kmer + gzwrite)\n"
             "  counts: files=%llu records=%llu flushes=%llu spills=%llu inserts=%llu\n",
-            s(ns_seq_read), s_compute, s(ns_flush), s(ns_lock_wait), s(ns_hashmap), s(ns_spill),
+            s(ns_seq_read), s_compute, s(ns_scan2bit), s(ns_flush), s(ns_lock_wait), s(ns_hashmap),
+            s(ns_spill),
             (unsigned long long)load(n_files), (unsigned long long)load(n_records),
             (unsigned long long)load(n_flushes), (unsigned long long)load(n_spills),
             (unsigned long long)load(n_inserts));
