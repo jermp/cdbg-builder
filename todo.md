@@ -38,9 +38,32 @@ pre-sized — they rehash (maps) or realloc-copy (vectors) repeatedly as
 they fill, *and* run at a chronically high load factor (longer probe
 chains → more cache misses per op).
 
+> **⚠️ Measured caveat — a naive full `reserve` is net-negative on a
+> *walked* map.** See the `claude/reserve-presize` study (shelved, not
+> merged). Reserving `kmer_info` to ~distinct backfired: `ankerl`'s
+> `reserve(n)` rounds the bucket array up to the next power of two, so the
+> table ends up ~2× sparser. The find-heavy walk then strides a sparser
+> array — more cache misses, and at high thread counts that becomes
+> memory-bandwidth contention across co-resident buckets. Same-binary A/B
+> on the 20K subset at `-b 12 -t 32` (`--reserve-frac` flip):
+>
+> | reserve | load | walk | peak RSS | phase |
+> |---|---|---|---|---|
+> | off (`0`) | 17.2s | **23.5s** | 2.95 GiB | 94.5s |
+> | on (`0.6`) | 16.9s | **35.1s** (+49%) | 3.26 GiB | ~100s |
+>
+> No load win (the per-bucket maps at `-b 12` are too small for growth to
+> dominate); a real walk regression that would *worsen* at 661K's 48-way.
+> A reserve only paid off at `-b 10` (maps big enough that repeated early
+> doublings dominate load, *and* throttled parallelism muted the walk
+> contention) — not a default regime. Lesson: the reserve must target the
+> *frequent-early-doubling* cost without over-sizing into the
+> sparse-table-walk penalty — i.e. a **threshold/capped** reserve, not a
+> reserve-to-distinct. See §2.1.
+
 | container | location | grows to | effect |
 |---|---|---|---|
-| `kmer_info` | `load_bucket` | millions / bucket | bucket-process `load` |
+| `kmer_info` | `load_bucket` | millions / bucket | bucket-process `load` (but **only big buckets** — see caveat above) |
 | global dict `m_classes` (`vector<hash_pair>`) | `streaming_color_set_dict` | ~389M × 16B ≈ 6.2 GB | realloc-copies a multi-GB vector |
 | global dict `m_index` (set) | `streaming_color_set_dict` | ~389M | rehashes ~log₂N times |
 | local dict `m_index`/`m_classes` | `compact_color_set_dict` | ~tens of K / bucket × 40K | bucket-process `resolve` |
@@ -61,15 +84,40 @@ attacks it at the root, likely cheaper than lock-sharding.
 
 ## 2. bucket-process (27% of wall)
 
-1. **`reserve` `kmer_info`** to `c · distinct_estimate(bucket_unc_bytes)`;
-   tune `c` for the load-factor / RAM-per-bucket knee (more headroom →
-   shorter probe chains → faster probes, but more RAM per bucket → fewer
-   buckets fit the admission gate). Biggest `load` win; the only design
-   choice is the operating load factor.
+1. **Threshold-`reserve` `kmer_info` (revised — see §1 caveat).** The naive
+   reserve-to-distinct is *net-negative* (slows the walk ~49% via
+   pow2-over-sizing + bandwidth contention). The win we actually want is
+   bounded: a big 661K bucket grows `0→1→…→N` and pays ~log₂N rehashes,
+   each copying the whole table — the early doublings are frequent and the
+   late ones copy the most. Goal: skip those **without** over-sizing into
+   the sparse-walk penalty. Candidate shapes to try (20K A/B at both `-b 10`
+   and `-b 12`, `-t 32`, then confirm direction at 661K `-t 48`):
+   - **Floor-only:** `reserve(max(estimate, FLOOR))` with a modest `FLOOR`
+     (e.g. 1–4M) — small buckets keep the cheap path; only genuinely large
+     buckets get pre-sized, where the load win exists.
+   - **Cap the reserve below the pow2 cliff:** size to a target *just under*
+     a power-of-two boundary so the rounded array isn't 2× the live set
+     (keeps load factor high → walk stays dense). Needs knowing `ankerl`'s
+     rounding rule and reserving `≈ 0.9 · 2^j`.
+   - **Reserve as a fraction of the *gate's* admitted budget**, not of the
+     bucket's own distinct count, so RAM-per-bucket stays bounded.
+
+   Key: measure `walk` *and* `load` *and* peak RSS on every variant — the
+   reserve trades all three, and the 20K `-b 12` result proves `load`-only
+   measurement is misleading.
 2. **Pre-size / de-reallocate the global dict** — segmented `m_classes`
    (so it never realloc-copies) + reserved `m_index`. Cashes out
    `merge_wait` at its root (see §1).
-3. **`reserve` the per-bucket `compact_color_set_dict` maps** (`resolve`).
+3. **Instrument + cut `resolve`** (33.7s ≈ **36%** of bucket-process at
+   20K — the biggest single sub-cost now that the reserve is shelved). It
+   braids three costs that we currently can't separate: `record_sets.at`
+   color-list **decode**, `local_dict.intern` (**hash + maybe global-dict
+   insert**), and the rsid→cid **cache** lookups. *Split-timer first*
+   (decode / intern / cache), then attack the dominant one. Note the
+   per-bucket `compact_color_set_dict` maps here are **insert-heavy, not
+   walked**, so the §1 sparse-walk reserve hazard does *not* apply —
+   reserving them should be a clean win (and the same is true of the global
+   dict in §2.2).
 4. **Sort-for-locality in `load`** — sort each bucket's records by
    canonical k-mer so `out[can]` goes in ascending order (sequential
    memory access, fewer cache misses). Deeper; attacks the residual probe
