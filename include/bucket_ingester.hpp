@@ -149,13 +149,21 @@ inline void ingest_file_bucketed(std::string const& path, uint32_t k, uint32_t m
         auto t_body = bucket_write_prof::clock::now();
         size_t pos = 0;
         while (pos < l) {
-            // Find an ACGT-only run starting at pos.
+            // Find an ACGT-only run starting at pos, converting to 2-bit. This
+            // scan + conversion is exactly what a SIMD FASTX parser replaces;
+            // time it separately from emit_super_kmers.
+            auto t_scan = bucket_write_prof::clock::now();
             size_t end = pos;
             while (end < l && nuc_to_2bit(s[end]) != 0xff) ++end;
             size_t run_len = end - pos;
-            if (run_len >= k) {
+            bool have_run = run_len >= k;
+            if (have_run) {
                 bases_buf.resize(run_len);
                 for (size_t i = 0; i < run_len; ++i) { bases_buf[i] = nuc_to_2bit(s[pos + i]); }
+            }
+            prof.ns_scan2bit.fetch_add(bucket_write_prof::since(t_scan),
+                                       std::memory_order_relaxed);
+            if (have_run) {
                 emit_super_kmers(bases_buf.data(), (uint32_t)run_len, k, m, color, num_buckets,
                                  sink);
             }
