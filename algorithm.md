@@ -198,6 +198,18 @@ acquires that bucket's mutex and calls `bucket_compactor::insert_batch`.
 
 ### 3.4 Per-bucket compactor (online dedup)
 
+**Purpose.** In a pangenome the same super-k-mer recurs across *many input
+files* (one per genome/color) far more than within any single file —
+genomes are mostly unique sequence internally. The compactor collapses
+those cross-file repeats *online*: one `m_dedup` map per bucket, **shared
+by all `T` ingest threads**, so the same super-k-mer arriving from
+different files (different colors) lands on one entry whose `colors` list
+accumulates the union. On 661K genomes / g64 this merged **93.7 %** of all
+super-k-mer occurrences before they reached disk (`n_records` 6.27 B fed in
+→ `n_inserts` 395 M entries written, ~16×), nearly all of it cross-file —
+the main disk-write reduction over a naive one-record-per-occurrence
+layout. Cross-file, not within-file, is the case it is built for.
+
 Each `bucket_compactor` (one per bucket) holds:
 
 - `m_dedup`: an `ankerl::unordered_dense::map<std::string, entry>`
@@ -217,6 +229,31 @@ AND-shrinks the flags (`e.flags &= r.flags`), so
 when *every* contributor agreed. On miss it constructs the
 std::string and emplaces. Sort+unique on `colors` is deferred until
 spill.
+
+**The online dedup is *local*, and that is by design.** The map is cleared
+on every spill (§3.5), so a super-k-mer that recurs across *all* N files is
+not collapsed to a single record in RAM — it is merged only among the files
+whose contributions co-reside in the map's current ~64 KiB window, and
+emits one record per spill-window it appears in. A single file drops only a
+*thin slice* into each of the `B` buckets (its super-k-mers spread over all
+buckets, ~tens of entries each), so dozens of files' slices co-reside per
+window — enough overlap to catch the recurrence locally, which is why the
+hit rate is so high *without* the window being file-sized. The remaining,
+*global* union across windows is completed downstream: bucket-process
+merges color sets across all spilled records for the same super-k-mer
+(§4.3). So **spilling is purely a memory bound, never a correctness one** —
+the on-disk records are a partially-deduped intermediate, not the final
+color sets.
+
+Crucially, this dedup reduces *writes*, not bucket-write *time*:
+`insert_batch` does one `find()` **per occurrence**, so the hashmap cost
+scales with `n_records` (occurrences fed in) — fixed by the input,
+independent of how well dedup hits or how `B`/`spill` are set. Improving
+dedup (e.g. a larger `B` thins each file's per-bucket slice, so entries
+live longer before eviction and absorb more colors) shrinks the **disk
+volume and the bucket-process read/merge work**, not the bucket-write
+hashmap. This is the same find-count floor that makes bucket-write
+wall-clock flat in `-g` (§3.7).
 
 ### 3.5 Spill: serialize, LZ4-compress, write a frame
 
@@ -309,9 +346,10 @@ So `B` is the only dial that absorbs a larger budget without raising the
 per-operation cost — which is exactly **why bucket-write's wall-clock is
 flat in `-g`**. The binding resource for its dominant step is L2 cache
 (CPU-fixed); a bigger `-g` buys *more cache-sized maps in parallel* (more
-buckets), never a *faster* map. Total hashing work (insert count) and
-minimizer work (record count) are `B`-independent, so the budget is a
-*ceiling on `B`*, not a throughput dial. The levers that actually move
+buckets), never a *faster* map. The hashmap work is one `find()` per
+occurrence, so it scales with the record (occurrence) count — and that,
+like the minimizer work, is `B`-independent and dedup-hit-independent
+(§3.4). So the budget is a *ceiling on `B`*, not a throughput dial. The levers that actually move
 bucket-write time — thread count `T`, and the dedup key/hash
 representation — are orthogonal to `-g`. (If L2 were the size of `-g` the
 trade would flip: hold `B` fixed, grow `spill` to swallow a whole bucket
