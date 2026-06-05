@@ -138,10 +138,36 @@ struct builder {
             {
                 timer _("bucket-write");
                 std::atomic<uint64_t> done{0};
-                progress prog("bucket-write", done, files.size());
+
+                // Drive the progress bar by *bytes of input* rather than file
+                // count. The input files vary ~3x in size, so a file-% bar
+                // badly misreports true progress -- e.g. on the 20k-genome set
+                // "50% of files" was only ~30% of the work, since the larger
+                // files cluster late. We learn each file's on-disk (compressed)
+                // size with a cheap stat() up front -- no read needed -- and
+                // sum it for the denominator. Compressed bytes is a proxy for
+                // work (uncompressed bases), far better than file count; the
+                // file counter rides along as secondary context. Fall back to
+                // the file-count bar if no size is available.
+                std::vector<uint64_t> file_sizes(files.size(), 0);
+                uint64_t total_bytes = 0;
+                for (size_t i = 0; i < files.size(); ++i) {
+                    std::error_code ec;
+                    auto sz = std::filesystem::file_size(files[i], ec);
+                    file_sizes[i] = ec ? 0 : (uint64_t)sz;
+                    total_bytes += file_sizes[i];
+                }
+                std::atomic<uint64_t> done_bytes{0};
+                std::unique_ptr<progress> prog =
+                    total_bytes > 0
+                        ? std::make_unique<progress>("bucket-write", done_bytes, total_bytes,
+                                                     /*render_bytes=*/true, &done,
+                                                     (uint64_t)files.size(), "files")
+                        : std::make_unique<progress>("bucket-write", done,
+                                                     (uint64_t)files.size());
                 ingest_bucketed(files, m_cfg.k, m_cfg.m, m_cfg.num_buckets, *writer,
-                                m_cfg.num_threads, &done);
-                prog.stop();
+                                m_cfg.num_threads, &done, &file_sizes, &done_bytes);
+                prog->stop();
             }
             // Snapshot before writer.close() frees the compactor
             // hashmaps -- their memory is part of the bucket-write peak.
