@@ -116,6 +116,30 @@ inline std::string format_bytes(uint64_t b) {
     return buf;
 }
 
+// The unit index format_bytes() would pick for `b` (0=B,1=KiB,2=MiB,...).
+inline int byte_unit_index(uint64_t b) {
+    int u = 0;
+    double v = (double)b;
+    while (v >= 1024.0 && u + 1 < 5) { v /= 1024.0; ++u; }
+    return u;
+}
+
+// Format `b` in a *fixed* unit index (not auto-scaled). Used to render a
+// running value in the same unit as its total so "X/Y" stays aligned and
+// the unit never jumps under in-place progress updates.
+inline std::string format_bytes_in(uint64_t b, int u) {
+    static char const* units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+    char buf[64];
+    if (u <= 0) {
+        std::snprintf(buf, sizeof(buf), "%llu B", (unsigned long long)b);
+    } else {
+        double v = (double)b;
+        for (int i = 0; i < u; ++i) v /= 1024.0;
+        std::snprintf(buf, sizeof(buf), "%.2f %s", v, units[u]);
+    }
+    return buf;
+}
+
 // Current resident set size in bytes (live RSS, not the lifetime peak).
 // Linux: parses VmRSS from /proc/self/status using a single read()
 // syscall to be robust against environments where stdio fopen() is
@@ -232,12 +256,25 @@ private:
 // only reads it. This keeps the hot path lock-free and progress optional.
 class progress {
 public:
+    // `render_bytes`: format counter/total via format_bytes (use when the
+    // counter is a byte total, so the % reflects *work* rather than item
+    // count). `secondary`/`secondary_total`/`secondary_label`: an optional
+    // second counter shown as " | <label> cur/total" for context (e.g. files
+    // alongside a byte-based bar) -- so a bar driven by work still shows the
+    // item count and the user can't mistake "50% of files" for "50% done".
     progress(std::string label, std::atomic<uint64_t>& counter, uint64_t total,
+             bool render_bytes = false,
+             std::atomic<uint64_t> const* secondary = nullptr, uint64_t secondary_total = 0,
+             std::string secondary_label = "",
              std::ostream& os = std::cerr,
              std::chrono::milliseconds interval = std::chrono::milliseconds(500))
         : m_label(std::move(label))
         , m_counter(counter)
         , m_total(total)
+        , m_render_bytes(render_bytes)
+        , m_secondary(secondary)
+        , m_secondary_total(secondary_total)
+        , m_secondary_label(std::move(secondary_label))
         , m_os(os)
         , m_interval(interval)
         , m_is_tty(::isatty(2) != 0)
@@ -276,15 +313,42 @@ private:
         double sec =
             std::chrono::duration_cast<std::chrono::milliseconds>(now - m_start).count() / 1000.0;
 
-        char buf[256];
+        // Render with a STABLE width so the line doesn't shift as digits/units
+        // change under in-place (\r) updates: the running value X is rendered
+        // in the total Y's unit and right-justified to Y's width (X <= Y, same
+        // unit => X is never wider, so it already has as many columns as Y).
+        // Percentages use a fixed %5.1f field too.
+        std::string totstr =
+            m_render_bytes ? format_bytes(m_total) : std::to_string(m_total);
+        std::string valstr = m_render_bytes ? format_bytes_in(done, byte_unit_index(m_total))
+                                            : std::to_string(done);
+        int hw = m_total ? (int)totstr.size() : (int)valstr.size();
+
+        char buf[320];
+        char head[64];
+        std::snprintf(head, sizeof(head), "%*s", hw, valstr.c_str());
+        char totbuf[64] = "";
+        char pctbuf[24] = "";
         if (m_total) {
             double pct = 100.0 * (double)done / (double)m_total;
-            std::snprintf(buf, sizeof(buf), "[%s] %llu/%llu (%.1f%%) %.1fs", m_label.c_str(),
-                          (unsigned long long)done, (unsigned long long)m_total, pct, sec);
-        } else {
-            std::snprintf(buf, sizeof(buf), "[%s] %llu %.1fs", m_label.c_str(),
-                          (unsigned long long)done, sec);
+            std::snprintf(totbuf, sizeof(totbuf), "/%s", totstr.c_str());
+            std::snprintf(pctbuf, sizeof(pctbuf), " (%5.1f%%)", pct);
         }
+        char secbuf[160] = "";
+        if (m_secondary) {
+            uint64_t s = m_secondary->load(std::memory_order_relaxed);
+            if (final && m_secondary_total) s = m_secondary_total;
+            // Show the secondary's own % too: a bytes-% well below the
+            // files-% (or vice versa) is exactly the non-uniform-input signal
+            // -- e.g. "files 50% but bytes 30%" => the big files cluster late.
+            double spct = m_secondary_total ? 100.0 * (double)s / (double)m_secondary_total : 0.0;
+            std::string stot = std::to_string(m_secondary_total);
+            std::snprintf(secbuf, sizeof(secbuf), " | %s %*llu/%s (%5.1f%%)",
+                          m_secondary_label.c_str(), (int)stot.size(), (unsigned long long)s,
+                          stot.c_str(), spct);
+        }
+        std::snprintf(buf, sizeof(buf), "[%s] %s%s%s%s %.1fs", m_label.c_str(), head, totbuf,
+                      pctbuf, secbuf, sec);
 
         if (m_is_tty) {
             m_os << '\r' << buf << "      ";
@@ -301,6 +365,10 @@ private:
     std::string m_label;
     std::atomic<uint64_t>& m_counter;
     uint64_t m_total;
+    bool m_render_bytes;
+    std::atomic<uint64_t> const* m_secondary;
+    uint64_t m_secondary_total;
+    std::string m_secondary_label;
     std::ostream& m_os;
     std::chrono::milliseconds m_interval;
     bool m_is_tty;
