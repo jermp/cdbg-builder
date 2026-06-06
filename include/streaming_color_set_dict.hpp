@@ -5,8 +5,8 @@
 // or the EF offsets array in memory at once.
 //
 // On intern() we (a) compute a 128-bit content hash of the candidate
-// color list, (b) look it up in m_index, and either return the existing
-// id or (c) encode the candidate's bits into an in-memory
+// color list, (b) look it up in the sharded dedup index, and either
+// return the existing id or (c) encode the candidate's bits into an in-memory
 // bits::bit_vector::builder (m_bvb) using the hybrid sparse / dense /
 // complementary-dense rules, then immediately flush every COMPLETE 64-
 // bit word from m_bvb into the output file. We never keep more than
@@ -189,10 +189,10 @@ struct streaming_color_set_dict {
     uint64_t total_integers() const { return m_total_integers; }
     uint64_t total_bits() const { return m_flushed_words * 64 + m_bvb.num_bits(); }
 
-    // Free the dedup index + per-class hashes once interning is DONE (after
-    // bucket-process). Neither m_index nor m_classes is read by finalize() --
-    // it only needs the class COUNT (stashed here) and the on-disk bits +
-    // sidecar offsets. This dict otherwise stays fully resident through stitch
+    // Free the dedup shards once interning is DONE (after bucket-process).
+    // The shards are not read by finalize() -- it only needs the class COUNT
+    // (stashed here) and the on-disk bits + sidecar offsets. This dict
+    // otherwise stays fully resident through stitch
     // AND emit (it's freed at finalize today), and at high class counts that's
     // the dominant cross-phase CARRY-IN that pushed stitch over budget (100K:
     // ~15 GiB carried into stitch; 661k would be far worse). Releasing here
@@ -205,8 +205,8 @@ struct streaming_color_set_dict {
         m_released = true;
     }
 
-    // Approx RAM held by the dedup structures: m_classes (16 B/class) + the
-    // m_index hashset (ankerl flat backing ~ 1.6 * 9 B/entry). This is what
+    // Approx RAM held by the dedup structures: the NUM_SHARDS maps, each
+    // entry being the 128-bit hash key (16 B) + the cid (8 B). This is what
     // release_index() frees. Reported at phase boundaries to attribute budget.
     uint64_t resident_bytes() const {
         if (m_released) return 0;
