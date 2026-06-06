@@ -840,6 +840,11 @@ inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frag
     members.close();
 
     // --- phase 2: attach bases, re-bucket by chain_id % C --------------------
+    // Read one frag-id RANGE at a time into a buffer (the spill is a single
+    // stream, so the read is serial), then orient + serialize + route that
+    // range's fragments in parallel: the CPU-heavy revcomp + per-record LZ4
+    // (inside bases.put, parallel across the C output buckets) fans across
+    // workers. Peak extra RAM is one range's fragments + its member array.
     auto t_p2 = std::chrono::steady_clock::now();
     frame_spill_writer bases(dir, "idbase_", chain_buckets);
     {
@@ -848,14 +853,73 @@ inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frag
             uint32_t pos;
             uint8_t pack;
         };
-        std::vector<Slot> arr;     // current range's members, indexed by (fid - lo)
+        struct FragItem {
+            std::string seq;
+            std::vector<color_run> runs;
+        };
+        std::vector<Slot> arr;          // current range's members, indexed by (fid - lo)
+        std::vector<FragItem> buf;      // current range's fragments, buf[i] <-> fid lo+i
         uint64_t cur_range = UINT64_MAX, lo = 0;
         uint64_t fid = 0;
-        std::vector<uint8_t> rbuf;  // reused base-record buffer
+
+        // Orient + serialize + route buf[i] (fid = lo+i, member arr[i]) over
+        // num_threads workers, then clear the buffer.
+        std::atomic<size_t> cursor{0};
+        auto flush_range = [&]() {
+            const size_t nb = buf.size();
+            if (nb == 0) return;
+            cursor.store(0, std::memory_order_relaxed);
+            auto work = [&]() {
+                std::vector<uint8_t> rbuf;
+                for (;;) {
+                    size_t i = cursor.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= nb) break;
+                    const Slot& m = arr[i];
+                    const bool rc = (m.pack & 1u) != 0;
+                    const uint8_t cof = (uint8_t)(m.pack >> 1);
+                    std::string s = std::move(buf[i].seq);
+                    std::vector<color_run> r = std::move(buf[i].runs);
+                    if (rc) {
+                        s = revcomp_string(s);
+                        ext_reverse_runs(r);
+                    }
+                    // [u64 cid][u32 pos][u8 open_flags][u32 seq_len][seq]
+                    // [u32 nruns][nruns x (u64 cid + u32 num_kmers)]
+                    rbuf.clear();
+                    auto put = [&](void const* d, size_t n) {
+                        uint8_t const* b = (uint8_t const*)d;
+                        rbuf.insert(rbuf.end(), b, b + n);
+                    };
+                    uint32_t slen = (uint32_t)s.size(), nruns = (uint32_t)r.size();
+                    put(&m.cid, 8);
+                    put(&m.pos, 4);
+                    put(&cof, 1);
+                    put(&slen, 4);
+                    put(s.data(), slen);
+                    put(&nruns, 4);
+                    for (auto const& cr : r) {
+                        put(&cr.cid, sizeof(cr.cid));
+                        put(&cr.num_kmers, sizeof(cr.num_kmers));
+                    }
+                    bases.put((uint32_t)(m.cid % chain_buckets), rbuf.data(), rbuf.size());
+                }
+            };
+            if (num_threads <= 1) {
+                work();
+            } else {
+                std::vector<std::thread> ws;
+                ws.reserve(num_threads);
+                for (uint32_t t = 0; t < num_threads; ++t) ws.emplace_back(work);
+                for (auto& w : ws) w.join();
+            }
+            buf.clear();
+        };
+
         for_each_frag([&](uint8_t of, std::vector<color_run>& runs, std::string& seq) {
             (void)of;
             const uint64_t range = fid / range_size;
             if (range != cur_range) {
+                flush_range();  // finish the previous range
                 std::vector<uint8_t> raw = read_spill_bucket_decoded(members.bucket_path(range));
                 lo = range * range_size;
                 const uint64_t hi = std::min(lo + range_size, n_frags);
@@ -868,38 +932,13 @@ inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frag
                     std::memcpy(&rpos, raw.data() + p + 16, 4);
                     arr[(size_t)(rfid - lo)] = Slot{rcid, rpos, raw[p + 20]};
                 }
+                buf.reserve((size_t)(hi - lo));
                 cur_range = range;
             }
-            const Slot& m = arr[(size_t)(fid - lo)];
-            const bool rc = (m.pack & 1u) != 0;
-            const uint8_t cof = (uint8_t)(m.pack >> 1);
-            std::string s = seq;
-            std::vector<color_run> r = runs;
-            if (rc) {
-                s = revcomp_string(s);
-                ext_reverse_runs(r);
-            }
-            // base record: [u64 cid][u32 pos][u8 open_flags][u32 seq_len][seq]
-            //              [u32 nruns][nruns x (u64 cid + u32 num_kmers)]
-            rbuf.clear();
-            auto put = [&](void const* d, size_t n) {
-                uint8_t const* b = (uint8_t const*)d;
-                rbuf.insert(rbuf.end(), b, b + n);
-            };
-            uint32_t slen = (uint32_t)s.size(), nruns = (uint32_t)r.size();
-            put(&m.cid, 8);
-            put(&m.pos, 4);
-            put(&cof, 1);
-            put(&slen, 4);
-            put(s.data(), slen);
-            put(&nruns, 4);
-            for (auto const& cr : r) {
-                put(&cr.cid, sizeof(cr.cid));
-                put(&cr.num_kmers, sizeof(cr.num_kmers));
-            }
-            bases.put((uint32_t)(m.cid % chain_buckets), rbuf.data(), rbuf.size());
+            buf.push_back(FragItem{std::move(seq), std::move(runs)});
             ++fid;
         });
+        flush_range();  // last range
     }
     bases.close();
     std::cout << "  [id-stitch] phase2 (attach+rebucket) "
