@@ -598,17 +598,32 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
     // will, in a later round when its partner co-buckets) a unique mate.
     auto is_terminal = [&](ext_tig const& t) -> bool { return t.open_flags == 0; };
     // The sink (unitig_bucket_writer) is NOT internally thread-safe, so the
-    // parallel round driver guards every terminal-unitig emission with this
-    // mutex. Output ORDER may interleave across threads, but emit_fasta sorts
-    // each cid-bucket before writing, so the final .fa is identical regardless.
+    // parallel round driver guards emission with this mutex. To keep that one
+    // lock from serialising ~one fwrite-per-unitig across all 32 workers -- the
+    // dominant source of voluntary context switches AND the utilization ceiling
+    // in this phase -- each worker ACCUMULATES its split unitigs into a local
+    // batch and drains the batch under the lock once per ~SINK_BATCH_BYTES, so
+    // sink_mu is acquired a few thousand times instead of tens of millions.
+    // Output ORDER may interleave across threads, but emit_fasta sorts each
+    // cid-bucket before writing, so the final .fa is identical regardless.
     std::mutex sink_mu;
-    auto sink_unitig = [&](ext_tig& t) {
-        // Cut the finished topological tig at its color-run boundaries into
-        // monochromatic output unitigs (verify.py requires monochromaticity).
-        ext_split_monochromatic(t, k, t.open_flags, [&](stitchable_unitig&& u) {
-            std::lock_guard<std::mutex> lk(sink_mu);
+    auto flush_batch = [&](std::vector<stitchable_unitig>& batch) {
+        if (batch.empty()) return;
+        std::lock_guard<std::mutex> lk(sink_mu);
+        for (auto& u : batch) {
             if (done) done->fetch_add(1, std::memory_order_relaxed);
             sink(std::move(u));
+        }
+        batch.clear();
+    };
+    // Cut a finished topological tig at its color-run boundaries into
+    // monochromatic output unitigs (verify.py requires monochromaticity),
+    // appending them to the caller's batch (drained via flush_batch).
+    auto sink_unitig = [&](ext_tig& t, std::vector<stitchable_unitig>& batch,
+                           size_t& batch_bytes) {
+        ext_split_monochromatic(t, k, t.open_flags, [&](stitchable_unitig&& u) {
+            batch_bytes += u.seq.size();
+            batch.push_back(std::move(u));
         });
     };
 
@@ -618,10 +633,16 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
     // order-seeded), so buckets parallelize cleanly within a round; the only
     // shared state is the store (per-output-bucket locked) and the sink
     // (mutex above). Returns how many joins it made.
+    // Per-worker sink batch is drained under sink_mu at the byte threshold and
+    // before process_bucket returns, bounding extra resident RAM to ~32 *
+    // SINK_BATCH_BYTES while taking the global sink lock once per batch.
+    constexpr size_t SINK_BATCH_BYTES = 2u * 1024 * 1024;
     auto process_bucket = [&](uint32_t b) -> uint64_t {
         std::vector<ext_tig> tigs = store.take_input_bucket(b);
         if (tigs.empty()) return 0;
         uint64_t joined = 0;
+        std::vector<stitchable_unitig> out_batch;
+        size_t out_bytes = 0;
 
         const uint64_t NT = tigs.size();
         std::vector<ext_end> ends(NT);
@@ -681,7 +702,8 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
             waiting.erase(it);
             ++joined;
             if (is_terminal(merged)) {
-                sink_unitig(merged);
+                sink_unitig(merged, out_batch, out_bytes);
+                if (out_bytes >= SINK_BATCH_BYTES) { flush_batch(out_batch); out_bytes = 0; }
             } else {
                 uint64_t dummy = 0;
                 detail::ext_route(std::move(merged), k, store, dummy);
@@ -694,7 +716,8 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
         for (uint64_t i = 0; i < NT; ++i) {
             if (consumed[i]) continue;
             if (is_terminal(tigs[i])) {
-                sink_unitig(tigs[i]);
+                sink_unitig(tigs[i], out_batch, out_bytes);
+                if (out_bytes >= SINK_BATCH_BYTES) { flush_batch(out_batch); out_bytes = 0; }
                 continue;
             }
             ext_tig t = std::move(tigs[i]);
@@ -704,6 +727,7 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
             uint64_t dummy = 0;
             detail::ext_route(std::move(t), k, store, dummy);
         }
+        flush_batch(out_batch);  // drain this bucket's remaining unitigs
         return joined;
     };
 
@@ -823,10 +847,16 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
         if (joined == 0 || round_no >= MAX_ROUNDS) {
             if (round_no >= MAX_ROUNDS)
                 std::cerr << "[ext-stitch] WARNING: round cap " << MAX_ROUNDS << " hit\n";
+            std::vector<stitchable_unitig> rem_batch;
+            size_t rem_bytes = 0;
             for (uint32_t b = 0; b < num_buckets; ++b) {
                 std::vector<ext_tig> rem = store.take_input_bucket(b);
-                for (auto& t : rem) sink_unitig(t);
+                for (auto& t : rem) {
+                    sink_unitig(t, rem_batch, rem_bytes);
+                    if (rem_bytes >= SINK_BATCH_BYTES) { flush_batch(rem_batch); rem_bytes = 0; }
+                }
             }
+            flush_batch(rem_batch);
             break;
         }
     }
