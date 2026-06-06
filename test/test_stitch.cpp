@@ -54,7 +54,7 @@ multiset_t to_multiset(std::vector<stitchable_unitig> const& v) {
     return m;
 }
 
-enum class which_stitch { ext_mem, ext_file, ext_file_mt, compact_mem, compact_file };
+enum class which_stitch { ext_mem, ext_file, ext_file_mt, compact_mem, compact_file, compact_scalable };
 
 char const* stitch_name(which_stitch w) {
     switch (w) {
@@ -66,8 +66,10 @@ char const* stitch_name(which_stitch w) {
             return "ext_file_mt";
         case which_stitch::compact_mem:
             return "compact_mem";
-        default:
+        case which_stitch::compact_file:
             return "compact_file";
+        default:
+            return "compact_scalable";
     }
 }
 
@@ -101,6 +103,28 @@ void run_stitch(which_stitch w, std::vector<stitchable_unitig>& frags, uint32_t 
                           std::to_string(g_tmp_counter++);
         std::filesystem::create_directories(dir);
         cdbg::compact_stitch_file(src, k, dir, sink, /*num_buckets=*/16);
+        std::filesystem::remove_all(dir);
+    } else if (w == which_stitch::compact_scalable) {
+        // Full RAM-bounded path (parallel-stitch Step B.2): id-only doubling +
+        // disk-based re-bucket assembly. Small frag_ranges/chain_buckets force
+        // the multi-bucket join + group/sort logic even on tiny inputs.
+        cdbg::vector_frag_source src(frags);
+        std::string dir = std::filesystem::temp_directory_path().string() +
+                          "/cdbg_stitch_test_" + std::to_string(::getpid()) + "_" +
+                          std::to_string(g_tmp_counter++);
+        std::filesystem::create_directories(dir);
+        auto for_each = [&](auto&& fn) {
+            std::vector<cdbg::color_run> runs;
+            std::string seq;
+            for (uint64_t i = 0; i < src.size(); ++i) {
+                std::string_view sv = src.seq_view(i);
+                seq.assign(sv.data(), sv.size());
+                runs = src.runs(i);
+                fn(src.open_flags(i), runs, seq);
+            }
+        };
+        cdbg::compact_stitch_scalable(for_each, src.size(), k, dir, sink, /*num_buckets=*/16,
+                                      /*frag_ranges=*/4, /*chain_buckets=*/4);
         std::filesystem::remove_all(dir);
     } else {
         cdbg::vector_frag_source src(frags);
@@ -177,7 +201,8 @@ bool run_case(uint64_t seed, uint32_t k, uint64_t num_unitigs, uint64_t max_len,
     bool d = run_case_impl(which_stitch::ext_file_mt, seed, k, num_unitigs, max_len, max_frags);
     bool e = run_case_impl(which_stitch::compact_mem, seed, k, num_unitigs, max_len, max_frags);
     bool f = run_case_impl(which_stitch::compact_file, seed, k, num_unitigs, max_len, max_frags);
-    return b && c && d && e && f;
+    bool g = run_case_impl(which_stitch::compact_scalable, seed, k, num_unitigs, max_len, max_frags);
+    return b && c && d && e && f && g;
 }
 
 // Shared-cid branchy correctness case. Builds `num_clusters` branch
@@ -222,7 +247,8 @@ bool run_branch_case(uint64_t seed, uint32_t k, uint64_t num_clusters) {
     bool d = run_branch_case_impl(which_stitch::ext_file_mt, seed, k, num_clusters);
     bool e = run_branch_case_impl(which_stitch::compact_mem, seed, k, num_clusters);
     bool f = run_branch_case_impl(which_stitch::compact_file, seed, k, num_clusters);
-    return b && c && d && e && f;
+    bool g = run_branch_case_impl(which_stitch::compact_scalable, seed, k, num_clusters);
+    return b && c && d && e && f && g;
 }
 
 // Larger case: report timing + fragment/unitig counts, plus the same
@@ -249,7 +275,7 @@ bool run_scale(uint64_t seed, uint32_t k, uint64_t num_unitigs) {
     bool ok = true;
     for (which_stitch w :
          {which_stitch::ext_mem, which_stitch::ext_file, which_stitch::ext_file_mt,
-          which_stitch::compact_mem, which_stitch::compact_file}) {
+          which_stitch::compact_mem, which_stitch::compact_file, which_stitch::compact_scalable}) {
         auto t0 = std::chrono::steady_clock::now();
         run_stitch(w, frags, k, out);
         auto t1 = std::chrono::steady_clock::now();

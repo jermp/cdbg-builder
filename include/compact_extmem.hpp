@@ -529,6 +529,114 @@ inline void id_assemble_chain(id_chain const& c, Source& frag, uint32_t k, Sink&
     id_tig_assembled_split(seq, runs, c.open_flags, k, sink);
 }
 
+// --- Step B.2: scalable disk-based assembly ---------------------------------
+// A one-shot bucketed byte spill: append opaque records into num_buckets files
+// (LZ4-framed, per-bucket write batch), then read each bucket's decoded bytes
+// back once. Same frame format as the round store; unlike it there are no rounds
+// (write phase, then read phase). Records are parsed by the caller (it knows the
+// fixed/var layout), so this only moves bytes.
+class frame_spill_writer {
+public:
+    frame_spill_writer(std::string dir, std::string prefix, uint32_t num_buckets)
+        : m_dir(std::move(dir)), m_prefix(std::move(prefix)), m_num_buckets(num_buckets),
+          m_batch(num_buckets), m_files(num_buckets, nullptr), m_locks(num_buckets) {}
+
+    ~frame_spill_writer() {
+        for (auto* f : m_files)
+            if (f) std::fclose(f);
+    }
+
+    frame_spill_writer(frame_spill_writer const&) = delete;
+    frame_spill_writer& operator=(frame_spill_writer const&) = delete;
+
+    uint32_t num_buckets() const { return m_num_buckets; }
+
+    std::string bucket_path(uint32_t b) const {
+        return m_dir + "/" + m_prefix + std::to_string(b) + ".bin";
+    }
+
+    void put(uint32_t b, void const* data, size_t n) {
+        std::lock_guard<std::mutex> lk(m_locks[b]);
+        uint8_t const* p = (uint8_t const*)data;
+        m_batch[b].insert(m_batch[b].end(), p, p + n);
+        if (m_batch[b].size() >= FRAME_BUDGET) flush_frame(b);
+    }
+
+    // Flush + EOF-mark + close all buckets (call once, after all puts).
+    void close() {
+        for (uint32_t b = 0; b < m_num_buckets; ++b) {
+            if (!m_batch[b].empty()) flush_frame(b);
+            if (m_files[b]) {
+                uint32_t eof = 0;
+                std::fwrite(&eof, sizeof(eof), 1, m_files[b]);
+                std::fclose(m_files[b]);
+                m_files[b] = nullptr;
+            }
+        }
+    }
+
+private:
+    static constexpr size_t FRAME_BUDGET = 4u * 1024 * 1024;
+
+    void flush_frame(uint32_t b) {  // caller holds m_locks[b]
+        auto& batch = m_batch[b];
+        if (batch.empty()) return;
+        if (!m_files[b]) {
+            std::string path = bucket_path(b);
+            m_files[b] = std::fopen(path.c_str(), "wb");
+            if (!m_files[b])
+                throw std::runtime_error("cannot open spill file: " + path + ": " +
+                                         std::strerror(errno));
+        }
+        int src = (int)batch.size();
+        std::vector<uint8_t> scratch((size_t)LZ4_compressBound(src));
+        int comp = LZ4_compress_default((char const*)batch.data(), (char*)scratch.data(), src,
+                                        (int)scratch.size());
+        if (comp <= 0) throw std::runtime_error("spill LZ4 compress failed");
+        uint32_t u = (uint32_t)src, c = (uint32_t)comp;
+        std::FILE* f = m_files[b];
+        if (std::fwrite(&u, sizeof(u), 1, f) != 1 || std::fwrite(&c, sizeof(c), 1, f) != 1 ||
+            std::fwrite(scratch.data(), 1, (size_t)comp, f) != (size_t)comp)
+            throw std::runtime_error("short write to spill file");
+        batch.clear();
+    }
+
+    std::string m_dir, m_prefix;
+    uint32_t m_num_buckets;
+    std::vector<std::vector<uint8_t>> m_batch;
+    std::vector<std::FILE*> m_files;
+    std::vector<std::mutex> m_locks;
+};
+
+// Decode every frame of one spill bucket file into a flat byte vector, then
+// delete the file. Returns empty if the bucket file does not exist (no record
+// was ever routed there). Peak extra RAM is this one bucket's decoded bytes --
+// the bounded working set of the assembly.
+inline std::vector<uint8_t> read_spill_bucket_decoded(std::string const& path) {
+    std::vector<uint8_t> raw;
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return raw;
+    std::vector<uint8_t> comp;
+    for (;;) {
+        uint32_t u = 0;
+        if (std::fread(&u, sizeof(u), 1, f) != 1) break;
+        if (u == 0) break;
+        uint32_t c = 0;
+        if (std::fread(&c, sizeof(c), 1, f) != 1) break;
+        if (comp.size() < c) comp.resize(c);
+        if (std::fread(comp.data(), 1, c, f) != c) break;
+        size_t base = raw.size();
+        raw.resize(base + u);
+        int decoded = LZ4_decompress_safe((char const*)comp.data(), (char*)raw.data() + base,
+                                          (int)c, (int)u);
+        if (decoded < 0 || (uint32_t)decoded != u)
+            throw std::runtime_error("spill bucket LZ4 decode failed: " + path);
+    }
+    std::fclose(f);
+    std::remove(path.c_str());
+    return raw;
+}
+
 }  // namespace detail
 
 // In-RAM id-only compaction stitch (STEP 1): same Source/Sink contract as
@@ -559,6 +667,199 @@ inline void compact_stitch_file(Source& frag, uint32_t k, std::string const& tmp
     detail::id_seed(frag, k, store, chain_sink);
     detail::id_run_rounds(store, k, num_buckets, chain_sink);
     for (auto const& c : chains) detail::id_assemble_chain(c, frag, k, sink);
+}
+
+// Scalable, RAM-bounded id-only compaction stitch (STEP B.2). Unlike
+// compact_stitch_{mem,file} it holds neither all fragments nor all chains in
+// RAM: the only resident structures are one round-store bucket, one frag-id
+// range's member array, and one chain bucket's bases -- so peak RAM is
+// independent of fragment/chain COUNT (the extmem invariant).
+//
+// `for_each_frag(fn)` must call fn(uint8_t open_flags, std::vector<color_run>&
+// runs, std::string& seq) for every fragment in frag_id order, and be
+// re-invocable (it is called twice: seed, then phase-2 base attach). `n_frags`
+// is the total fragment count (known by the producer). `dir` is scratch.
+//
+// Pipeline:
+//   seed+rounds : id-only doubling -> per-chain-member records (frag_id,
+//                 chain_id, pos, rc, open_flags) bucketed by frag_id RANGE.
+//   phase 2     : stream the fragments once; for each, look up its member
+//                 (one range's array resident at a time), orient by rc, and
+//                 re-bucket its bases+runs by chain_id % C.
+//   phase 3     : per chain bucket, group by chain_id, sort by pos, fold-
+//                 assemble (same ext_concat_runs + seq-append + split) -> sink.
+template <typename ForEachFrag, typename Sink>
+inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frags, uint32_t k,
+                                    std::string const& dir, Sink&& sink, uint32_t num_buckets = 0,
+                                    uint32_t frag_ranges = 0, uint32_t chain_buckets = 0) {
+    using namespace detail;
+    if (num_buckets == 0) num_buckets = 1024;
+    if (frag_ranges == 0) frag_ranges = 64;
+    if (chain_buckets == 0) chain_buckets = 64;
+    if (n_frags == 0) return;
+    const uint64_t range_size = (n_frags + frag_ranges - 1) / frag_ranges;
+
+    // --- seed + doubling: emit member records bucketed by frag_id range ------
+    id_round_store_file store(dir, num_buckets);
+    frame_spill_writer members(dir, "idmem_", frag_ranges);
+    uint64_t chain_counter = 0;
+    auto chain_sink = [&](id_chain&& c) {
+        const uint64_t cid = chain_counter++;
+        const uint8_t of = c.open_flags;
+        for (uint32_t pos = 0; pos < c.entries.size(); ++pos) {
+            const uint64_t fid = id_entry_frag(c.entries[pos]);
+            const uint8_t pack = (uint8_t)((id_entry_rc(c.entries[pos]) ? 1u : 0u) | (of << 1));
+            uint8_t rec[8 + 8 + 4 + 1];
+            std::memcpy(rec, &fid, 8);
+            std::memcpy(rec + 8, &cid, 8);
+            std::memcpy(rec + 16, &pos, 4);
+            rec[20] = pack;
+            members.put((uint32_t)(fid / range_size), rec, sizeof(rec));
+        }
+    };
+
+    {
+        // Seed reads each fragment's open_flags + boundary k-mers (it ignores
+        // runs, but the reader fills them). frag_id = iteration order.
+        uint64_t fid = 0;
+        std::vector<color_run> runs;
+        std::string seq;
+        for_each_frag([&](uint8_t of, std::vector<color_run>& r, std::string& s) {
+            (void)r;
+            if (k < 2 || of == 0) {
+                chain_sink(id_chain{std::vector<uint64_t>{id_entry(fid, false)}, 0});
+            } else {
+                id_tig t;
+                t.open_flags = of;
+                t.rng = id_rng_seed(fid);
+                t.entries.push_back(id_entry(fid, false));
+                std::string_view sv(s.data(), s.size());
+                if (of & UNITIG_OPEN_LEFT) t.kl = id_fwd_kmer(sv, k, SIDE_LEFT);
+                if (of & UNITIG_OPEN_RIGHT) t.kr = id_fwd_kmer(sv, k, SIDE_RIGHT);
+                id_route(std::move(t), k, store);
+            }
+            ++fid;
+        });
+        store.advance();
+    }
+    id_run_rounds(store, k, num_buckets, chain_sink);
+    members.close();
+
+    // --- phase 2: attach bases, re-bucket by chain_id % C --------------------
+    frame_spill_writer bases(dir, "idbase_", chain_buckets);
+    {
+        struct Slot {
+            uint64_t cid;
+            uint32_t pos;
+            uint8_t pack;
+        };
+        std::vector<Slot> arr;     // current range's members, indexed by (fid - lo)
+        uint64_t cur_range = UINT64_MAX, lo = 0;
+        uint64_t fid = 0;
+        std::vector<uint8_t> rbuf;  // reused base-record buffer
+        for_each_frag([&](uint8_t of, std::vector<color_run>& runs, std::string& seq) {
+            (void)of;
+            const uint64_t range = fid / range_size;
+            if (range != cur_range) {
+                std::vector<uint8_t> raw = read_spill_bucket_decoded(members.bucket_path(range));
+                lo = range * range_size;
+                const uint64_t hi = std::min(lo + range_size, n_frags);
+                arr.assign((size_t)(hi - lo), Slot{0, 0, 0xFF});
+                for (size_t p = 0; p + 21 <= raw.size(); p += 21) {
+                    uint64_t rfid, rcid;
+                    uint32_t rpos;
+                    std::memcpy(&rfid, raw.data() + p, 8);
+                    std::memcpy(&rcid, raw.data() + p + 8, 8);
+                    std::memcpy(&rpos, raw.data() + p + 16, 4);
+                    arr[(size_t)(rfid - lo)] = Slot{rcid, rpos, raw[p + 20]};
+                }
+                cur_range = range;
+            }
+            const Slot& m = arr[(size_t)(fid - lo)];
+            const bool rc = (m.pack & 1u) != 0;
+            const uint8_t cof = (uint8_t)(m.pack >> 1);
+            std::string s = seq;
+            std::vector<color_run> r = runs;
+            if (rc) {
+                s = revcomp_string(s);
+                ext_reverse_runs(r);
+            }
+            // base record: [u64 cid][u32 pos][u8 open_flags][u32 seq_len][seq]
+            //              [u32 nruns][nruns x (u64 cid + u32 num_kmers)]
+            rbuf.clear();
+            auto put = [&](void const* d, size_t n) {
+                uint8_t const* b = (uint8_t const*)d;
+                rbuf.insert(rbuf.end(), b, b + n);
+            };
+            uint32_t slen = (uint32_t)s.size(), nruns = (uint32_t)r.size();
+            put(&m.cid, 8);
+            put(&m.pos, 4);
+            put(&cof, 1);
+            put(&slen, 4);
+            put(s.data(), slen);
+            put(&nruns, 4);
+            for (auto const& cr : r) {
+                put(&cr.cid, sizeof(cr.cid));
+                put(&cr.num_kmers, sizeof(cr.num_kmers));
+            }
+            bases.put((uint32_t)(m.cid % chain_buckets), rbuf.data(), rbuf.size());
+            ++fid;
+        });
+    }
+    bases.close();
+
+    // --- phase 3: per chain bucket, group + sort + fold-assemble + split -----
+    struct BaseRec {
+        uint32_t pos;
+        uint8_t open_flags;
+        std::string seq;
+        std::vector<color_run> runs;
+    };
+    for (uint32_t cb = 0; cb < chain_buckets; ++cb) {
+        std::vector<uint8_t> raw = read_spill_bucket_decoded(bases.bucket_path(cb));
+        if (raw.empty()) continue;
+        ankerl::unordered_dense::map<uint64_t, std::vector<BaseRec>> groups;
+        size_t p = 0;
+        while (p + 17 <= raw.size()) {
+            uint64_t cid;
+            uint32_t pos, slen;
+            std::memcpy(&cid, raw.data() + p, 8);
+            std::memcpy(&pos, raw.data() + p + 8, 4);
+            uint8_t of = raw[p + 12];
+            std::memcpy(&slen, raw.data() + p + 13, 4);
+            p += 17;
+            if (p + slen + 4 > raw.size()) break;
+            BaseRec br;
+            br.pos = pos;
+            br.open_flags = of;
+            br.seq.assign((char const*)raw.data() + p, slen);
+            p += slen;
+            uint32_t nruns;
+            std::memcpy(&nruns, raw.data() + p, 4);
+            p += 4;
+            if (p + (size_t)nruns * 12 > raw.size()) break;
+            br.runs.resize(nruns);
+            for (uint32_t i = 0; i < nruns; ++i) {
+                std::memcpy(&br.runs[i].cid, raw.data() + p, 8);
+                std::memcpy(&br.runs[i].num_kmers, raw.data() + p + 8, 4);
+                p += 12;
+            }
+            groups[cid].push_back(std::move(br));
+        }
+        for (auto& kv : groups) {
+            std::vector<BaseRec>& recs = kv.second;
+            std::sort(recs.begin(), recs.end(),
+                      [](BaseRec const& a, BaseRec const& b) { return a.pos < b.pos; });
+            std::string seq = std::move(recs[0].seq);
+            std::vector<color_run> runs = std::move(recs[0].runs);
+            const uint8_t of = recs[0].open_flags;
+            for (size_t i = 1; i < recs.size(); ++i) {
+                ext_concat_runs(runs, std::move(recs[i].runs));
+                seq.append(recs[i].seq.begin() + k, recs[i].seq.end());
+            }
+            id_tig_assembled_split(seq, runs, of, k, sink);
+        }
+    }
 }
 
 }  // namespace cdbg
