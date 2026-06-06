@@ -98,6 +98,25 @@ inline uint64_t process_peak_rss_bytes() {
 #endif
 }
 
+// Cumulative context-switch counts via getrusage(RUSAGE_SELF) -- the
+// kernel sums these across ALL threads of the process and they are
+// monotonically non-decreasing, so diffing two snapshots gives the
+// switches a phase incurred. Voluntary (ru_nvcsw) = a thread blocked and
+// yielded the CPU (contended mutex/futex, condvar, or blocking I/O);
+// involuntary (ru_nivcsw) = the scheduler preempted a runnable thread
+// (oversubscription / time-slice). Voluntary is the lock/I/O-contention
+// signal we attribute per phase.
+struct ctx_switch_counts {
+    uint64_t voluntary = 0;
+    uint64_t involuntary = 0;
+};
+
+inline ctx_switch_counts process_ctx_switches() {
+    struct rusage ru;
+    if (::getrusage(RUSAGE_SELF, &ru) != 0) return {};
+    return {(uint64_t)ru.ru_nvcsw, (uint64_t)ru.ru_nivcsw};
+}
+
 // Pretty-printer: 3.42 GiB / 728 MiB / 12 KiB, picking the largest
 // unit at which the number is >= 1.
 inline std::string format_bytes(uint64_t b) {
@@ -204,6 +223,9 @@ public:
         // matter for the -g budget -- a phase can be "within its share" yet
         // push the absolute peak over because of the carry-in.
         m_entry_live = current_rss_bytes();
+        // Context-switch baseline: the delta over the phase attributes the
+        // run's total voluntary switches (lock/I/O blocking) to a phase.
+        m_csw_baseline = process_ctx_switches();
     }
     ~phase_rss_marker() { stop(); }
 
@@ -234,11 +256,21 @@ public:
             std::cout << " [live in " << format_bytes(m_entry_live) << " -> out "
                       << format_bytes(exit_live) << "]";
         std::cout << "\n";
+
+        // Per-phase context switches: voluntary = threads that blocked (on a
+        // contended lock or blocking I/O) and yielded; this is what we drive
+        // down. Involuntary = scheduler preemptions, shown for context.
+        ctx_switch_counts csw = process_ctx_switches();
+        uint64_t vol = csw.voluntary - m_csw_baseline.voluntary;
+        uint64_t invol = csw.involuntary - m_csw_baseline.involuntary;
+        std::cout << "  [" << m_label << " ctx-switch] voluntary " << vol
+                  << "  involuntary " << invol << "\n";
     }
 
 private:
     std::string m_label;
     uint64_t m_baseline = 0;
+    ctx_switch_counts m_csw_baseline;
     uint64_t m_entry_live = 0;
     bool m_stopped = false;
 };
