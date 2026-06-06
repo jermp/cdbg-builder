@@ -1,0 +1,390 @@
+#pragma once
+
+// GGCAT-style id-only cross-bucket compaction + single base/color assembly.
+// Companion to stitch_extmem.hpp; see parallel-stitch-plan.md.
+//
+// Same doubling algorithm as stitch_extmem (boundary-k-mer keying, colorless
+// join, structural branch separation, O(log L) rounds), but the doubling loop
+// carries only fragment-ID chains -- NO bases and NO colors. A final pass then
+// assembles each closed chain's bases+colors exactly ONCE (like GGCAT's
+// build_unitigs), which is just a fold of the SAME ext_concat_runs + seq-append
+// the rounds use today. This removes the per-round base/color shuffle (LZ4 of
+// growing sequences every round) that dominates stitch_extmem.
+//
+// STEP 1 (this file): in-RAM round store + in-RAM assembly, so it is directly
+// comparable to stitch_unitigs_extmem in test_stitch (same Source/Sink). The
+// file-backed store and the scalable (sort/bucket) assembly come next; the
+// id-only doubling and the assembly fold validated here are reused unchanged.
+
+#include <algorithm>
+#include <cstdint>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <unordered_dense/unordered_dense.h>
+
+#include "kmer.hpp"           // kmer_int_t, reverse_complement, kmer_hasher, nuc_to_2bit
+#include "stitch.hpp"         // SIDE_*, UNITIG_OPEN_*, revcomp_string
+#include "stitch_extmem.hpp"  // ext_mix_bit/ext_rng_next/ext_pair_compatible/ext_end,
+                              // ext_concat_runs/ext_reverse_runs/ext_split_monochromatic
+
+namespace cdbg {
+namespace detail {
+
+// --- chain entries -----------------------------------------------------------
+// An entry packs a fragment id with its orientation: (frag_id << 1) | rc.
+// rc = 1 means the fragment is reverse-complemented when laid into the chain's
+// LEFT->RIGHT frame.
+inline uint64_t id_entry(uint64_t frag_id, bool rc) { return (frag_id << 1) | (rc ? 1ull : 0ull); }
+inline uint64_t id_entry_frag(uint64_t e) { return e >> 1; }
+inline bool id_entry_rc(uint64_t e) { return (e & 1ull) != 0; }
+
+// Reverse a chain: flip element order AND each fragment's orientation bit.
+inline void id_reverse_entries(std::vector<uint64_t>& e) {
+    std::reverse(e.begin(), e.end());
+    for (auto& x : e) x ^= 1ull;
+}
+
+// --- the id-only tig ---------------------------------------------------------
+// A partial chain with up to two open ends. kl/kr are the boundary k-mers read
+// FORWARD in the current chain frame at the LEFT/RIGHT end (valid iff that end
+// is open). We store the forward-frame value (not the canonical) and derive the
+// canonical + is_canonical_fwd on demand, so palindromic boundary k-mers (only
+// possible for even k) stay correct under reversal -- unlike a stored-canonical
+// flag, which would mis-flip on a palindrome.
+struct id_tig {
+    kmer_int_t kl = 0, kr = 0;
+    uint8_t open_flags = 0;
+    uint64_t rng = 0;
+    std::vector<uint64_t> entries;  // LEFT->RIGHT in the current frame
+};
+
+// Deterministic per-fragment rng seed. Unlike stitch_extmem (which seeds from
+// sequence content because it has the bases), the compaction loop has only ids,
+// so we seed from frag_id. Only requirement: distinct both-open tigs get
+// distinct streams so they don't flip their presented end in lockstep -- this is
+// a convergence (round-count) property, not a correctness one, so a per-id mix
+// is at least as good as per-content. (splitmix64 finalizer, never zero.)
+inline uint64_t id_rng_seed(uint64_t frag_id) {
+    uint64_t h = frag_id + 0x9e3779b97f4a7c15ull;
+    h ^= h >> 30;
+    h *= 0xbf58476d1ce4e5b9ull;
+    h ^= h >> 27;
+    h *= 0x94d049bb133111ebull;
+    h ^= h >> 31;
+    return h ? h : 0x9e3779b97f4a7c15ull;
+}
+
+// Boundary k-mer read FORWARD in `seq`'s frame at the given side (NOT canonical).
+inline kmer_int_t id_fwd_kmer(std::string_view seq, uint32_t k, uint8_t side) {
+    char const* p = (side == SIDE_LEFT) ? seq.data() : seq.data() + (seq.size() - k);
+    kmer_int_t v = 0;
+    for (uint32_t i = 0; i < k; ++i) v = (v << 2) | (kmer_int_t)nuc_to_2bit(p[i]);
+    return v;
+}
+
+// canonical(kf) + whether the forward-frame value IS the canonical one.
+inline kmer_int_t id_canon(kmer_int_t kf, uint32_t k, bool& fwd) {
+    kmer_int_t rc = reverse_complement(kf, k);
+    if (kf <= rc) {
+        fwd = true;
+        return kf;
+    }
+    fwd = false;
+    return rc;
+}
+
+// Choose the presented open side from open_flags + rng (mirrors ext_choose_side,
+// which is itself base-agnostic but takes an ext_tig).
+inline bool id_choose_side(uint8_t open_flags, uint64_t rng, uint8_t& side) {
+    bool l = (open_flags & UNITIG_OPEN_LEFT) != 0;
+    bool r = (open_flags & UNITIG_OPEN_RIGHT) != 0;
+    if (l && r) {
+        side = ext_mix_bit(rng) ? SIDE_RIGHT : SIDE_LEFT;
+        return true;
+    }
+    if (l) {
+        side = SIDE_LEFT;
+        return true;
+    }
+    if (r) {
+        side = SIDE_RIGHT;
+        return true;
+    }
+    return false;
+}
+
+// Build the ext_end (canonical junction / side / is_canonical_fwd) for t's
+// chosen side. Returns false if t is fully closed. Reuses ext_end +
+// ext_pair_compatible from stitch_extmem unchanged (both are base-free).
+inline bool id_end(id_tig const& t, uint32_t k, ext_end& out) {
+    uint8_t side;
+    if (!id_choose_side(t.open_flags, t.rng, side)) return false;
+    kmer_int_t kf = (side == SIDE_LEFT) ? t.kl : t.kr;
+    bool fwd;
+    kmer_int_t j = id_canon(kf, k, fwd);
+    out = ext_end{0, j, side, fwd};
+    return true;
+}
+
+// Join two id-tigs at a shared, compatible boundary k-mer. `a` is oriented with
+// its keyed end at the RIGHT and `b` with its keyed end at the LEFT, then the
+// chains concatenate. Mirrors ext_join's end/orientation bookkeeping exactly
+// (see its comments) but on entries + end-kmers instead of seq + runs. NO entry
+// is dropped: both fragments keep their shared boundary k-mer; the k-base
+// overlap is removed once, at assembly.
+inline id_tig id_join(id_tig const& a, uint8_t a_side, id_tig const& b, uint8_t b_side,
+                      uint32_t k) {
+    id_tig m;
+    // a oriented keyed-end-RIGHT: merged LEFT = a's other (non-keyed) end.
+    std::vector<uint64_t> ae = a.entries;
+    bool left_open;
+    if (a_side == SIDE_RIGHT) {  // frame unchanged
+        m.kl = a.kl;
+        left_open = (a.open_flags & UNITIG_OPEN_LEFT) != 0;
+    } else {  // a reversed
+        id_reverse_entries(ae);
+        m.kl = reverse_complement(a.kr, k);
+        left_open = (a.open_flags & UNITIG_OPEN_RIGHT) != 0;
+    }
+    // b oriented keyed-end-LEFT: merged RIGHT = b's other end.
+    std::vector<uint64_t> be = b.entries;
+    bool right_open;
+    if (b_side == SIDE_LEFT) {  // frame unchanged
+        m.kr = b.kr;
+        right_open = (b.open_flags & UNITIG_OPEN_RIGHT) != 0;
+    } else {  // b reversed
+        id_reverse_entries(be);
+        m.kr = reverse_complement(b.kl, k);
+        right_open = (b.open_flags & UNITIG_OPEN_LEFT) != 0;
+    }
+    m.entries = std::move(ae);
+    m.entries.insert(m.entries.end(), be.begin(), be.end());
+    m.open_flags = (uint8_t)((left_open ? UNITIG_OPEN_LEFT : 0) |
+                             (right_open ? UNITIG_OPEN_RIGHT : 0));
+    m.rng = a.rng ^ (b.rng * 0x9e3779b97f4a7c15ull);
+    if (m.rng == 0) m.rng = 0x9e3779b97f4a7c15ull;
+    return m;
+}
+
+// --- in-RAM round store (Step 1) --------------------------------------------
+// Same interface as round_store_mem (emit / take_input_bucket / advance), holding
+// id_tigs instead of ext_tigs.
+struct id_round_store_mem {
+    explicit id_round_store_mem(uint32_t num_buckets)
+        : m_in(num_buckets), m_out(num_buckets), m_locks(num_buckets),
+          m_num_buckets(num_buckets) {}
+
+    uint32_t num_buckets() const { return m_num_buckets; }
+
+    void emit(uint32_t b, id_tig&& t) {
+        std::lock_guard<std::mutex> lk(m_locks[b]);
+        m_out[b].push_back(std::move(t));
+    }
+
+    std::vector<id_tig> take_input_bucket(uint32_t b) {
+        std::vector<id_tig> v = std::move(m_in[b]);
+        m_in[b].clear();
+        return v;
+    }
+
+    void advance() {
+        m_in.swap(m_out);
+        for (auto& v : m_out) v.clear();
+    }
+
+private:
+    std::vector<std::vector<id_tig>> m_in, m_out;
+    std::vector<std::mutex> m_locks;
+    uint32_t m_num_buckets;
+};
+
+// Route an id-tig to a round-output bucket by its presented end's canonical
+// junction. Returns false (does nothing) if fully closed -- caller sinks it.
+template <typename Store>
+inline bool id_route(id_tig&& t, uint32_t k, Store& store) {
+    ext_end e;
+    if (!id_end(t, k, e)) return false;
+    uint32_t b = (uint32_t)((kmer_hasher{}(e.junction) >> 1) % store.num_buckets());
+    store.emit(b, std::move(t));
+    return true;
+}
+
+// A closed (or terminal-flushed) chain handed to assembly: the ordered entry
+// list plus the residual open_flags (0 for a genuinely closed chain; the
+// unmatched end's flag for a terminal-flushed one, so assembly drops the right
+// extremal foreign run -- exactly as the rounds pass open_flags to
+// ext_split_monochromatic today).
+struct id_chain {
+    std::vector<uint64_t> entries;
+    uint8_t open_flags;
+};
+
+// Seed round 0: build one id-tig per fragment, route open ones, sink closed ones
+// as length-1 chains. Mirrors ext_seed_round0 but reads only open_flags (+ the
+// boundary k-mers of open ends) -- not the whole sequence into the loop.
+template <typename Source, typename Store, typename ChainSink>
+inline void id_seed(Source& frag, uint32_t k, Store& store, ChainSink&& chain_sink) {
+    const uint64_t n = (uint64_t)frag.size();
+    for (uint64_t i = 0; i < n; ++i) {
+        uint8_t of = frag.open_flags(i);
+        if (k < 2 || of == 0) {
+            chain_sink(id_chain{std::vector<uint64_t>{id_entry(i, false)}, 0});
+            continue;
+        }
+        std::string_view sv = frag.seq_view(i);
+        id_tig t;
+        t.open_flags = of;
+        t.rng = id_rng_seed(i);
+        t.entries.push_back(id_entry(i, false));
+        if (of & UNITIG_OPEN_LEFT) t.kl = id_fwd_kmer(sv, k, SIDE_LEFT);
+        if (of & UNITIG_OPEN_RIGHT) t.kr = id_fwd_kmer(sv, k, SIDE_RIGHT);
+        id_route(std::move(t), k, store);
+    }
+    store.advance();
+}
+
+// Doubling rounds on id-tigs. Each round pairs co-bucketed tigs presenting the
+// same canonical boundary k-mer with compatible orientation, joins them, and
+// re-routes survivors; closed tigs are emitted as chains. Terminates when a
+// round makes zero joins, then flushes the remaining open tigs as terminal
+// chains. Single-threaded (Step 1); the parallel driver is added with the file
+// store. Structure mirrors ext_run_rounds' process_bucket exactly.
+template <typename Store, typename ChainSink>
+inline void id_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, ChainSink&& chain_sink) {
+    constexpr uint32_t MAX_ROUNDS = 4096;
+
+    auto process_bucket = [&](uint32_t b) -> uint64_t {
+        std::vector<id_tig> tigs = store.take_input_bucket(b);
+        if (tigs.empty()) return 0;
+        const uint64_t NT = tigs.size();
+        uint64_t joined = 0;
+        std::vector<ext_end> ends(NT);
+        std::vector<uint8_t> has_end(NT, 0), consumed(NT, 0);
+        ankerl::unordered_dense::map<kmer_int_t, uint64_t, kmer_hasher> waiting;
+        waiting.reserve(NT);
+
+        for (uint64_t i = 0; i < NT; ++i) {
+            ext_end e;
+            if (id_end(tigs[i], k, e)) {
+                e.tig_idx = i;
+                ends[i] = e;
+                has_end[i] = 1;
+            }
+        }
+        for (uint64_t i = 0; i < NT; ++i) {
+            if (consumed[i] || !has_end[i]) continue;
+            kmer_int_t j = ends[i].junction;
+            auto it = waiting.find(j);
+            if (it == waiting.end()) {
+                waiting.emplace(j, i);
+                continue;
+            }
+            uint64_t a_idx = it->second;
+            if (consumed[a_idx]) {
+                it->second = i;
+                continue;
+            }
+            if (!ext_pair_compatible(ends[a_idx], ends[i])) continue;  // real terminus
+            id_tig merged = id_join(tigs[a_idx], ends[a_idx].side, tigs[i], ends[i].side, k);
+            consumed[a_idx] = 1;
+            consumed[i] = 1;
+            waiting.erase(it);
+            ++joined;
+            if (merged.open_flags == 0)
+                chain_sink(id_chain{std::move(merged.entries), 0});
+            else
+                id_route(std::move(merged), k, store);
+        }
+        for (uint64_t i = 0; i < NT; ++i) {
+            if (consumed[i]) continue;
+            if (tigs[i].open_flags == 0) {
+                chain_sink(id_chain{std::move(tigs[i].entries), 0});
+                continue;
+            }
+            id_tig t = std::move(tigs[i]);
+            bool both = (t.open_flags & UNITIG_OPEN_LEFT) && (t.open_flags & UNITIG_OPEN_RIGHT);
+            if (both) ext_rng_next(t.rng);  // re-roll presented end
+            id_route(std::move(t), k, store);
+        }
+        return joined;
+    };
+
+    for (uint32_t round_no = 0;; ++round_no) {
+        uint64_t joined = 0;
+        for (uint32_t b = 0; b < num_buckets; ++b) joined += process_bucket(b);
+        store.advance();
+        if (joined == 0 || round_no >= MAX_ROUNDS) {
+            // No further join is possible: flush every remaining open tig as a
+            // terminal chain (its open end has no partner in the graph).
+            for (uint32_t b = 0; b < num_buckets; ++b) {
+                std::vector<id_tig> rem = store.take_input_bucket(b);
+                for (auto& t : rem) chain_sink(id_chain{std::move(t.entries), t.open_flags});
+            }
+            return;
+        }
+    }
+}
+
+// Split an assembled tig into monochromatic unitigs. Kept separate so the
+// file/parallel path can reuse it. Builds a scratch ext_tig only to feed
+// ext_split_monochromatic (which takes one).
+template <typename Sink>
+inline void id_tig_assembled_split(std::string& seq, std::vector<color_run>& runs,
+                                   uint8_t open_flags, uint32_t k, Sink&& sink) {
+    ext_tig t;
+    t.seq = std::move(seq);
+    t.runs = std::move(runs);
+    t.open_flags = open_flags;
+    ext_split_monochromatic(t, k, open_flags, [&](stitchable_unitig&& u) { sink(std::move(u)); });
+}
+
+// Assemble one chain's bases+colors and split into monochromatic unitigs. This
+// is a fold of the SAME ext_concat_runs + seq-append (drop the k-base overlap)
+// the rounds' ext_join performs, so the result is identical to what the
+// base-carrying stitch produces for the same chain -- then the same
+// ext_split_monochromatic cut. `frag` provides seq_view(id)/runs(id).
+template <typename Source, typename Sink>
+inline void id_assemble_chain(id_chain const& c, Source& frag, uint32_t k, Sink&& sink) {
+    std::string seq;
+    std::vector<color_run> runs;
+    for (size_t idx = 0; idx < c.entries.size(); ++idx) {
+        const uint64_t fid = id_entry_frag(c.entries[idx]);
+        const bool rc = id_entry_rc(c.entries[idx]);
+        std::string_view sv = frag.seq_view(fid);
+        std::string s(sv.data(), sv.size());
+        std::vector<color_run> r = frag.runs(fid);
+        if (rc) {
+            s = revcomp_string(s);
+            ext_reverse_runs(r);
+        }
+        if (idx == 0) {
+            seq = std::move(s);
+            runs = std::move(r);
+        } else {
+            ext_concat_runs(runs, std::move(r));    // reconcile + drop shared X unit
+            seq.append(s.begin() + k, s.end());      // drop the k-base overlap
+        }
+    }
+    id_tig_assembled_split(seq, runs, c.open_flags, k, sink);
+}
+
+}  // namespace detail
+
+// In-RAM id-only compaction stitch (STEP 1): same Source/Sink contract as
+// stitch_unitigs_extmem, for validation against it in test_stitch. Seeds + runs
+// the id-only doubling collecting closed chains, then assembles + splits each.
+template <typename Source, typename Sink>
+inline void compact_stitch_mem(Source& frag, uint32_t k, Sink&& sink, uint32_t num_buckets = 0) {
+    if (num_buckets == 0) num_buckets = 256;
+    detail::id_round_store_mem store(num_buckets);
+    std::vector<detail::id_chain> chains;
+    auto chain_sink = [&](detail::id_chain&& c) { chains.push_back(std::move(c)); };
+    detail::id_seed(frag, k, store, chain_sink);
+    detail::id_run_rounds(store, k, num_buckets, chain_sink);
+    for (auto const& c : chains) detail::id_assemble_chain(c, frag, k, sink);
+}
+
+}  // namespace cdbg

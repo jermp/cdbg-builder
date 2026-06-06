@@ -28,6 +28,7 @@
 #include <filesystem>
 #include <unistd.h>
 
+#include "compact_extmem.hpp"  // GGCAT-style id-only compaction (parallel-stitch)
 #include "gen.hpp"
 #include "stitch.hpp"
 #include "stitch_extmem.hpp"
@@ -53,7 +54,7 @@ multiset_t to_multiset(std::vector<stitchable_unitig> const& v) {
     return m;
 }
 
-enum class which_stitch { ext_mem, ext_file, ext_file_mt };
+enum class which_stitch { ext_mem, ext_file, ext_file_mt, compact_mem };
 
 char const* stitch_name(which_stitch w) {
     switch (w) {
@@ -61,8 +62,10 @@ char const* stitch_name(which_stitch w) {
             return "ext_mem";
         case which_stitch::ext_file:
             return "ext_file";
-        default:
+        case which_stitch::ext_file_mt:
             return "ext_file_mt";
+        default:
+            return "compact_mem";
     }
 }
 
@@ -82,6 +85,11 @@ void run_stitch(which_stitch w, std::vector<stitchable_unitig>& frags, uint32_t 
         // Small bucket count exercises multi-round doubling on tiny
         // inputs; 0 would pick the production default.
         cdbg::stitch_unitigs_extmem(src, k, sink, /*num_buckets=*/16);
+    } else if (w == which_stitch::compact_mem) {
+        // GGCAT-style id-only compaction + fold assembly (parallel-stitch Step 1).
+        // Must produce the same unitig multiset as ext_mem.
+        cdbg::vector_frag_source src(frags);
+        cdbg::compact_stitch_mem(src, k, sink, /*num_buckets=*/16);
     } else {
         cdbg::vector_frag_source src(frags);
         std::string dir = std::filesystem::temp_directory_path().string() +
@@ -155,7 +163,8 @@ bool run_case(uint64_t seed, uint32_t k, uint64_t num_unitigs, uint64_t max_len,
     bool b = run_case_impl(which_stitch::ext_mem, seed, k, num_unitigs, max_len, max_frags);
     bool c = run_case_impl(which_stitch::ext_file, seed, k, num_unitigs, max_len, max_frags);
     bool d = run_case_impl(which_stitch::ext_file_mt, seed, k, num_unitigs, max_len, max_frags);
-    return b && c && d;
+    bool e = run_case_impl(which_stitch::compact_mem, seed, k, num_unitigs, max_len, max_frags);
+    return b && c && d && e;
 }
 
 // Shared-cid branchy correctness case. Builds `num_clusters` branch
@@ -198,7 +207,8 @@ bool run_branch_case(uint64_t seed, uint32_t k, uint64_t num_clusters) {
     bool b = run_branch_case_impl(which_stitch::ext_mem, seed, k, num_clusters);
     bool c = run_branch_case_impl(which_stitch::ext_file, seed, k, num_clusters);
     bool d = run_branch_case_impl(which_stitch::ext_file_mt, seed, k, num_clusters);
-    return b && c && d;
+    bool e = run_branch_case_impl(which_stitch::compact_mem, seed, k, num_clusters);
+    return b && c && d && e;
 }
 
 // Larger case: report timing + fragment/unitig counts, plus the same
@@ -224,7 +234,8 @@ bool run_scale(uint64_t seed, uint32_t k, uint64_t num_unitigs) {
     std::vector<stitchable_unitig> out;
     bool ok = true;
     for (which_stitch w :
-         {which_stitch::ext_mem, which_stitch::ext_file, which_stitch::ext_file_mt}) {
+         {which_stitch::ext_mem, which_stitch::ext_file, which_stitch::ext_file_mt,
+          which_stitch::compact_mem}) {
         auto t0 = std::chrono::steady_clock::now();
         run_stitch(w, frags, k, out);
         auto t1 = std::chrono::steady_clock::now();
