@@ -61,6 +61,7 @@
 #include "bucket_ingester.hpp"
 #include "bucket_walker.hpp"
 #include "minimizer.hpp"
+#include "compact_extmem.hpp"
 #include "stitch.hpp"
 #include "stitch_extmem.hpp"
 #include "streaming_color_set_dict.hpp"
@@ -312,7 +313,6 @@ struct builder {
                 uwriter_ptr = std::make_unique<unitig_bucket_writer>(
                     tmp_dir, m_num_color_classes, unitig_bucket_count);
 
-                frag_unitig_stream_reader frag_reader(frag_sink.path());
                 std::atomic<uint64_t> done{0};
                 progress prog("stitch", done, n_frags);
                 // External-memory iterative-doubling stitch: per-round
@@ -330,12 +330,39 @@ struct builder {
                 // RNG), so this fans out cleanly. Output is unchanged --
                 // emit_fasta sorts each cid-bucket, so .fa is identical
                 // regardless of which thread emitted which unitig.
-                stitch_unitigs_extmem_file_stream(frag_reader, m_cfg.k, tmp_dir,
-                                                  std::ref(*uwriter_ptr), stitch_buckets, &done,
-                                                  m_cfg.num_threads);
+                if (m_cfg.compact_stitch) {
+                    // GGCAT-style id-only compaction: the doubling carries only
+                    // fragment-id chains; bases/colors are assembled once at the
+                    // end by a RAM-bounded re-bucket pass. for_each_frag reopens
+                    // the spill for each of its two passes (seed, base-attach);
+                    // each holds one fragment at a time -- the spill is unlinked
+                    // only after this block, so both passes see it.
+                    // for_each_frag is invoked twice (seed, then base-attach);
+                    // advance the progress bar only on the first pass so it
+                    // tracks 0..n_frags rather than overshooting to 2x.
+                    bool first_pass = true;
+                    auto for_each_frag = [&](auto&& fn) {
+                        frag_unitig_stream_reader rd(frag_sink.path());
+                        uint8_t of;
+                        std::vector<color_run> runs;
+                        std::string seq;
+                        const bool count = first_pass;
+                        while (rd.next(of, runs, seq)) {
+                            fn(of, runs, seq);
+                            if (count) done.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        first_pass = false;
+                    };
+                    compact_stitch_scalable(for_each_frag, n_frags, m_cfg.k, tmp_dir,
+                                            std::ref(*uwriter_ptr), stitch_buckets);
+                } else {
+                    frag_unitig_stream_reader frag_reader(frag_sink.path());
+                    stitch_unitigs_extmem_file_stream(frag_reader, m_cfg.k, tmp_dir,
+                                                      std::ref(*uwriter_ptr), stitch_buckets, &done,
+                                                      m_cfg.num_threads);
+                }
                 prog.stop();
                 std::cout << "  unitigs after stitching: " << uwriter_ptr->total_unitigs() << "\n";
-                // frag_reader destroyed here -- file handle closed.
             }
             rss.stop();
         }
