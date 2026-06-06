@@ -356,29 +356,19 @@ public:
     frag_unitig_writer& operator=(frag_unitig_writer const&) = delete;
 
     void operator()(stitchable_unitig&& u) {
-        std::lock_guard<std::mutex> lk(m_mu);
         const uint8_t flags = u.open_flags;
         const uint32_t nruns = (uint32_t)u.runs.size();
         const uint32_t seq_len = (uint32_t)u.seq.size();
-        if (std::fwrite(&flags, sizeof(flags), 1, m_file) != 1 ||
-            std::fwrite(&nruns, sizeof(nruns), 1, m_file) != 1)
-            throw std::runtime_error("short write to " + m_path);
-        for (auto const& r : u.runs) {
-            if (std::fwrite(&r.cid, sizeof(r.cid), 1, m_file) != 1 ||
-                std::fwrite(&r.num_kmers, sizeof(r.num_kmers), 1, m_file) != 1)
-                throw std::runtime_error("short write to " + m_path);
-        }
-        if (std::fwrite(&seq_len, sizeof(seq_len), 1, m_file) != 1)
-            throw std::runtime_error("short write to " + m_path);
-        if (seq_len > 0 &&
-            std::fwrite(u.seq.data(), 1, seq_len, m_file) != (size_t)seq_len)
-            throw std::runtime_error("short write to " + m_path);
-        ++m_count;
-        m_total_seq_bytes += seq_len;
-        // Companion links record (same lock => same frag_id order as the frag
-        // spill). Compute the FORWARD boundary k-mer of each open end exactly as
-        // detail::id_fwd_kmer does (v = (v<<2)|2bit over the first/last k bases),
-        // store its low kbytes little-endian. open_flags != 0 implies seq_len >= k.
+        // Build the links record BEFORE taking the lock: the boundary k-mer
+        // compute is the only real CPU here, so keep it off the critical section
+        // (otherwise it serializes across all bucket-process threads). frag_id
+        // order is still identical to the frag spill because the fwrites below
+        // run under the lock in call order. Compute the FORWARD boundary k-mer of
+        // each open end exactly as detail::id_fwd_kmer does
+        // (v = (v<<2)|2bit over the first/last k bases); store low kbytes
+        // little-endian. open_flags != 0 implies seq_len >= k.
+        uint8_t lrec[1 + 32];
+        size_t lrsz = 0;
         if (m_links_file) {
             kmer_int_t kl = 0, kr = 0;
             if (flags & UNITIG_OPEN_LEFT) {
@@ -394,15 +384,31 @@ public:
                     v = (v << 2) | (kmer_int_t)nuc_to_2bit(p[i]);
                 kr = v;
             }
-            uint8_t rec[1 + 32];
-            rec[0] = flags;
-            for (uint32_t b = 0; b < m_kbytes; ++b) rec[1 + b] = (uint8_t)(kl >> (8 * b));
+            lrec[0] = flags;
+            for (uint32_t b = 0; b < m_kbytes; ++b) lrec[1 + b] = (uint8_t)(kl >> (8 * b));
             for (uint32_t b = 0; b < m_kbytes; ++b)
-                rec[1 + m_kbytes + b] = (uint8_t)(kr >> (8 * b));
-            const size_t rsz = (size_t)1 + 2 * m_kbytes;
-            if (std::fwrite(rec, 1, rsz, m_links_file) != rsz)
-                throw std::runtime_error("short write to " + m_links_path);
+                lrec[1 + m_kbytes + b] = (uint8_t)(kr >> (8 * b));
+            lrsz = (size_t)1 + 2 * m_kbytes;
         }
+
+        std::lock_guard<std::mutex> lk(m_mu);
+        if (std::fwrite(&flags, sizeof(flags), 1, m_file) != 1 ||
+            std::fwrite(&nruns, sizeof(nruns), 1, m_file) != 1)
+            throw std::runtime_error("short write to " + m_path);
+        for (auto const& r : u.runs) {
+            if (std::fwrite(&r.cid, sizeof(r.cid), 1, m_file) != 1 ||
+                std::fwrite(&r.num_kmers, sizeof(r.num_kmers), 1, m_file) != 1)
+                throw std::runtime_error("short write to " + m_path);
+        }
+        if (std::fwrite(&seq_len, sizeof(seq_len), 1, m_file) != 1)
+            throw std::runtime_error("short write to " + m_path);
+        if (seq_len > 0 &&
+            std::fwrite(u.seq.data(), 1, seq_len, m_file) != (size_t)seq_len)
+            throw std::runtime_error("short write to " + m_path);
+        ++m_count;
+        m_total_seq_bytes += seq_len;
+        if (lrsz && std::fwrite(lrec, 1, lrsz, m_links_file) != lrsz)
+            throw std::runtime_error("short write to " + m_links_path);
         // Free the merged seq's backing storage in place: the caller
         // already moved into us.
         std::string().swap(u.seq);
