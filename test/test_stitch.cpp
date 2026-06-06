@@ -139,8 +139,12 @@ void run_stitch(which_stitch w, std::vector<stitchable_unitig>& frags, uint32_t 
         };
         // 4 threads exercises the parallel round driver + thread-safe chain
         // sink; output is a thread-count-independent multiset (compared canonical).
+        // A tiny RAM cap (4 KiB) forces the hybrid stores to spill almost every
+        // record to disk, stressing the overflow path (RAM batch + spilled frames
+        // merged on read). Output must still match the oracle.
         cdbg::compact_stitch_scalable(for_each, src.size(), k, dir, sink, /*num_buckets=*/16,
-                                      /*frag_ranges=*/4, /*chain_buckets=*/4, /*num_threads=*/4);
+                                      /*frag_ranges=*/4, /*chain_buckets=*/4, /*num_threads=*/4,
+                                      /*links_path=*/"", /*ram_budget_bytes=*/4096);
         std::filesystem::remove_all(dir);
     } else if (w == which_stitch::compact_scalable_links) {
         // Same as compact_scalable, but the seed reads the companion LINKS spill

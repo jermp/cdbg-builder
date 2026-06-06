@@ -340,16 +340,31 @@ struct builder {
                 if (m_cfg.compact_stitch) {
                     // GGCAT-style id-only compaction on a single, always-on-disk
                     // path: the doubling carries only fragment-id chains; bases +
-                    // colors are assembled at the end through an on-disk re-bucket,
-                    // so peak RAM is bounded by -g independent of the fragment
-                    // count -- the -g bound is honored at all costs. Round 0 seeds
-                    // from the precomputed links spill (boundary k-mers,
-                    // ~17 B/fragment) instead of a second full frag-spill read.
-                    // There is deliberately NO separate in-RAM arena path to
-                    // maintain: spare RAM beyond -g is still used, just by the OS
-                    // page cache keeping the tmp spills hot rather than by a second
-                    // code path.
-                    std::cout << "  compact stitch: scalable disk re-bucket\n";
+                    // colors are assembled at the end through an on-disk re-bucket.
+                    // The stores are RAM-FIRST: round store, member, and base
+                    // records stay in RAM up to a -g-derived cap and spill only the
+                    // overflow to disk. So when the working set fits, the whole
+                    // stitch runs in RAM (no disk round-trip); when it does not, it
+                    // degrades to disk and the -g bound is honored at all costs.
+                    // Round 0 seeds from the precomputed links spill (boundary
+                    // k-mers, ~17 B/fragment), not a second full frag-spill read.
+                    //
+                    // cap = -g minus the cross-phase carry (the color dict that
+                    // stays resident through stitch) minus a working-set reserve
+                    // for the per-bucket decode set. 0 means no -g => use all RAM.
+                    size_t stitch_ram_cap = 0;
+                    if (m_cfg.max_ram_gb > 0) {
+                        const uint64_t total =
+                            (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0);
+                        const uint64_t carry =
+                            global_dict.resident_bytes() + (uint64_t)(2.0 * 1024 * 1024 * 1024);
+                        stitch_ram_cap = total > carry ? (size_t)(total - carry)
+                                                       : (size_t)(256ull * 1024 * 1024);
+                    }
+                    std::cout << "  compact stitch: scalable, RAM-first cap "
+                              << (stitch_ram_cap ? format_bytes(stitch_ram_cap)
+                                                 : std::string("unlimited"))
+                              << "\n";
                     auto for_each_frag = [&, first_pass = true](auto&& fn) mutable {
                         frag_unitig_stream_reader rd(frag_sink.path());
                         uint8_t of;
@@ -365,7 +380,8 @@ struct builder {
                     compact_stitch_scalable(for_each_frag, n_frags, m_cfg.k, tmp_dir,
                                             std::ref(*uwriter_ptr), stitch_buckets,
                                             /*frag_ranges=*/0, /*chain_buckets=*/0,
-                                            m_cfg.num_threads, frag_sink.links_path());
+                                            m_cfg.num_threads, frag_sink.links_path(),
+                                            stitch_ram_cap);
                 } else {
                     frag_unitig_stream_reader frag_reader(frag_sink.path());
                     stitch_unitigs_extmem_file_stream(frag_reader, m_cfg.k, tmp_dir,

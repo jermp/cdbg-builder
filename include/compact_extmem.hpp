@@ -251,6 +251,36 @@ inline size_t id_tig_deserialize(uint8_t const* buf, size_t buf_len, id_tig& t) 
     return p;
 }
 
+// Shared RAM accountant for the hybrid (RAM-first, overflow-to-disk) stores.
+// All hybrid stores active in one stitch draw from a single budget: each retains
+// its records in RAM and, when the shared `used` exceeds `cap`, the store that
+// pushed it over spills one of its own buckets to disk. So spare RAM up to `cap`
+// is exploited and the -g bound is honored at all costs (overflow always spills).
+// cap == SIZE_MAX means unbounded (no -g): everything stays in RAM.
+struct ram_budget {
+    std::atomic<size_t> used{0};
+    size_t cap;
+    explicit ram_budget(size_t c) : cap(c) {}
+    void add(size_t n) { used.fetch_add(n, std::memory_order_relaxed); }
+    void sub(size_t n) { used.fetch_sub(n, std::memory_order_relaxed); }
+    bool over() const { return used.load(std::memory_order_relaxed) > cap; }
+};
+
+// Defined below (after the spill writer); forward-declared for the hybrid store.
+inline std::vector<uint8_t> read_spill_bucket_decoded(std::string const& path);
+
+// Parse a flat byte run of serialized id_tigs into `out` (appends).
+inline void id_tigs_decode_into(uint8_t const* raw, size_t len, std::vector<id_tig>& out) {
+    size_t pos = 0;
+    while (pos < len) {
+        id_tig t;
+        size_t got = id_tig_deserialize(raw + pos, len - pos, t);
+        if (got == 0) break;
+        pos += got;
+        out.push_back(std::move(t));
+    }
+}
+
 // File-backed id-tig round store: one LZ4-framed file per bucket per round, one
 // bucket resident at a time. Clone of round_store_file (stitch_extmem.hpp) with
 // the id_tig codec; see there for the frame format and concurrency notes.
@@ -361,6 +391,124 @@ private:
     std::vector<std::FILE*> m_files;
     std::vector<std::mutex> m_locks;
     uint32_t m_in_round = 0;
+    uint32_t m_out_round = 0;
+};
+
+// RAM-first id-tig round store (overflow to disk). Same interface as
+// id_round_store_file (emit / take_input_bucket / advance / num_buckets), but
+// each output bucket's serialized id_tigs are retained UNCOMPRESSED in RAM and
+// persist across advance() (output becomes the next round's input read straight
+// from RAM -- no disk round-trip). When the shared ram_budget is exceeded, the
+// emitting thread spills its own bucket: the RAM bytes are LZ4-framed to a
+// per-round disk file and dropped from RAM. take_input_bucket merges the RAM
+// part with any spilled frames. So the doubling rounds run entirely in RAM when
+// they fit -g, and degrade gracefully to disk when they do not.
+class id_round_store_hybrid {
+public:
+    id_round_store_hybrid(std::string dir, uint32_t num_buckets, ram_budget* budget)
+        : m_dir(std::move(dir)), m_num_buckets(num_buckets), m_budget(budget),
+          m_ram_in(num_buckets), m_ram_out(num_buckets), m_spill_in(num_buckets),
+          m_spill_out_path(num_buckets), m_spill_out_file(num_buckets, nullptr),
+          m_locks(num_buckets) {}
+
+    ~id_round_store_hybrid() {
+        std::error_code ec;
+        for (uint32_t b = 0; b < m_num_buckets; ++b) {
+            if (m_spill_out_file[b]) std::fclose(m_spill_out_file[b]);
+            if (!m_spill_out_path[b].empty()) std::filesystem::remove(m_spill_out_path[b], ec);
+            if (!m_spill_in[b].empty()) std::filesystem::remove(m_spill_in[b], ec);
+        }
+    }
+
+    id_round_store_hybrid(id_round_store_hybrid const&) = delete;
+    id_round_store_hybrid& operator=(id_round_store_hybrid const&) = delete;
+
+    uint32_t num_buckets() const { return m_num_buckets; }
+
+    void emit(uint32_t b, id_tig&& t) {
+        std::lock_guard<std::mutex> lk(m_locks[b]);
+        size_t before = m_ram_out[b].size();
+        id_tig_serialize(t, m_ram_out[b]);
+        if (m_budget) {
+            m_budget->add(m_ram_out[b].size() - before);
+            if (m_budget->over()) spill_out(b);  // drains this bucket's RAM to disk
+        }
+    }
+
+    std::vector<id_tig> take_input_bucket(uint32_t b) {
+        std::vector<uint8_t> ram;
+        std::string spill;
+        {
+            std::lock_guard<std::mutex> lk(m_locks[b]);
+            ram.swap(m_ram_in[b]);
+            spill.swap(m_spill_in[b]);
+        }
+        if (m_budget) m_budget->sub(ram.size());
+        std::vector<id_tig> out;
+        id_tigs_decode_into(ram.data(), ram.size(), out);
+        if (!spill.empty()) {
+            std::vector<uint8_t> raw = read_spill_bucket_decoded(spill);  // decodes + deletes
+            id_tigs_decode_into(raw.data(), raw.size(), out);
+        }
+        return out;
+    }
+
+    void advance() {
+        for (uint32_t b = 0; b < m_num_buckets; ++b) {
+            if (m_spill_out_file[b]) {
+                uint32_t eof = 0;
+                std::fwrite(&eof, sizeof(eof), 1, m_spill_out_file[b]);
+                std::fclose(m_spill_out_file[b]);
+                m_spill_out_file[b] = nullptr;
+            }
+            // Output (RAM + spill path) becomes the next round's input. The old
+            // input buffers were emptied by take_input_bucket already.
+            m_ram_in[b].swap(m_ram_out[b]);
+            m_ram_out[b].clear();
+            m_spill_in[b].swap(m_spill_out_path[b]);
+            m_spill_out_path[b].clear();
+        }
+        ++m_out_round;
+    }
+
+private:
+    std::string bucket_path(uint32_t round, uint32_t b) const {
+        return m_dir + "/idstitchH_r" + std::to_string(round) + "_b" + std::to_string(b) + ".bin";
+    }
+
+    // Compress this bucket's retained RAM bytes into one frame appended to its
+    // per-round spill file, then drop them from RAM. Caller holds m_locks[b].
+    void spill_out(uint32_t b) {
+        auto& batch = m_ram_out[b];
+        if (batch.empty()) return;
+        if (!m_spill_out_file[b]) {
+            m_spill_out_path[b] = bucket_path(m_out_round, b);
+            m_spill_out_file[b] = std::fopen(m_spill_out_path[b].c_str(), "wb");
+            if (!m_spill_out_file[b])
+                throw std::runtime_error("cannot open id-stitch spill file: " +
+                                         m_spill_out_path[b] + ": " + std::strerror(errno));
+        }
+        int src = (int)batch.size();
+        std::vector<uint8_t> scratch((size_t)LZ4_compressBound(src));
+        int comp = LZ4_compress_default((char const*)batch.data(), (char*)scratch.data(), src,
+                                        (int)scratch.size());
+        if (comp <= 0) throw std::runtime_error("id-stitch LZ4 compress failed");
+        uint32_t u = (uint32_t)src, c = (uint32_t)comp;
+        std::FILE* f = m_spill_out_file[b];
+        if (std::fwrite(&u, sizeof(u), 1, f) != 1 || std::fwrite(&c, sizeof(c), 1, f) != 1 ||
+            std::fwrite(scratch.data(), 1, (size_t)comp, f) != (size_t)comp)
+            throw std::runtime_error("short write to id-stitch spill file");
+        if (m_budget) m_budget->sub(batch.size());
+        batch.clear();
+    }
+
+    std::string m_dir;
+    uint32_t m_num_buckets;
+    ram_budget* m_budget;
+    std::vector<std::vector<uint8_t>> m_ram_in, m_ram_out;  // uncompressed serialized id_tigs
+    std::vector<std::string> m_spill_in, m_spill_out_path;
+    std::vector<std::FILE*> m_spill_out_file;
+    std::vector<std::mutex> m_locks;
     uint32_t m_out_round = 0;
 };
 
@@ -694,9 +842,16 @@ inline void id_assemble_chain(id_chain const& c, Source& frag, uint32_t k, Sink&
 // fixed/var layout), so this only moves bytes.
 class frame_spill_writer {
 public:
-    frame_spill_writer(std::string dir, std::string prefix, uint32_t num_buckets)
+    // `budget` (nullable) makes the writer RAM-first: records are retained
+    // UNCOMPRESSED in their bucket's RAM batch and only LZ4-spilled to disk when
+    // the shared budget is exceeded. With budget == nullptr it is the original
+    // always-on-disk writer (flush at FRAME_BUDGET). Read each bucket back with
+    // take_bucket_decoded, which merges the retained RAM with any spilled frames.
+    frame_spill_writer(std::string dir, std::string prefix, uint32_t num_buckets,
+                       ram_budget* budget = nullptr)
         : m_dir(std::move(dir)), m_prefix(std::move(prefix)), m_num_buckets(num_buckets),
-          m_batch(num_buckets), m_files(num_buckets, nullptr), m_locks(num_buckets) {}
+          m_budget(budget), m_batch(num_buckets), m_files(num_buckets, nullptr),
+          m_locks(num_buckets) {}
 
     ~frame_spill_writer() {
         for (auto* f : m_files)
@@ -716,13 +871,20 @@ public:
         std::lock_guard<std::mutex> lk(m_locks[b]);
         uint8_t const* p = (uint8_t const*)data;
         m_batch[b].insert(m_batch[b].end(), p, p + n);
-        if (m_batch[b].size() >= FRAME_BUDGET) flush_frame(b);
+        if (m_budget) {
+            m_budget->add(n);
+            if (m_budget->over()) flush_frame(b);  // drains this bucket's RAM to disk
+        } else if (m_batch[b].size() >= FRAME_BUDGET) {
+            flush_frame(b);
+        }
     }
 
-    // Flush + EOF-mark + close all buckets (call once, after all puts).
+    // EOF-mark + close any open disk files. In RAM-first mode the retained
+    // batches are kept (read by take_bucket_decoded); in disk mode any residual
+    // batch is flushed first. Call once, after all puts.
     void close() {
         for (uint32_t b = 0; b < m_num_buckets; ++b) {
-            if (!m_batch[b].empty()) flush_frame(b);
+            if (!m_budget && !m_batch[b].empty()) flush_frame(b);
             if (m_files[b]) {
                 uint32_t eof = 0;
                 std::fwrite(&eof, sizeof(eof), 1, m_files[b]);
@@ -730,6 +892,19 @@ public:
                 m_files[b] = nullptr;
             }
         }
+    }
+
+    // Return bucket b's bytes (spilled frames decoded + retained RAM), freeing
+    // both and crediting the budget. Order within a bucket is irrelevant to the
+    // callers (members index by frag_id; bases group by chain_id then sort).
+    std::vector<uint8_t> take_bucket_decoded(uint32_t b) {
+        std::vector<uint8_t> raw = read_spill_bucket_decoded(bucket_path(b));  // decodes + deletes
+        std::vector<uint8_t> ram;
+        ram.swap(m_batch[b]);
+        if (m_budget) m_budget->sub(ram.size());
+        if (raw.empty()) return ram;
+        raw.insert(raw.end(), ram.begin(), ram.end());
+        return raw;
     }
 
 private:
@@ -755,11 +930,13 @@ private:
         if (std::fwrite(&u, sizeof(u), 1, f) != 1 || std::fwrite(&c, sizeof(c), 1, f) != 1 ||
             std::fwrite(scratch.data(), 1, (size_t)comp, f) != (size_t)comp)
             throw std::runtime_error("short write to spill file");
+        if (m_budget) m_budget->sub(batch.size());
         batch.clear();
     }
 
     std::string m_dir, m_prefix;
     uint32_t m_num_buckets;
+    ram_budget* m_budget;
     std::vector<std::vector<uint8_t>> m_batch;
     std::vector<std::FILE*> m_files;
     std::vector<std::mutex> m_locks;
@@ -962,7 +1139,8 @@ template <typename ForEachFrag, typename Sink>
 inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frags, uint32_t k,
                                     std::string const& dir, Sink&& sink, uint32_t num_buckets = 0,
                                     uint32_t frag_ranges = 0, uint32_t chain_buckets = 0,
-                                    uint32_t num_threads = 1, std::string const& links_path = "") {
+                                    uint32_t num_threads = 1, std::string const& links_path = "",
+                                    size_t ram_budget_bytes = 0) {
     using namespace detail;
     if (num_buckets == 0) num_buckets = 1024;
     if (frag_ranges == 0) frag_ranges = 64;
@@ -972,9 +1150,15 @@ inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frag
     if (n_frags == 0) return;
     const uint64_t range_size = (n_frags + frag_ranges - 1) / frag_ranges;
 
+    // Single RAM budget shared by every store in this stitch (round store +
+    // members in phases 1, bases in phase 2). ram_budget_bytes == 0 means no -g:
+    // keep everything in RAM (cap = SIZE_MAX). Otherwise stores stay in RAM up to
+    // the cap and spill the overflow, so the -g bound is honored at all costs.
+    ram_budget budget(ram_budget_bytes == 0 ? SIZE_MAX : ram_budget_bytes);
+
     // --- seed + doubling: emit member records bucketed by frag_id range ------
-    id_round_store_file store(dir, num_buckets);
-    frame_spill_writer members(dir, "idmem_", frag_ranges);
+    id_round_store_hybrid store(dir, num_buckets, &budget);
+    frame_spill_writer members(dir, "idmem_", frag_ranges, &budget);
     // Atomic: chain_sink is called from the round driver's worker threads. Only
     // uniqueness matters (chains bucket by chain_id % C), not order.
     std::atomic<uint64_t> chain_counter{0};
@@ -1037,7 +1221,7 @@ inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frag
     // reallocations) and, since phase 2 is read-bound here, the parallelism
     // could not pay that back. Peak extra RAM is one frag-id range's member array.
     auto t_p2 = std::chrono::steady_clock::now();
-    frame_spill_writer bases(dir, "idbase_", chain_buckets);
+    frame_spill_writer bases(dir, "idbase_", chain_buckets, &budget);
     {
         struct Slot {
             uint64_t cid;
@@ -1052,7 +1236,7 @@ inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frag
             (void)of;
             const uint64_t range = fid / range_size;
             if (range != cur_range) {
-                std::vector<uint8_t> raw = read_spill_bucket_decoded(members.bucket_path(range));
+                std::vector<uint8_t> raw = members.take_bucket_decoded(range);
                 lo = range * range_size;
                 const uint64_t hi = std::min(lo + range_size, n_frags);
                 arr.assign((size_t)(hi - lo), Slot{0, 0, 0xFF});
@@ -1123,7 +1307,7 @@ inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frag
         batch.clear();
     };
     auto process_cb = [&](uint32_t cb) {
-        std::vector<uint8_t> raw = read_spill_bucket_decoded(bases.bucket_path(cb));
+        std::vector<uint8_t> raw = bases.take_bucket_decoded(cb);
         if (raw.empty()) return;
         ankerl::unordered_dense::map<uint64_t, std::vector<BaseRec>> groups;
         size_t p = 0;
