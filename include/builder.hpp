@@ -412,6 +412,12 @@ struct builder {
         frag_sink.unlink();
         m_num_unitigs = uwriter_ptr->total_unitigs();
 
+        // The compact in-RAM stitch builds a multi-GiB fragment arena that is
+        // destroyed when stitch returns, but glibc keeps the freed pages in its
+        // per-thread arenas (RSS stays high), starving emit's bucket I/O of page
+        // cache. Hand them back to the OS before emit.
+        if (m_cfg.compact_stitch) release_free_heap_to_os_();
+
         {
             phase_rss_marker rss("emit-fasta");
             emit_fasta(*uwriter_ptr);

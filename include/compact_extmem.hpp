@@ -388,14 +388,17 @@ struct id_chain {
 // Seed round 0: build one id-tig per fragment, route open ones, sink closed ones
 // as length-1 chains. Mirrors ext_seed_round0 but reads only open_flags (+ the
 // boundary k-mers of open ends) -- not the whole sequence into the loop.
+// Fragments are independent, so the pass fans across num_threads: store.emit
+// (per-bucket locked) and chain_sink (caller-guarded) are both thread-safe.
 template <typename Source, typename Store, typename ChainSink>
-inline void id_seed(Source& frag, uint32_t k, Store& store, ChainSink&& chain_sink) {
+inline void id_seed(Source& frag, uint32_t k, Store& store, ChainSink&& chain_sink,
+                    uint32_t num_threads = 1) {
     const uint64_t n = (uint64_t)frag.size();
-    for (uint64_t i = 0; i < n; ++i) {
+    auto seed_one = [&](uint64_t i) {
         uint8_t of = frag.open_flags(i);
         if (k < 2 || of == 0) {
             chain_sink(id_chain{std::vector<uint64_t>{id_entry(i, false)}, 0});
-            continue;
+            return;
         }
         std::string_view sv = frag.seq_view(i);
         id_tig t;
@@ -405,6 +408,25 @@ inline void id_seed(Source& frag, uint32_t k, Store& store, ChainSink&& chain_si
         if (of & UNITIG_OPEN_LEFT) t.kl = id_fwd_kmer(sv, k, SIDE_LEFT);
         if (of & UNITIG_OPEN_RIGHT) t.kr = id_fwd_kmer(sv, k, SIDE_RIGHT);
         id_route(std::move(t), k, store);
+    };
+    if (num_threads <= 1) {
+        for (uint64_t i = 0; i < n; ++i) seed_one(i);
+    } else {
+        std::atomic<uint64_t> next{0};
+        constexpr uint64_t CHUNK = 4096;  // batch ids to amortize the atomic
+        std::vector<std::thread> ws;
+        ws.reserve(num_threads);
+        for (uint32_t t = 0; t < num_threads; ++t) {
+            ws.emplace_back([&]() {
+                for (;;) {
+                    uint64_t lo = next.fetch_add(CHUNK, std::memory_order_relaxed);
+                    if (lo >= n) break;
+                    uint64_t hi = std::min(lo + CHUNK, n);
+                    for (uint64_t i = lo; i < hi; ++i) seed_one(i);
+                }
+            });
+        }
+        for (auto& w : ws) w.join();
     }
     store.advance();
 }
@@ -821,7 +843,7 @@ inline void compact_stitch_inram(Source& frag, uint32_t k, std::string const& tm
     };
 
     auto t_seed = std::chrono::steady_clock::now();
-    id_seed(frag, k, store, chain_sink);
+    id_seed(frag, k, store, chain_sink, num_threads);
     std::cout << "  [id-stitch] seed "
               << std::chrono::duration<double>(std::chrono::steady_clock::now() - t_seed).count()
               << "s\n";
