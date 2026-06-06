@@ -592,39 +592,66 @@ inline void id_seed(Source& frag, uint32_t k, Store& store, ChainSink&& chain_si
 // to avoid HDD seek thrash on the scalable path.
 template <typename Store, typename ChainSink>
 inline void id_seed_links(std::string const& path, uint64_t n_frags, uint32_t k, Store& store,
-                          ChainSink&& chain_sink) {
-    std::FILE* f = std::fopen(path.c_str(), "rb");
-    if (!f) throw std::runtime_error("cannot open links spill: " + path);
+                          ChainSink&& chain_sink, uint32_t num_threads = 1) {
     const uint32_t kbytes = (2u * k + 7u) / 8u;
     const size_t recsize = (size_t)1 + 2 * kbytes;
-    std::vector<uint8_t> buf(recsize);
-    for (uint64_t i = 0; i < n_frags; ++i) {
-        if (std::fread(buf.data(), 1, recsize, f) != recsize) {
+    if (num_threads == 0) num_threads = 1;
+    // Records are fixed-size and in frag_id order, so a worker owns a contiguous
+    // [lo, hi) frag range: it seeks to lo*recsize and reads its slice with its own
+    // handle (no shared cursor). Routing + chain_sink are the parallel-safe ones
+    // the rounds already use. Output is identical to a serial pass: each frag i
+    // uses id_rng_seed(i) and routes by its own junction regardless of thread.
+    auto seed_range = [&](uint64_t lo, uint64_t hi) {
+        std::FILE* f = std::fopen(path.c_str(), "rb");
+        if (!f) throw std::runtime_error("cannot open links spill: " + path);
+        if (std::fseek(f, (long)(lo * recsize), SEEK_SET) != 0) {
             std::fclose(f);
-            throw std::runtime_error("short read of links record from " + path);
+            throw std::runtime_error("seek failed in links spill: " + path);
         }
-        const uint8_t of = buf[0];
-        if (k < 2 || of == 0) {
-            chain_sink(id_chain{std::vector<uint64_t>{id_entry(i, false)}, 0});
-            continue;
+        std::vector<uint8_t> buf(recsize);
+        for (uint64_t i = lo; i < hi; ++i) {
+            if (std::fread(buf.data(), 1, recsize, f) != recsize) {
+                std::fclose(f);
+                throw std::runtime_error("short read of links record from " + path);
+            }
+            const uint8_t of = buf[0];
+            if (k < 2 || of == 0) {
+                chain_sink(id_chain{std::vector<uint64_t>{id_entry(i, false)}, 0});
+                continue;
+            }
+            id_tig t;
+            t.open_flags = of;
+            t.rng = id_rng_seed(i);
+            t.entries.push_back(id_entry(i, false));
+            if (of & UNITIG_OPEN_LEFT) {
+                kmer_int_t kl = 0;
+                for (uint32_t b = 0; b < kbytes; ++b) kl |= (kmer_int_t)buf[1 + b] << (8 * b);
+                t.kl = kl;
+            }
+            if (of & UNITIG_OPEN_RIGHT) {
+                kmer_int_t kr = 0;
+                for (uint32_t b = 0; b < kbytes; ++b)
+                    kr |= (kmer_int_t)buf[1 + kbytes + b] << (8 * b);
+                t.kr = kr;
+            }
+            id_route(std::move(t), k, store);
         }
-        id_tig t;
-        t.open_flags = of;
-        t.rng = id_rng_seed(i);
-        t.entries.push_back(id_entry(i, false));
-        if (of & UNITIG_OPEN_LEFT) {
-            kmer_int_t kl = 0;
-            for (uint32_t b = 0; b < kbytes; ++b) kl |= (kmer_int_t)buf[1 + b] << (8 * b);
-            t.kl = kl;
+        std::fclose(f);
+    };
+    if (num_threads <= 1) {
+        seed_range(0, n_frags);
+    } else {
+        const uint64_t per = (n_frags + num_threads - 1) / num_threads;
+        std::vector<std::thread> ws;
+        ws.reserve(num_threads);
+        for (uint32_t t = 0; t < num_threads; ++t) {
+            const uint64_t lo = std::min((uint64_t)t * per, n_frags);
+            const uint64_t hi = std::min(lo + per, n_frags);
+            if (lo >= hi) break;
+            ws.emplace_back(seed_range, lo, hi);
         }
-        if (of & UNITIG_OPEN_RIGHT) {
-            kmer_int_t kr = 0;
-            for (uint32_t b = 0; b < kbytes; ++b) kr |= (kmer_int_t)buf[1 + kbytes + b] << (8 * b);
-            t.kr = kr;
-        }
-        id_route(std::move(t), k, store);
+        for (auto& w : ws) w.join();
     }
-    std::fclose(f);
     store.advance();
 }
 
@@ -1182,7 +1209,7 @@ inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frag
         // Links-only seed: read ~17 B/fragment from the precomputed links spill
         // instead of streaming every base out of the frag spill. The first of the
         // two frag-spill passes vanishes; phase 2 still reads the bases once.
-        id_seed_links(links_path, n_frags, k, store, chain_sink);
+        id_seed_links(links_path, n_frags, k, store, chain_sink, num_threads);
     } else {
         // Seed reads each fragment's open_flags + boundary k-mers (it ignores
         // runs, but the reader fills them). frag_id = iteration order.
