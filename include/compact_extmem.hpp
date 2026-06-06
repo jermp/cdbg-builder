@@ -807,6 +807,7 @@ inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frag
         }
     };
 
+    auto t_seed = std::chrono::steady_clock::now();
     {
         // Seed reads each fragment's open_flags + boundary k-mers (it ignores
         // runs, but the reader fills them). frag_id = iteration order.
@@ -831,10 +832,13 @@ inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frag
         });
         store.advance();
     }
+    std::cout << "  [id-stitch] seed " << std::chrono::duration<double>(
+                     std::chrono::steady_clock::now() - t_seed).count() << "s\n";
     id_run_rounds(store, k, num_buckets, chain_sink, num_threads);
     members.close();
 
     // --- phase 2: attach bases, re-bucket by chain_id % C --------------------
+    auto t_p2 = std::chrono::steady_clock::now();
     frame_spill_writer bases(dir, "idbase_", chain_buckets);
     {
         struct Slot {
@@ -896,8 +900,12 @@ inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frag
         });
     }
     bases.close();
+    std::cout << "  [id-stitch] phase2 (attach+rebucket) "
+              << std::chrono::duration<double>(std::chrono::steady_clock::now() - t_p2).count()
+              << "s\n";
 
     // --- phase 3: per chain bucket, group + sort + fold-assemble + split -----
+    auto t_p3 = std::chrono::steady_clock::now();
     struct BaseRec {
         uint32_t pos;
         uint8_t open_flags;
@@ -949,6 +957,9 @@ inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frag
             id_tig_assembled_split(seq, runs, of, k, sink);
         }
     }
+    std::cout << "  [id-stitch] phase3 (assemble+split) "
+              << std::chrono::duration<double>(std::chrono::steady_clock::now() - t_p3).count()
+              << "s\n";
 }
 
 }  // namespace cdbg
