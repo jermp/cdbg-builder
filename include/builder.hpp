@@ -91,8 +91,8 @@ struct builder {
                   << ", num_threads = " << m_cfg.num_threads << ", num_buckets = " << num_buckets
                   << "\n";
         std::cout << "  bucket-write model: flush_bases=" << format_bytes(m_flush_bases)
-                  << ", spill_bytes=" << format_bytes(m_spill_bytes)
-                  << ", alpha=" << m_cfg.alpha << ", beta=" << m_cfg.beta;
+                  << ", spill_bytes=" << format_bytes(m_spill_bytes) << ", alpha=" << m_cfg.alpha
+                  << ", beta=" << m_cfg.beta;
         if (m_cfg.max_ram_gb > 0 && PLATFORM_RAM_OVERHEAD > 1.0) {
             std::cout << " (platform RAM overhead " << PLATFORM_RAM_OVERHEAD << "x)";
         }
@@ -109,8 +109,8 @@ struct builder {
         std::string const tmp_dir = resolve_tmp_dir();
         std::cout << "  tmp_dir = " << tmp_dir << "\n";
 
-        auto writer = std::make_unique<bucket_writer>(tmp_dir, num_buckets, m_flush_bases,
-                                                      m_spill_bytes);
+        auto writer =
+            std::make_unique<bucket_writer>(tmp_dir, num_buckets, m_flush_bases, m_spill_bytes);
         // When -g is set, arm a background RSS watcher with
         // hysteresis. Bucket-write must leave room for what comes
         // after: bucket-process adds ~1 GiB on top on multi-thousand-
@@ -128,8 +128,7 @@ struct builder {
         // pressure is sticky, and we do over-spill -- that's the
         // safer-but-slower path on platforms without VmRSS.
         if (m_cfg.max_ram_gb > 0) {
-            uint64_t budget_bytes =
-                (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0);
+            uint64_t budget_bytes = (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0);
             uint64_t high_threshold_bytes = (uint64_t)(0.60 * (double)budget_bytes);
             uint64_t low_threshold_bytes = (uint64_t)(0.45 * (double)budget_bytes);
             writer->start_rss_watcher(high_threshold_bytes, low_threshold_bytes);
@@ -164,8 +163,7 @@ struct builder {
                         ? std::make_unique<progress>("bucket-write", done_bytes, total_bytes,
                                                      /*render_bytes=*/true, &done,
                                                      (uint64_t)files.size(), "files")
-                        : std::make_unique<progress>("bucket-write", done,
-                                                     (uint64_t)files.size());
+                        : std::make_unique<progress>("bucket-write", done, (uint64_t)files.size());
                 ingest_bucketed(files, m_cfg.k, m_cfg.m, m_cfg.num_buckets, *writer,
                                 m_cfg.num_threads, &done, &file_sizes, &done_bytes);
                 prog->stop();
@@ -235,8 +233,7 @@ struct builder {
         // small disk-only cost that never counts against -g).
         frag_unitig_writer frag_sink(tmp_dir + "/frag_unitigs.bin",
                                      m_cfg.compact_stitch ? m_cfg.k : 0);
-        streaming_color_set_dict global_dict(m_num_colors,
-                                             m_cfg.out_basename + ".color_sets");
+        streaming_color_set_dict global_dict(m_num_colors, m_cfg.out_basename + ".color_sets");
         std::mutex global_mu;
         {
             phase_rss_marker rss("bucket-process");
@@ -256,13 +253,11 @@ struct builder {
                 // All num_threads threads stay alive; -t is never reduced.
                 uint64_t bp_budget = 0;
                 if (m_cfg.max_ram_gb > 0) {
-                    const uint64_t total =
-                        (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0);
+                    const uint64_t total = (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0);
                     bp_budget = (uint64_t)(BUCKET_PROCESS_BUDGET_FRAC * (double)total);
                 }
-                process_buckets(*writer, m_cfg.k, m_num_colors, m_cfg.num_threads,
-                                frag_sink, global_dict, global_mu, &done,
-                                bp_budget);
+                process_buckets(*writer, m_cfg.k, m_num_colors, m_cfg.num_threads, frag_sink,
+                                global_dict, global_mu, &done, bp_budget);
                 prog.stop();
                 std::cout << "  bucket fragments: " << frag_sink.count() << "\n";
                 std::cout << "  distinct color classes: " << global_dict.size() << "\n";
@@ -317,8 +312,8 @@ struct builder {
 
                 const uint32_t unitig_bucket_count = pick_unitig_bucket_count_(
                     m_num_color_classes, total_frag_seq_bytes, m_cfg.max_ram_gb);
-                uwriter_ptr = std::make_unique<unitig_bucket_writer>(
-                    tmp_dir, m_num_color_classes, unitig_bucket_count);
+                uwriter_ptr = std::make_unique<unitig_bucket_writer>(tmp_dir, m_num_color_classes,
+                                                                     unitig_bucket_count);
 
                 std::atomic<uint64_t> done{0};
                 progress prog("stitch", done, n_frags);
@@ -328,8 +323,8 @@ struct builder {
                 // once. We DIMENSION THE BUCKET COUNT (never the user's thread
                 // count) so num_threads resident buckets fit stitch's share of
                 // -g: more, smaller buckets. The user's -t is honored as-is.
-                const uint32_t stitch_buckets = pick_stitch_buckets_(
-                    total_frag_seq_bytes, m_cfg.max_ram_gb, m_cfg.num_threads);
+                const uint32_t stitch_buckets =
+                    pick_stitch_buckets_(total_frag_seq_bytes, m_cfg.max_ram_gb, m_cfg.num_threads);
                 std::cout << "  stitch buckets: " << stitch_buckets
                           << ", threads: " << m_cfg.num_threads << "\n";
                 // Parallel over the per-round bucket loop: buckets are
@@ -511,9 +506,8 @@ private:
         if (m_cfg.bucket_log2 != 0) {
             // -b override: forces a power-of-two count, range-checked.
             if (m_cfg.bucket_log2 < MIN_BUCKETS_LOG2 || m_cfg.bucket_log2 > MAX_BUCKETS_LOG2)
-                throw std::runtime_error("-b must be in [" +
-                                         std::to_string(MIN_BUCKETS_LOG2) + ", " +
-                                         std::to_string(MAX_BUCKETS_LOG2) + "]");
+                throw std::runtime_error("-b must be in [" + std::to_string(MIN_BUCKETS_LOG2) +
+                                         ", " + std::to_string(MAX_BUCKETS_LOG2) + "]");
             m_cfg.num_buckets = 1u << m_cfg.bucket_log2;
         } else {
             m_cfg.num_buckets = auto_bucket_count_();
@@ -539,8 +533,8 @@ private:
         const double g = m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0;
         const double M = BUCKET_WRITE_BUDGET_FRAC * g / PLATFORM_RAM_OVERHEAD;
         const double T = (double)std::max<uint32_t>(1, m_cfg.num_threads);
-        const double per_bucket = m_cfg.alpha * T * (double)m_flush_bases +
-                                  m_cfg.beta * (double)m_spill_bytes;
+        const double per_bucket =
+            m_cfg.alpha * T * (double)m_flush_bases + m_cfg.beta * (double)m_spill_bytes;
         double b = M / per_bucket;
         // Floor at a small sane minimum (avoid degenerate single-bucket runs at
         // tiny -g); the fd clamp handles the ceiling. If the model lands below
@@ -571,8 +565,8 @@ private:
         uint32_t avail = (uint32_t)nr.rlim_cur > HEADROOM ? (uint32_t)nr.rlim_cur - HEADROOM : 1;
         if (avail < count) {
             std::cerr << "warning: RLIMIT_NOFILE hard limit " << nr.rlim_max
-                      << " can't accommodate " << count << " buckets; clamping to "
-                      << avail << ". Raise the hard limit (e.g. ulimit -Hn) for tighter budgets.\n";
+                      << " can't accommodate " << count << " buckets; clamping to " << avail
+                      << ". Raise the hard limit (e.g. ulimit -Hn) for tighter budgets.\n";
             return avail;
         }
         return count;
@@ -621,8 +615,7 @@ private:
         std::error_code ec;
         if (std::filesystem::exists(m_cfg.tmp_dir, ec)) {
             if (!std::filesystem::is_directory(m_cfg.tmp_dir, ec))
-                throw std::runtime_error("-d " + m_cfg.tmp_dir +
-                                         " exists but is not a directory");
+                throw std::runtime_error("-d " + m_cfg.tmp_dir + " exists but is not a directory");
             if (!std::filesystem::is_empty(m_cfg.tmp_dir, ec))
                 throw std::runtime_error("-d " + m_cfg.tmp_dir +
                                          " is not empty (the tool will remove the directory on"
@@ -630,8 +623,7 @@ private:
         } else {
             std::filesystem::create_directories(m_cfg.tmp_dir, ec);
             if (ec)
-                throw std::runtime_error("cannot create -d " + m_cfg.tmp_dir + ": " +
-                                         ec.message());
+                throw std::runtime_error("cannot create -d " + m_cfg.tmp_dir + ": " + ec.message());
         }
         return m_cfg.tmp_dir;
     }
@@ -681,8 +673,7 @@ private:
         if (max_ram_gb <= 0 || total_seq_bytes_estimate == 0) {
             return (uint32_t)std::min<uint64_t>(num_color_classes, DEFAULT_K);
         }
-        const uint64_t budget_bytes =
-            (uint64_t)(max_ram_gb * 1024.0 * 1024.0 * 1024.0 * SHARE);
+        const uint64_t budget_bytes = (uint64_t)(max_ram_gb * 1024.0 * 1024.0 * 1024.0 * SHARE);
         if (budget_bytes == 0) {
             return (uint32_t)std::min<uint64_t>(num_color_classes, DEFAULT_K);
         }
@@ -734,8 +725,7 @@ private:
         // freed before stitch via release_index, so this is small now).
         const uint64_t carry_in = current_rss_bytes();
         const uint64_t budget_total = (uint64_t)(max_ram_gb * 1024.0 * 1024.0 * 1024.0);
-        const uint64_t avail =
-            budget_total > carry_in ? (budget_total - carry_in) : budget_total;
+        const uint64_t avail = budget_total > carry_in ? (budget_total - carry_in) : budget_total;
         const uint64_t budget = (uint64_t)((double)avail * SHARE);
         if (budget == 0) return DEFAULT_BUCKETS;
 
@@ -798,9 +788,8 @@ private:
         // otherwise made one low-cid bucket dominate; 661k: +36 GiB). Use a
         // modest share of -g; fall back to a fixed cap with no -g.
         const uint64_t emit_mem_cap =
-            m_cfg.max_ram_gb > 0
-                ? (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0 * 0.10)
-                : (uint64_t)(1ull << 30);  // 1 GiB default
+            m_cfg.max_ram_gb > 0 ? (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0 * 0.10)
+                                 : (uint64_t)(1ull << 30);  // 1 GiB default
 
         auto emit_record = [&](uint64_t cid, std::string_view seq) {
             // Mark the final unitig of the previous run. cid is globally
@@ -833,8 +822,8 @@ private:
         flush_buf();
         std::fclose(fa);
 
-        std::cout << "  [emit-fasta] " << uwriter.num_buckets()
-                  << " buckets, cid-sort RAM cap " << format_bytes(emit_mem_cap)
+        std::cout << "  [emit-fasta] " << uwriter.num_buckets() << " buckets, cid-sort RAM cap "
+                  << format_bytes(emit_mem_cap)
                   << " (external merge-sort if a bucket exceeds it)\n";
 
         // Close out the very last run.
