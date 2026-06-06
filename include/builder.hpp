@@ -332,31 +332,71 @@ struct builder {
                 // regardless of which thread emitted which unitig.
                 if (m_cfg.compact_stitch) {
                     // GGCAT-style id-only compaction: the doubling carries only
-                    // fragment-id chains; bases/colors are assembled once at the
-                    // end by a RAM-bounded re-bucket pass. for_each_frag reopens
-                    // the spill for each of its two passes (seed, base-attach);
-                    // each holds one fragment at a time -- the spill is unlinked
-                    // only after this block, so both passes see it.
-                    // for_each_frag is invoked twice (seed, then base-attach);
-                    // advance the progress bar only on the first pass so it
-                    // tracks 0..n_frags rather than overshooting to 2x.
-                    bool first_pass = true;
-                    auto for_each_frag = [&](auto&& fn) {
-                        frag_unitig_stream_reader rd(frag_sink.path());
-                        uint8_t of;
-                        std::vector<color_run> runs;
-                        std::string seq;
-                        const bool count = first_pass;
-                        while (rd.next(of, runs, seq)) {
-                            fn(of, runs, seq);
-                            if (count) done.fetch_add(1, std::memory_order_relaxed);
+                    // fragment-id chains, and bases/colors are assembled once at
+                    // the end. Two variants:
+                    //  - in-RAM: load the frag spill into a compact arena ONCE,
+                    //    then seed + assemble straight from RAM (no second spill
+                    //    read, no disk re-bucket). Chosen when the arena fits the
+                    //    RAM budget -- the stitch's resident set is tiny (~3 GiB)
+                    //    so on a -g build there is room.
+                    //  - scalable: stream the spill twice with an on-disk
+                    //    re-bucket; RAM bounded independent of fragment count.
+                    //    Fallback when the arena would not fit the budget.
+                    const uint64_t spill_bytes = std::filesystem::file_size(frag_sink.path());
+                    const uint64_t seq_bytes = frag_sink.total_seq_bytes();
+                    // frag record = 9 B header + 12 B/run + seq; recover run count
+                    // so the runs arena can be reserved (no growth-doubling spike).
+                    const uint64_t hdr_bytes = n_frags * 9ull;
+                    const uint64_t run_bytes =
+                        spill_bytes > seq_bytes + hdr_bytes ? spill_bytes - seq_bytes - hdr_bytes : 0;
+                    const uint64_t run_count = run_bytes / 12ull;
+                    // arena holds seq + runs(12 B) + offsets(16 B/frag) + flags;
+                    // ~= spill size + 8 B/frag. Add a slack reserve for the round
+                    // store, chains, and dict before deciding it fits the budget.
+                    const uint64_t arena_est = spill_bytes + n_frags * 24ull;
+                    const uint64_t budget = m_cfg.max_ram_gb > 0
+                                          ? (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024 * 1024)
+                                          : 0;
+                    const uint64_t reserve = (uint64_t)(2.0 * 1024 * 1024 * 1024);
+                    bool fits = budget > 0 && arena_est + reserve < budget;
+                    if (fits) {
+                        std::cout << "  compact stitch: in-RAM arena (~"
+                                  << (arena_est >> 20) << " MiB)\n";
+                        arena_frag_source arena;
+                        arena.reserve(n_frags, seq_bytes, run_count);
+                        {
+                            frag_unitig_stream_reader rd(frag_sink.path());
+                            uint8_t of;
+                            std::vector<color_run> runs;
+                            std::string seq;
+                            while (rd.next(of, runs, seq)) {
+                                arena.append(of, std::string_view(seq.data(), seq.size()), runs);
+                                done.fetch_add(1, std::memory_order_relaxed);
+                            }
                         }
-                        first_pass = false;
-                    };
-                    compact_stitch_scalable(for_each_frag, n_frags, m_cfg.k, tmp_dir,
-                                            std::ref(*uwriter_ptr), stitch_buckets,
-                                            /*frag_ranges=*/0, /*chain_buckets=*/0,
-                                            m_cfg.num_threads);
+                        compact_stitch_inram(arena, m_cfg.k, tmp_dir, std::ref(*uwriter_ptr),
+                                             stitch_buckets, m_cfg.num_threads);
+                    } else {
+                        std::cout << "  compact stitch: scalable disk re-bucket "
+                                     "(arena would exceed budget)\n";
+                        bool first_pass = true;
+                        auto for_each_frag = [&](auto&& fn) {
+                            frag_unitig_stream_reader rd(frag_sink.path());
+                            uint8_t of;
+                            std::vector<color_run> runs;
+                            std::string seq;
+                            const bool count = first_pass;
+                            while (rd.next(of, runs, seq)) {
+                                fn(of, runs, seq);
+                                if (count) done.fetch_add(1, std::memory_order_relaxed);
+                            }
+                            first_pass = false;
+                        };
+                        compact_stitch_scalable(for_each_frag, n_frags, m_cfg.k, tmp_dir,
+                                                std::ref(*uwriter_ptr), stitch_buckets,
+                                                /*frag_ranges=*/0, /*chain_buckets=*/0,
+                                                m_cfg.num_threads);
+                    }
                 } else {
                     frag_unitig_stream_reader frag_reader(frag_sink.path());
                     stitch_unitigs_extmem_file_stream(frag_reader, m_cfg.k, tmp_dir,

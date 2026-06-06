@@ -755,8 +755,121 @@ inline void compact_stitch_file(Source& frag, uint32_t k, std::string const& tmp
     for (auto const& c : chains) detail::id_assemble_chain(c, frag, k, sink);
 }
 
-// Scalable, RAM-bounded id-only compaction stitch (STEP B.2). Unlike
-// compact_stitch_{mem,file} it holds neither all fragments nor all chains in
+// Compact in-RAM fragment store: a flat base-byte arena + offset array (NOT
+// 92.5M std::strings, which would cost ~5 GiB of object overhead alone), a flat
+// color-run arena + offsets, and a flags byte per fragment. Satisfies the
+// Source interface (size/open_flags/seq_view/runs) with O(1) random access, so
+// the id-only stitch can seed AND assemble straight from RAM -- no second pass
+// over the frag spill and no disk re-bucket. Resident bytes ~= frag spill size
+// plus ~16 B/fragment of offsets; bounded by the caller's budget check.
+class arena_frag_source {
+public:
+    void reserve(uint64_t n_frags, uint64_t seq_bytes, uint64_t run_count) {
+        m_flags.reserve(n_frags);
+        m_seq.reserve(seq_bytes);
+        m_seq_off.reserve(n_frags + 1);
+        m_runs.reserve(run_count);
+        m_runs_off.reserve(n_frags + 1);
+    }
+    // Append one fragment in frag_id order (frag_id == call index).
+    void append(uint8_t flags, std::string_view seq, std::vector<color_run> const& runs) {
+        m_flags.push_back(flags);
+        m_seq.insert(m_seq.end(), seq.begin(), seq.end());
+        m_seq_off.push_back(m_seq.size());
+        m_runs.insert(m_runs.end(), runs.begin(), runs.end());
+        m_runs_off.push_back(m_runs.size());
+    }
+    size_t size() const { return m_flags.size(); }
+    uint8_t open_flags(size_t i) const { return m_flags[i]; }
+    std::string_view seq_view(size_t i) const {
+        return std::string_view(m_seq.data() + m_seq_off[i],
+                                (size_t)(m_seq_off[i + 1] - m_seq_off[i]));
+    }
+    std::vector<color_run> runs(size_t i) const {
+        return std::vector<color_run>(m_runs.begin() + (ptrdiff_t)m_runs_off[i],
+                                      m_runs.begin() + (ptrdiff_t)m_runs_off[i + 1]);
+    }
+    uint64_t seq_bytes() const { return m_seq.size(); }
+
+private:
+    std::vector<char> m_seq;             // all fragment bases concatenated
+    std::vector<uint64_t> m_seq_off{0};  // seq[i] = [off[i], off[i+1])
+    std::vector<color_run> m_runs;       // all color runs concatenated
+    std::vector<uint64_t> m_runs_off{0};
+    std::vector<uint8_t> m_flags;
+};
+
+// In-RAM id-only compaction stitch. The whole frag store is resident (arena),
+// so seed and assembly read bases straight from RAM: there is NO second spill
+// read and NO disk re-bucket (the only reason compact_stitch_scalable spills is
+// to get frag_id->chain locality on disk -- with random access that vanishes).
+// The id-only doubling round store stays on disk (small, keeps RAM for the
+// arena). Rounds and the final assembly both run across num_threads. Use this
+// when the arena fits the RAM budget; else use compact_stitch_scalable.
+template <typename Source, typename Sink>
+inline void compact_stitch_inram(Source& frag, uint32_t k, std::string const& tmp_dir, Sink&& sink,
+                                 uint32_t num_buckets = 0, uint32_t num_threads = 1) {
+    using namespace detail;
+    if (num_buckets == 0) num_buckets = 1024;
+    id_round_store_file store(tmp_dir, num_buckets);
+    std::vector<id_chain> chains;
+    std::mutex chains_mu;
+    // chain_sink is called from the parallel round workers, so it is guarded.
+    auto chain_sink = [&](id_chain&& c) {
+        std::lock_guard<std::mutex> lk(chains_mu);
+        chains.push_back(std::move(c));
+    };
+
+    auto t_seed = std::chrono::steady_clock::now();
+    id_seed(frag, k, store, chain_sink);
+    std::cout << "  [id-stitch] seed "
+              << std::chrono::duration<double>(std::chrono::steady_clock::now() - t_seed).count()
+              << "s\n";
+    id_run_rounds(store, k, num_buckets, chain_sink, num_threads);  // prints its own timing
+
+    // Assemble: chains are independent, so fan across num_threads, reading each
+    // fragment's bases directly from the arena. The sink is not thread-safe, so
+    // each worker batches and drains under sink_mu.
+    auto t_a = std::chrono::steady_clock::now();
+    std::mutex sink_mu;
+    constexpr size_t SINK_BATCH_BYTES = 2u * 1024 * 1024;
+    auto flush_batch = [&](std::vector<stitchable_unitig>& batch) {
+        if (batch.empty()) return;
+        std::lock_guard<std::mutex> lk(sink_mu);
+        for (auto& u : batch) sink(std::move(u));
+        batch.clear();
+    };
+    std::atomic<size_t> next{0};
+    const size_t nc = chains.size();
+    auto work = [&]() {
+        std::vector<stitchable_unitig> batch;
+        size_t bytes = 0;
+        for (;;) {
+            size_t i = next.fetch_add(1, std::memory_order_relaxed);
+            if (i >= nc) break;
+            id_assemble_chain(chains[i], frag, k, [&](stitchable_unitig&& u) {
+                bytes += u.seq.size();
+                batch.push_back(std::move(u));
+                if (bytes >= SINK_BATCH_BYTES) {
+                    flush_batch(batch);
+                    bytes = 0;
+                }
+            });
+        }
+        flush_batch(batch);
+    };
+    if (num_threads <= 1) {
+        work();
+    } else {
+        std::vector<std::thread> ws;
+        ws.reserve(num_threads);
+        for (uint32_t t = 0; t < num_threads; ++t) ws.emplace_back(work);
+        for (auto& w : ws) w.join();
+    }
+    std::cout << "  [id-stitch] assemble "
+              << std::chrono::duration<double>(std::chrono::steady_clock::now() - t_a).count()
+              << "s\n";
+}
 // RAM: the only resident structures are one round-store bucket, one frag-id
 // range's member array, and one chain bucket's bases -- so peak RAM is
 // independent of fragment/chain COUNT (the extmem invariant).
