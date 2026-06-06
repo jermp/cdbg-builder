@@ -5,8 +5,8 @@
 // or the EF offsets array in memory at once.
 //
 // On intern() we (a) compute a 128-bit content hash of the candidate
-// color list, (b) look it up in m_index, and either return the existing
-// id or (c) encode the candidate's bits into an in-memory
+// color list, (b) look it up in the sharded dedup index, and either
+// return the existing id or (c) encode the candidate's bits into an in-memory
 // bits::bit_vector::builder (m_bvb) using the hybrid sparse / dense /
 // complementary-dense rules, then immediately flush every COMPLETE 64-
 // bit word from m_bvb into the output file. We never keep more than
@@ -55,6 +55,8 @@
 // ~2^-64 per pair. We rely on this to skip the byte-level equality
 // check (we don't have the original colors any more after encoding).
 
+#include <array>
+#include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
@@ -62,6 +64,7 @@
 #include <filesystem>
 #include <iostream>
 #include <iterator>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -85,7 +88,6 @@ struct streaming_color_set_dict {
         : m_num_colors(num_colors)
         , m_sparse_threshold((uint32_t)(0.25 * num_colors))
         , m_dense_threshold((uint32_t)(0.75 * num_colors))
-        , m_index(0, hasher{&m_classes}, key_eq{&m_classes})
         , m_output_path(std::move(output_path))
         , m_offsets_path(m_output_path + ".tmp_offsets") {
         m_file = std::fopen(m_output_path.c_str(), "wb+");
@@ -133,43 +135,64 @@ struct streaming_color_set_dict {
 
     // Variant of intern() that uses caller-supplied hashes. The two
     // hashes MUST be wyhash + fnv1a of `candidate` (i.e. produced by
-    // compute_hashes()) -- internal dedup relies on this. Lets the
-    // bucket-process merge phase compute hashes outside the global
-    // lock so threads only serialise on the actual hashmap-find +
-    // encode work.
+    // compute_hashes()) -- internal dedup relies on this.
+    //
+    // THREAD-SAFE. The dedup index is sharded into NUM_SHARDS independent
+    // maps, each under its own mutex (selected by the secondary hash), so
+    // the common case -- a duplicate color class, just a probe + return --
+    // distributes across shards instead of serialising on one lock. For a
+    // genuinely new class the expensive hybrid-encode runs into a thread-
+    // local builder *under the shard lock* (so distinct shards encode in
+    // parallel); only the cheap append-to-output-stream + cid assignment +
+    // offset write is serialised under a single output mutex. cids stay
+    // globally sequential in append order, so the on-disk format is
+    // unchanged. Callers no longer need an external lock.
     uint64_t intern_with_hashes(std::vector<uint32_t>&& candidate, precomputed_hash h) {
         assert(!m_released && "intern() after release_index()");
-        auto it = m_index.find(hash_pair{h.primary, h.secondary});
-        if (it != m_index.end()) return *it;
+        const hash_pair key{h.primary, h.secondary};
+        shard_t& shard = m_shards[h.secondary & (NUM_SHARDS - 1)];
 
-        uint64_t bit_offset = m_flushed_words * 64 + m_bvb.num_bits();
-        hybrid_builder::encode_one(m_bvb, candidate.data(), candidate.size(), m_num_colors,
+        std::lock_guard<std::mutex> slk(shard.mu);
+        auto it = shard.index.find(key);
+        if (it != shard.index.end()) return it->second;  // duplicate: distributed hot path
+
+        // New class. Encode into a reusable thread-local builder -- the
+        // dominant cost (write_delta over the whole color list) runs here,
+        // off the output lock, in parallel with other shards.
+        static thread_local bits::bit_vector::builder tmp;
+        tmp.clear();
+        hybrid_builder::encode_one(tmp, candidate.data(), candidate.size(), m_num_colors,
                                    m_sparse_threshold, m_dense_threshold);
 
-        // Spill the per-class bit_offset to the sidecar (8 B per
-        // intern). Read back at finalize via a single-pass iterator;
-        // never lives in RAM as a vector.
-        if (std::fwrite(&bit_offset, sizeof(bit_offset), 1, m_offsets_file) != 1)
-            throw std::runtime_error("short write of class offset to " + m_offsets_path);
-
-        uint64_t id = m_classes.size();
-        m_classes.push_back({h.primary, h.secondary});
-        m_index.insert(id);
-        m_total_integers += candidate.size();
-
-        spill_complete_words_();
-
+        uint64_t id;
+        {
+            // Serial section: append the pre-encoded bits to the single
+            // output stream, assign the next cid, record its bit-offset.
+            std::lock_guard<std::mutex> olk(m_out_mu);
+            uint64_t bit_offset = m_flushed_words * 64 + m_bvb.num_bits();
+            m_bvb.append(tmp);
+            // Spill the per-class bit_offset to the sidecar (8 B per new
+            // class). Read back at finalize via a single-pass iterator.
+            if (std::fwrite(&bit_offset, sizeof(bit_offset), 1, m_offsets_file) != 1)
+                throw std::runtime_error("short write of class offset to " + m_offsets_path);
+            id = m_class_count.fetch_add(1, std::memory_order_relaxed);
+            m_total_integers += candidate.size();
+            spill_complete_words_();
+        }
+        shard.index.emplace(key, id);
         return id;
     }
 
-    uint64_t size() const { return m_released ? m_released_count : m_classes.size(); }
+    uint64_t size() const {
+        return m_released ? m_released_count : m_class_count.load(std::memory_order_relaxed);
+    }
     uint64_t total_integers() const { return m_total_integers; }
     uint64_t total_bits() const { return m_flushed_words * 64 + m_bvb.num_bits(); }
 
-    // Free the dedup index + per-class hashes once interning is DONE (after
-    // bucket-process). Neither m_index nor m_classes is read by finalize() --
-    // it only needs the class COUNT (stashed here) and the on-disk bits +
-    // sidecar offsets. This dict otherwise stays fully resident through stitch
+    // Free the dedup shards once interning is DONE (after bucket-process).
+    // The shards are not read by finalize() -- it only needs the class COUNT
+    // (stashed here) and the on-disk bits + sidecar offsets. This dict
+    // otherwise stays fully resident through stitch
     // AND emit (it's freed at finalize today), and at high class counts that's
     // the dominant cross-phase CARRY-IN that pushed stitch over budget (100K:
     // ~15 GiB carried into stitch; 661k would be far worse). Releasing here
@@ -177,21 +200,20 @@ struct streaming_color_set_dict {
     // NOT be called again (asserted); size()/total_*()/finalize() still work.
     void release_index() {
         if (m_released) return;
-        m_released_count = m_classes.size();
-        decltype(m_index){}.swap(m_index);     // free the dedup hashset
-        std::vector<hash_pair>{}.swap(m_classes);  // free the per-class hashes
+        m_released_count = m_class_count.load(std::memory_order_relaxed);
+        for (auto& s : m_shards) { decltype(s.index){}.swap(s.index); }  // free the dedup shards
         m_released = true;
     }
 
-    // Approx RAM held by the dedup structures: m_classes (16 B/class) + the
-    // m_index hashset (ankerl flat backing ~ 1.6 * 9 B/entry). This is what
+    // Approx RAM held by the dedup structures: the NUM_SHARDS maps, each
+    // entry being the 128-bit hash key (16 B) + the cid (8 B). This is what
     // release_index() frees. Reported at phase boundaries to attribute budget.
     uint64_t resident_bytes() const {
         if (m_released) return 0;
-        const uint64_t n = m_classes.size();
-        const uint64_t classes_bytes = n * sizeof(hash_pair);             // 16 B/class
-        const uint64_t index_bytes = (uint64_t)((double)n * 1.6 * 9.0);   // hashset est
-        return classes_bytes + index_bytes;
+        const uint64_t n = m_class_count.load(std::memory_order_relaxed);
+        // Each shard entry holds the 128-bit hash key (16 B) + the cid (8 B);
+        // ankerl's flat backing adds ~0.6x slack at the default load factor.
+        return (uint64_t)((double)n * 24.0 * 1.6);
     }
 
     // Finalize the on-disk file: flush trailing partial word, build &
@@ -281,27 +303,28 @@ private:
         uint64_t secondary;
     };
 
-    struct hasher {
-        std::vector<hash_pair> const* classes;
-        using is_transparent = void;
+    // Dedup index sharded NUM_SHARDS ways to remove the single-lock
+    // serialization on the bucket-process merge. Each shard maps the
+    // 128-bit content hash directly to a cid (no shared per-class array,
+    // so shards are fully independent). The hasher returns the primary
+    // hash (already avalanched); equality compares both halves.
+    static constexpr size_t NUM_SHARDS = 256;  // power of two
+
+    struct hp_hasher {
         using is_avalanching = void;
-        size_t operator()(uint64_t id) const noexcept { return (*classes)[id].primary; }
         size_t operator()(hash_pair const& h) const noexcept { return h.primary; }
     };
+    struct hp_eq {
+        bool operator()(hash_pair const& a, hash_pair const& b) const noexcept {
+            return a.primary == b.primary && a.secondary == b.secondary;
+        }
+    };
 
-    struct key_eq {
-        std::vector<hash_pair> const* classes;
-        using is_transparent = void;
-        bool operator()(uint64_t a, uint64_t b) const noexcept {
-            auto const& ea = (*classes)[a];
-            auto const& eb = (*classes)[b];
-            return ea.primary == eb.primary && ea.secondary == eb.secondary;
-        }
-        bool operator()(uint64_t a, hash_pair const& h) const noexcept {
-            auto const& ea = (*classes)[a];
-            return ea.primary == h.primary && ea.secondary == h.secondary;
-        }
-        bool operator()(hash_pair const& h, uint64_t a) const noexcept { return (*this)(a, h); }
+    // alignas(64): keep each shard's mutex on its own cache line so locking
+    // one shard doesn't false-share with its neighbors.
+    struct alignas(64) shard_t {
+        std::mutex mu;
+        ankerl::unordered_dense::map<hash_pair, uint64_t, hp_hasher, hp_eq> index;
     };
 
     // Forward-input iterator over a sequence of u64s on disk. Used at
@@ -377,18 +400,21 @@ private:
     uint32_t m_sparse_threshold;
     uint32_t m_dense_threshold;
 
+    // Guarded by m_out_mu while interning concurrently (single output stream):
     bits::bit_vector::builder m_bvb;
     uint64_t m_flushed_words = 0;
+    uint64_t m_total_integers = 0;
+    std::mutex m_out_mu;
+    // Next cid to assign (= count of distinct classes). Atomic so size() /
+    // resident_bytes() can read it lock-free as a monotone gauge.
+    std::atomic<uint64_t> m_class_count{0};
+
     bool m_released = false;          // release_index() called (interning done)
     uint64_t m_released_count = 0;    // class count stashed before release
-    std::vector<hash_pair> m_classes;  // 16 B per class (dedup hashes only)
-    // bucket_type::big -> 64-bit internal value-index; the default
-    // standard bucket caps at 2^32 entries, which overflows past
-    // 4.29e9 color classes.
-    ankerl::unordered_dense::set<uint64_t, hasher, key_eq, std::allocator<uint64_t>,
-                                 ankerl::unordered_dense::bucket_type::big>
-        m_index;
-    uint64_t m_total_integers = 0;
+
+    // Sharded dedup index (hash -> cid). No per-shard value cap concern: each
+    // shard holds < total/NUM_SHARDS entries, well under the standard 2^32.
+    std::array<shard_t, NUM_SHARDS> m_shards;
 
     std::FILE* m_file = nullptr;
     std::string m_output_path;

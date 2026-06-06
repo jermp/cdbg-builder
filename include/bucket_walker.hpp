@@ -594,6 +594,10 @@ inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t nu
                             std::atomic<uint64_t>* done = nullptr,
                             uint64_t mem_budget_bytes = 0) {
     if (num_threads == 0) num_threads = 1;
+    // global_dict is now internally sharded/thread-safe, so the caller's
+    // global_mu is no longer used to guard the merge. Kept in the signature
+    // for API stability (and a possible future use); silence the warning.
+    (void)global_mu;
     const uint32_t B = writer.num_buckets();
     std::atomic<uint32_t> next{0};
     std::vector<std::thread> workers;
@@ -711,11 +715,13 @@ inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t nu
                 process_prof().ns_pre_hash.fetch_add(
                     bucket_process_prof::since(t_hash), std::memory_order_relaxed);
 
-                // Locked phase: intern with pre-computed hashes.
-                auto t_wait = bucket_process_prof::clock::now();
-                std::unique_lock<std::mutex> lk(global_mu);
-                process_prof().ns_merge_lock_wait.fetch_add(
-                    bucket_process_prof::since(t_wait), std::memory_order_relaxed);
+                // Intern phase: intern_with_hashes is internally sharded and
+                // thread-safe -- per-shard dedup locks for the common
+                // duplicate case, and for a genuinely new class the expensive
+                // hybrid-encode runs lock-free (only the append to the single
+                // output stream is briefly serialized). No external global
+                // lock, so threads no longer serialize the whole merge on one
+                // mutex (this was ~14s of merge_wait / phase on bw20k).
                 auto t_merge = bucket_process_prof::clock::now();
                 for (uint32_t i = 0; i < batch_n; ++i) {
                     local_to_global[lc_start + i] = global_dict.intern_with_hashes(
