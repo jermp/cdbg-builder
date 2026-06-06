@@ -172,8 +172,8 @@ inline id_tig id_join(id_tig const& a, uint8_t a_side, id_tig const& b, uint8_t 
     }
     m.entries = std::move(ae);
     m.entries.insert(m.entries.end(), be.begin(), be.end());
-    m.open_flags = (uint8_t)((left_open ? UNITIG_OPEN_LEFT : 0) |
-                             (right_open ? UNITIG_OPEN_RIGHT : 0));
+    m.open_flags =
+        (uint8_t)((left_open ? UNITIG_OPEN_LEFT : 0) | (right_open ? UNITIG_OPEN_RIGHT : 0));
     m.rng = a.rng ^ (b.rng * 0x9e3779b97f4a7c15ull);
     if (m.rng == 0) m.rng = 0x9e3779b97f4a7c15ull;
     return m;
@@ -184,8 +184,7 @@ inline id_tig id_join(id_tig const& a, uint8_t a_side, id_tig const& b, uint8_t 
 // id_tigs instead of ext_tigs.
 struct id_round_store_mem {
     explicit id_round_store_mem(uint32_t num_buckets)
-        : m_in(num_buckets), m_out(num_buckets), m_locks(num_buckets),
-          m_num_buckets(num_buckets) {}
+        : m_in(num_buckets), m_out(num_buckets), m_locks(num_buckets), m_num_buckets(num_buckets) {}
 
     uint32_t num_buckets() const { return m_num_buckets; }
 
@@ -287,8 +286,11 @@ inline void id_tigs_decode_into(uint8_t const* raw, size_t len, std::vector<id_t
 class id_round_store_file {
 public:
     id_round_store_file(std::string dir, uint32_t num_buckets)
-        : m_dir(std::move(dir)), m_num_buckets(num_buckets), m_batch(num_buckets),
-          m_files(num_buckets, nullptr), m_locks(num_buckets) {}
+        : m_dir(std::move(dir))
+        , m_num_buckets(num_buckets)
+        , m_batch(num_buckets)
+        , m_files(num_buckets, nullptr)
+        , m_locks(num_buckets) {}
 
     ~id_round_store_file() {
         for (auto* f : m_files)
@@ -406,10 +408,15 @@ private:
 class id_round_store_hybrid {
 public:
     id_round_store_hybrid(std::string dir, uint32_t num_buckets, ram_budget* budget)
-        : m_dir(std::move(dir)), m_num_buckets(num_buckets), m_budget(budget),
-          m_ram_in(num_buckets), m_ram_out(num_buckets), m_spill_in(num_buckets),
-          m_spill_out_path(num_buckets), m_spill_out_file(num_buckets, nullptr),
-          m_locks(num_buckets) {}
+        : m_dir(std::move(dir))
+        , m_num_buckets(num_buckets)
+        , m_budget(budget)
+        , m_ram_in(num_buckets)
+        , m_ram_out(num_buckets)
+        , m_spill_in(num_buckets)
+        , m_spill_out_path(num_buckets)
+        , m_spill_out_file(num_buckets, nullptr)
+        , m_locks(num_buckets) {}
 
     ~id_round_store_hybrid() {
         std::error_code ec;
@@ -854,8 +861,8 @@ inline void id_assemble_chain(id_chain const& c, Source& frag, uint32_t k, Sink&
             seq = std::move(s);
             runs = std::move(r);
         } else {
-            ext_concat_runs(runs, std::move(r));    // reconcile + drop shared X unit
-            seq.append(s.begin() + k, s.end());      // drop the k-base overlap
+            ext_concat_runs(runs, std::move(r));  // reconcile + drop shared X unit
+            seq.append(s.begin() + k, s.end());   // drop the k-base overlap
         }
     }
     id_tig_assembled_split(seq, runs, c.open_flags, k, sink);
@@ -876,9 +883,13 @@ public:
     // take_bucket_decoded, which merges the retained RAM with any spilled frames.
     frame_spill_writer(std::string dir, std::string prefix, uint32_t num_buckets,
                        ram_budget* budget = nullptr)
-        : m_dir(std::move(dir)), m_prefix(std::move(prefix)), m_num_buckets(num_buckets),
-          m_budget(budget), m_batch(num_buckets), m_files(num_buckets, nullptr),
-          m_locks(num_buckets) {}
+        : m_dir(std::move(dir))
+        , m_prefix(std::move(prefix))
+        , m_num_buckets(num_buckets)
+        , m_budget(budget)
+        , m_batch(num_buckets)
+        , m_files(num_buckets, nullptr)
+        , m_locks(num_buckets) {}
 
     ~frame_spill_writer() {
         for (auto* f : m_files)
@@ -988,8 +999,8 @@ inline std::vector<uint8_t> read_spill_bucket_decoded(std::string const& path) {
         if (std::fread(comp.data(), 1, c, f) != c) break;
         size_t base = raw.size();
         raw.resize(base + u);
-        int decoded = LZ4_decompress_safe((char const*)comp.data(), (char*)raw.data() + base,
-                                          (int)c, (int)u);
+        int decoded =
+            LZ4_decompress_safe((char const*)comp.data(), (char*)raw.data() + base, (int)c, (int)u);
         if (decoded < 0 || (uint32_t)decoded != u)
             throw std::runtime_error("spill bucket LZ4 decode failed: " + path);
     }
@@ -1234,8 +1245,9 @@ inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frag
         });
         store.advance();
     }
-    std::cout << "  [id-stitch] seed " << std::chrono::duration<double>(
-                     std::chrono::steady_clock::now() - t_seed).count() << "s\n";
+    std::cout << "  [id-stitch] seed "
+              << std::chrono::duration<double>(std::chrono::steady_clock::now() - t_seed).count()
+              << "s\n";
     id_run_rounds(store, k, num_buckets, chain_sink, num_threads);
     members.close();
 
@@ -1255,7 +1267,7 @@ inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frag
             uint32_t pos;
             uint8_t pack;
         };
-        std::vector<Slot> arr;     // current range's members, indexed by (fid - lo)
+        std::vector<Slot> arr;  // current range's members, indexed by (fid - lo)
         uint64_t cur_range = UINT64_MAX, lo = 0;
         uint64_t fid = 0;
         std::vector<uint8_t> rbuf;  // reused base-record buffer

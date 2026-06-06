@@ -59,9 +59,9 @@ public:
     // num_buckets controls how the cid range is partitioned. Picked
     // so per-bucket peak fits comfortably in the budget remainder.
     unitig_bucket_writer(std::string dir, uint64_t num_color_classes, uint32_t num_buckets)
-        : m_dir(std::move(dir)),
-          m_num_color_classes(num_color_classes),
-          m_num_buckets(num_buckets == 0 ? 1 : num_buckets) {
+        : m_dir(std::move(dir))
+        , m_num_color_classes(num_color_classes)
+        , m_num_buckets(num_buckets == 0 ? 1 : num_buckets) {
         if (num_color_classes == 0) {
             // No unitigs ever produced -> a single empty bucket.
             m_num_buckets = 1;
@@ -98,8 +98,7 @@ public:
             throw std::runtime_error("short write of unitig cid to bucket " + std::to_string(b));
         if (std::fwrite(&seq_len, sizeof(seq_len), 1, f) != 1)
             throw std::runtime_error("short write of unitig len to bucket " + std::to_string(b));
-        if (seq_len > 0 &&
-            std::fwrite(u.seq.data(), 1, seq_len, f) != (size_t)seq_len) {
+        if (seq_len > 0 && std::fwrite(u.seq.data(), 1, seq_len, f) != (size_t)seq_len) {
             throw std::runtime_error("short write of unitig seq to bucket " + std::to_string(b));
         }
         ++m_total_unitigs;
@@ -136,18 +135,14 @@ public:
             size_t got = std::fread(&cid, sizeof(cid), 1, f);
             if (got != 1) {
                 if (std::feof(f)) break;
-                throw std::runtime_error("short read of unitig cid in bucket " +
-                                         std::to_string(b));
+                throw std::runtime_error("short read of unitig cid in bucket " + std::to_string(b));
             }
             if (std::fread(&seq_len, sizeof(seq_len), 1, f) != 1)
-                throw std::runtime_error("short read of unitig len in bucket " +
-                                         std::to_string(b));
+                throw std::runtime_error("short read of unitig len in bucket " + std::to_string(b));
             std::string seq;
             seq.resize(seq_len);
-            if (seq_len > 0 &&
-                std::fread(seq.data(), 1, seq_len, f) != (size_t)seq_len) {
-                throw std::runtime_error("short read of unitig seq in bucket " +
-                                         std::to_string(b));
+            if (seq_len > 0 && std::fread(seq.data(), 1, seq_len, f) != (size_t)seq_len) {
+                throw std::runtime_error("short read of unitig seq in bucket " + std::to_string(b));
             }
             out.push_back({cid, std::move(seq)});
         }
@@ -186,8 +181,7 @@ public:
             if (std::fread(&seq_len, sizeof(seq_len), 1, fp) != 1)
                 throw std::runtime_error("short read of len in bucket " + std::to_string(b));
             r.seq.resize(seq_len);
-            if (seq_len > 0 &&
-                std::fread(r.seq.data(), 1, seq_len, fp) != (size_t)seq_len)
+            if (seq_len > 0 && std::fread(r.seq.data(), 1, seq_len, fp) != (size_t)seq_len)
                 throw std::runtime_error("short read of seq in bucket " + std::to_string(b));
             return true;
         };
@@ -222,7 +216,10 @@ public:
             chunk_bytes += sizeof(record) + r.seq.size();
             chunk.push_back(std::move(r));
             r.seq.clear();
-            if (chunk_bytes >= mem_cap) { sort_chunk(); spill_chunk(); }
+            if (chunk_bytes >= mem_cap) {
+                sort_chunk();
+                spill_chunk();
+            }
         }
         if (run_paths.empty()) {
             // Whole bucket fit in RAM: sort + emit, no temp files.
@@ -230,7 +227,10 @@ public:
             for (auto const& rec : chunk) emit(rec.cid, std::string_view(rec.seq));
             return;
         }
-        if (!chunk.empty()) { sort_chunk(); spill_chunk(); }  // final partial run
+        if (!chunk.empty()) {
+            sort_chunk();
+            spill_chunk();
+        }  // final partial run
 
         // Pass 2: k-way merge the sorted runs. One record per run resident +
         // a heap -- bounded by (#runs * one record). #runs = bucket/mem_cap.
@@ -336,14 +336,12 @@ public:
     explicit frag_unitig_writer(std::string path, uint32_t k = 0)
         : m_path(std::move(path)), m_k(k >= 2 ? k : 0) {
         m_file = std::fopen(m_path.c_str(), "wb+");
-        if (!m_file)
-            throw std::runtime_error("cannot open frag spill: " + m_path);
+        if (!m_file) throw std::runtime_error("cannot open frag spill: " + m_path);
         if (m_k) {
             m_kbytes = (2u * m_k + 7u) / 8u;  // <= 16 (kmer_int_t is 128-bit)
             m_links_path = m_path + ".links";
             m_links_file = std::fopen(m_links_path.c_str(), "wb+");
-            if (!m_links_file)
-                throw std::runtime_error("cannot open links spill: " + m_links_path);
+            if (!m_links_file) throw std::runtime_error("cannot open links spill: " + m_links_path);
         }
     }
 
@@ -373,15 +371,13 @@ public:
             kmer_int_t kl = 0, kr = 0;
             if (flags & UNITIG_OPEN_LEFT) {
                 kmer_int_t v = 0;
-                for (uint32_t i = 0; i < m_k; ++i)
-                    v = (v << 2) | (kmer_int_t)nuc_to_2bit(u.seq[i]);
+                for (uint32_t i = 0; i < m_k; ++i) v = (v << 2) | (kmer_int_t)nuc_to_2bit(u.seq[i]);
                 kl = v;
             }
             if (flags & UNITIG_OPEN_RIGHT) {
                 kmer_int_t v = 0;
                 char const* p = u.seq.data() + (size_t)(seq_len - m_k);
-                for (uint32_t i = 0; i < m_k; ++i)
-                    v = (v << 2) | (kmer_int_t)nuc_to_2bit(p[i]);
+                for (uint32_t i = 0; i < m_k; ++i) v = (v << 2) | (kmer_int_t)nuc_to_2bit(p[i]);
                 kr = v;
             }
             lrec[0] = flags;
@@ -402,8 +398,7 @@ public:
         }
         if (std::fwrite(&seq_len, sizeof(seq_len), 1, m_file) != 1)
             throw std::runtime_error("short write to " + m_path);
-        if (seq_len > 0 &&
-            std::fwrite(u.seq.data(), 1, seq_len, m_file) != (size_t)seq_len)
+        if (seq_len > 0 && std::fwrite(u.seq.data(), 1, seq_len, m_file) != (size_t)seq_len)
             throw std::runtime_error("short write to " + m_path);
         ++m_count;
         m_total_seq_bytes += seq_len;
@@ -453,8 +448,7 @@ public:
                 if (flags & UNITIG_OPEN_RIGHT) {
                     kmer_int_t v = 0;
                     char const* p = u.seq.data() + (size_t)(seq_len - m_k);
-                    for (uint32_t i = 0; i < m_k; ++i)
-                        v = (v << 2) | (kmer_int_t)nuc_to_2bit(p[i]);
+                    for (uint32_t i = 0; i < m_k; ++i) v = (v << 2) | (kmer_int_t)nuc_to_2bit(p[i]);
                     kr = v;
                 }
                 uint8_t rec[1 + 32];
@@ -541,8 +535,7 @@ public:
             }
             u.open_flags = flags;
             u.seq.resize(seq_len);
-            if (seq_len > 0 &&
-                std::fread(u.seq.data(), 1, seq_len, f) != (size_t)seq_len) {
+            if (seq_len > 0 && std::fread(u.seq.data(), 1, seq_len, f) != (size_t)seq_len) {
                 std::fclose(f);
                 throw std::runtime_error("short read of seq from " + m_path);
             }
@@ -629,8 +622,7 @@ public:
             throw std::runtime_error("short read of seq_len from " + m_path);
         open_flags = flags;
         seq.resize(seq_len);
-        if (seq_len > 0 &&
-            std::fread(seq.data(), 1, seq_len, m_file) != (size_t)seq_len)
+        if (seq_len > 0 && std::fread(seq.data(), 1, seq_len, m_file) != (size_t)seq_len)
             throw std::runtime_error("short read of seq from " + m_path);
         return true;
     }
@@ -639,6 +631,5 @@ private:
     std::string m_path;
     std::FILE* m_file = nullptr;
 };
-
 
 }  // namespace cdbg

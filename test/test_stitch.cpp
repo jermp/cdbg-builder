@@ -112,9 +112,8 @@ void run_stitch(which_stitch w, std::vector<stitchable_unitig>& frags, uint32_t 
         // id-only compaction with the file-backed round store (parallel-stitch
         // Step B.1) -- validates the id_tig codec + on-disk doubling.
         cdbg::vector_frag_source src(frags);
-        std::string dir = std::filesystem::temp_directory_path().string() +
-                          "/cdbg_stitch_test_" + std::to_string(::getpid()) + "_" +
-                          std::to_string(g_tmp_counter++);
+        std::string dir = std::filesystem::temp_directory_path().string() + "/cdbg_stitch_test_" +
+                          std::to_string(::getpid()) + "_" + std::to_string(g_tmp_counter++);
         std::filesystem::create_directories(dir);
         cdbg::compact_stitch_file(src, k, dir, sink, /*num_buckets=*/16);
         std::filesystem::remove_all(dir);
@@ -123,9 +122,8 @@ void run_stitch(which_stitch w, std::vector<stitchable_unitig>& frags, uint32_t 
         // disk-based re-bucket assembly. Small frag_ranges/chain_buckets force
         // the multi-bucket join + group/sort logic even on tiny inputs.
         cdbg::vector_frag_source src(frags);
-        std::string dir = std::filesystem::temp_directory_path().string() +
-                          "/cdbg_stitch_test_" + std::to_string(::getpid()) + "_" +
-                          std::to_string(g_tmp_counter++);
+        std::string dir = std::filesystem::temp_directory_path().string() + "/cdbg_stitch_test_" +
+                          std::to_string(::getpid()) + "_" + std::to_string(g_tmp_counter++);
         std::filesystem::create_directories(dir);
         auto for_each = [&](auto&& fn) {
             std::vector<cdbg::color_run> runs;
@@ -152,9 +150,8 @@ void run_stitch(which_stitch w, std::vector<stitchable_unitig>& frags, uint32_t 
         // than recomputing boundary k-mers from the bases. Routes the frags
         // through the writer (frag spill + links), then runs the scalable stitch
         // with links_path set. Must match the oracle exactly.
-        std::string dir = std::filesystem::temp_directory_path().string() +
-                          "/cdbg_stitch_test_" + std::to_string(::getpid()) + "_" +
-                          std::to_string(g_tmp_counter++);
+        std::string dir = std::filesystem::temp_directory_path().string() + "/cdbg_stitch_test_" +
+                          std::to_string(::getpid()) + "_" + std::to_string(g_tmp_counter++);
         std::filesystem::create_directories(dir);
         std::string spill = dir + "/frag_unitigs.bin";
         cdbg::frag_unitig_writer fw(spill, k);
@@ -180,9 +177,8 @@ void run_stitch(which_stitch w, std::vector<stitchable_unitig>& frags, uint32_t 
         // In-RAM arena path: load fragments into the compact arena, then seed +
         // assemble straight from RAM (disk round store only). Must match oracle.
         cdbg::vector_frag_source src(frags);
-        std::string dir = std::filesystem::temp_directory_path().string() +
-                          "/cdbg_stitch_test_" + std::to_string(::getpid()) + "_" +
-                          std::to_string(g_tmp_counter++);
+        std::string dir = std::filesystem::temp_directory_path().string() + "/cdbg_stitch_test_" +
+                          std::to_string(::getpid()) + "_" + std::to_string(g_tmp_counter++);
         std::filesystem::create_directories(dir);
         cdbg::arena_frag_source arena;
         arena.reserve(src.size(), 0, 0);
@@ -192,9 +188,8 @@ void run_stitch(which_stitch w, std::vector<stitchable_unitig>& frags, uint32_t 
         std::filesystem::remove_all(dir);
     } else {
         cdbg::vector_frag_source src(frags);
-        std::string dir = std::filesystem::temp_directory_path().string() +
-                          "/cdbg_stitch_test_" + std::to_string(::getpid()) + "_" +
-                          std::to_string(g_tmp_counter++);
+        std::string dir = std::filesystem::temp_directory_path().string() + "/cdbg_stitch_test_" +
+                          std::to_string(::getpid()) + "_" + std::to_string(g_tmp_counter++);
         std::filesystem::create_directories(dir);
         // ext_file single-threaded; ext_file_mt with 4 threads exercises the
         // parallel per-round bucket loop + per-output-bucket locking.
@@ -249,9 +244,8 @@ bool run_case_impl(which_stitch w, uint64_t seed, uint32_t k, uint64_t num_uniti
         std::fprintf(stderr,
                      "[FAIL %s] seed=%llu k=%u unitigs=%llu: want %zu distinct, got %zu "
                      "distinct, out_count=%zu open_outputs=%llu\n",
-                     stitch_name(w),
-                     (unsigned long long)seed, k, (unsigned long long)num_unitigs, want.size(),
-                     got.size(), out.size(), (unsigned long long)open_outputs);
+                     stitch_name(w), (unsigned long long)seed, k, (unsigned long long)num_unitigs,
+                     want.size(), got.size(), out.size(), (unsigned long long)open_outputs);
         return false;
     }
     return true;
@@ -265,9 +259,10 @@ bool run_case(uint64_t seed, uint32_t k, uint64_t num_unitigs, uint64_t max_len,
     bool d = run_case_impl(which_stitch::ext_file_mt, seed, k, num_unitigs, max_len, max_frags);
     bool e = run_case_impl(which_stitch::compact_mem, seed, k, num_unitigs, max_len, max_frags);
     bool f = run_case_impl(which_stitch::compact_file, seed, k, num_unitigs, max_len, max_frags);
-    bool g = run_case_impl(which_stitch::compact_scalable, seed, k, num_unitigs, max_len, max_frags);
-    bool gl =
-        run_case_impl(which_stitch::compact_scalable_links, seed, k, num_unitigs, max_len, max_frags);
+    bool g =
+        run_case_impl(which_stitch::compact_scalable, seed, k, num_unitigs, max_len, max_frags);
+    bool gl = run_case_impl(which_stitch::compact_scalable_links, seed, k, num_unitigs, max_len,
+                            max_frags);
     bool h = run_case_impl(which_stitch::compact_inram, seed, k, num_unitigs, max_len, max_frags);
     return b && c && d && e && f && g && gl && h;
 }
@@ -300,9 +295,8 @@ bool run_branch_case_impl(which_stitch w, uint64_t seed, uint32_t k, uint64_t nu
         std::fprintf(stderr,
                      "[FAIL branch %s] seed=%llu k=%u clusters=%llu: want %zu distinct, got %zu "
                      "distinct, out_count=%zu open_outputs=%llu\n",
-                     stitch_name(w), (unsigned long long)seed, k,
-                     (unsigned long long)num_clusters, want.size(), got.size(), out.size(),
-                     (unsigned long long)open_outputs);
+                     stitch_name(w), (unsigned long long)seed, k, (unsigned long long)num_clusters,
+                     want.size(), got.size(), out.size(), (unsigned long long)open_outputs);
         return false;
     }
     return true;
@@ -353,9 +347,8 @@ bool run_scale(uint64_t seed, uint32_t k, uint64_t num_unitigs) {
         bool this_ok = (want == to_multiset(out));
         ok = ok && this_ok;
         std::fprintf(stderr, "[scale %s] unitigs=%llu frags=%llu out=%zu time=%.0fms %s\n",
-                     stitch_name(w),
-                     (unsigned long long)num_unitigs, (unsigned long long)n_frags, out.size(),
-                     ms, this_ok ? "OK" : "MISMATCH");
+                     stitch_name(w), (unsigned long long)num_unitigs, (unsigned long long)n_frags,
+                     out.size(), ms, this_ok ? "OK" : "MISMATCH");
     }
     return ok;
 }
@@ -376,9 +369,9 @@ int main() {
     }
 
     // A couple of fixed edge cases.
-    if (!run_case(1001, k, 1, k, 1)) ++failures;       // single k-length unitig, 1 frag
-    if (!run_case(1002, k, 1, k + 5, 6)) ++failures;   // 1 unitig, many frags
-    if (!run_case(1003, k, 500, 60, 10)) ++failures;   // many short unitigs
+    if (!run_case(1001, k, 1, k, 1)) ++failures;      // single k-length unitig, 1 frag
+    if (!run_case(1002, k, 1, k + 5, 6)) ++failures;  // 1 unitig, many frags
+    if (!run_case(1003, k, 500, 60, 10)) ++failures;  // many short unitigs
 
     // Shared-cid branchy cases: catch same-cid false joins at dBG
     // branches (the distinct-cid oracle above cannot).
