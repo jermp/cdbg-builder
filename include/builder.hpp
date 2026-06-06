@@ -227,7 +227,14 @@ struct builder {
         // is just 16 bytes of metadata; the compressed bit_vector
         // never sits in RAM. EF offsets are appended to the file at
         // finalize().
-        frag_unitig_writer frag_sink(tmp_dir + "/frag_unitigs.bin");
+        // Emit the companion links spill (boundary k-mers per fragment, in
+        // frag_id order) during bucket-process when compact stitch is on, so the
+        // scalable stitch can seed from ~1.6 GB of links instead of re-reading
+        // the whole frag spill. Only the scalable compact path consumes it; the
+        // in-RAM path seeds from the arena and ignores it (the links file is a
+        // small disk-only cost that never counts against -g).
+        frag_unitig_writer frag_sink(tmp_dir + "/frag_unitigs.bin",
+                                     m_cfg.compact_stitch ? m_cfg.k : 0);
         streaming_color_set_dict global_dict(m_num_colors,
                                              m_cfg.out_basename + ".color_sets");
         std::mutex global_mu;
@@ -395,7 +402,7 @@ struct builder {
                         compact_stitch_scalable(for_each_frag, n_frags, m_cfg.k, tmp_dir,
                                                 std::ref(*uwriter_ptr), stitch_buckets,
                                                 /*frag_ranges=*/0, /*chain_buckets=*/0,
-                                                m_cfg.num_threads);
+                                                m_cfg.num_threads, frag_sink.links_path());
                     }
                 } else {
                     frag_unitig_stream_reader frag_reader(frag_sink.path());

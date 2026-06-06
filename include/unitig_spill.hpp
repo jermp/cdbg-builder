@@ -325,15 +325,31 @@ private:
 
 class frag_unitig_writer {
 public:
-    explicit frag_unitig_writer(std::string path)
-        : m_path(std::move(path)) {
+    // When k >= 2 a companion "links" spill is written alongside the frag spill,
+    // one fixed-size record per fragment IN THE SAME frag_id order (both writes
+    // happen under the same lock in operator()). Each record is
+    //   [u8 open_flags][kbytes kl][kbytes kr]   (little-endian, kbytes=(2k+7)/8)
+    // where kl/kr are the FORWARD boundary k-mers of the open ends (0 otherwise),
+    // bit-identical to detail::id_fwd_kmer in compact_extmem. The id-only stitch's
+    // seed reads this tiny stream instead of re-reading every base out of the 7 GB
+    // frag spill just to recover two k-mers per fragment. k==0 disables it.
+    explicit frag_unitig_writer(std::string path, uint32_t k = 0)
+        : m_path(std::move(path)), m_k(k >= 2 ? k : 0) {
         m_file = std::fopen(m_path.c_str(), "wb+");
         if (!m_file)
             throw std::runtime_error("cannot open frag spill: " + m_path);
+        if (m_k) {
+            m_kbytes = (2u * m_k + 7u) / 8u;  // <= 16 (kmer_int_t is 128-bit)
+            m_links_path = m_path + ".links";
+            m_links_file = std::fopen(m_links_path.c_str(), "wb+");
+            if (!m_links_file)
+                throw std::runtime_error("cannot open links spill: " + m_links_path);
+        }
     }
 
     ~frag_unitig_writer() {
         if (m_file) std::fclose(m_file);
+        if (m_links_file) std::fclose(m_links_file);
     }
 
     frag_unitig_writer(frag_unitig_writer const&) = delete;
@@ -359,6 +375,34 @@ public:
             throw std::runtime_error("short write to " + m_path);
         ++m_count;
         m_total_seq_bytes += seq_len;
+        // Companion links record (same lock => same frag_id order as the frag
+        // spill). Compute the FORWARD boundary k-mer of each open end exactly as
+        // detail::id_fwd_kmer does (v = (v<<2)|2bit over the first/last k bases),
+        // store its low kbytes little-endian. open_flags != 0 implies seq_len >= k.
+        if (m_links_file) {
+            kmer_int_t kl = 0, kr = 0;
+            if (flags & UNITIG_OPEN_LEFT) {
+                kmer_int_t v = 0;
+                for (uint32_t i = 0; i < m_k; ++i)
+                    v = (v << 2) | (kmer_int_t)nuc_to_2bit(u.seq[i]);
+                kl = v;
+            }
+            if (flags & UNITIG_OPEN_RIGHT) {
+                kmer_int_t v = 0;
+                char const* p = u.seq.data() + (size_t)(seq_len - m_k);
+                for (uint32_t i = 0; i < m_k; ++i)
+                    v = (v << 2) | (kmer_int_t)nuc_to_2bit(p[i]);
+                kr = v;
+            }
+            uint8_t rec[1 + 32];
+            rec[0] = flags;
+            for (uint32_t b = 0; b < m_kbytes; ++b) rec[1 + b] = (uint8_t)(kl >> (8 * b));
+            for (uint32_t b = 0; b < m_kbytes; ++b)
+                rec[1 + m_kbytes + b] = (uint8_t)(kr >> (8 * b));
+            const size_t rsz = (size_t)1 + 2 * m_kbytes;
+            if (std::fwrite(rec, 1, rsz, m_links_file) != rsz)
+                throw std::runtime_error("short write to " + m_links_path);
+        }
         // Free the merged seq's backing storage in place: the caller
         // already moved into us.
         std::string().swap(u.seq);
@@ -370,6 +414,8 @@ public:
     // O(num_fragments) frag_unitig_reader index).
     uint64_t total_seq_bytes() const { return m_total_seq_bytes; }
     std::string const& path() const { return m_path; }
+    // Companion links spill path, or "" when k < 2 (links disabled).
+    std::string const& links_path() const { return m_links_path; }
 
     // Close the writer side. Call before reads.
     void close_for_writing() {
@@ -378,6 +424,11 @@ public:
             std::fflush(m_file);
             std::fclose(m_file);
             m_file = nullptr;
+        }
+        if (m_links_file) {
+            std::fflush(m_links_file);
+            std::fclose(m_links_file);
+            m_links_file = nullptr;
         }
     }
 
@@ -429,10 +480,15 @@ public:
     }
 
     void unlink() {
-        if (m_path.empty()) return;
         std::error_code ec;
-        std::filesystem::remove(m_path, ec);
-        m_path.clear();
+        if (!m_path.empty()) {
+            std::filesystem::remove(m_path, ec);
+            m_path.clear();
+        }
+        if (!m_links_path.empty()) {
+            std::filesystem::remove(m_links_path, ec);
+            m_links_path.clear();
+        }
     }
 
 private:
@@ -441,6 +497,11 @@ private:
     std::mutex m_mu;
     uint64_t m_count = 0;
     uint64_t m_total_seq_bytes = 0;
+    // Companion links spill (boundary k-mers per fragment). Disabled when m_k==0.
+    uint32_t m_k = 0;
+    uint32_t m_kbytes = 0;
+    std::string m_links_path;
+    std::FILE* m_links_file = nullptr;
 };
 
 // ----------------------------------------------------------------------------

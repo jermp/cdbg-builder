@@ -431,6 +431,55 @@ inline void id_seed(Source& frag, uint32_t k, Store& store, ChainSink&& chain_si
     store.advance();
 }
 
+// Seed round 0 from a precomputed LINKS spill instead of the frag bases. The
+// links spill (frag_unitig_writer) holds one fixed-size record per fragment in
+// frag_id order: [u8 open_flags][kbytes kl][kbytes kr], little-endian, where
+// kl/kr are the FORWARD boundary k-mers id_fwd_kmer would have computed. This
+// lets the scalable stitch seed by reading ~17 B/fragment (~1.6 GB total)
+// rather than streaming the whole multi-GB frag spill (all bases + runs) just
+// to recover two k-mers each. Output is byte-for-byte identical to the
+// for_each_frag seed: same frag_id order, same id_rng_seed(fid), same routing.
+// Read is one sequential pass (no seeks); routing/sink are the parallel-safe
+// ones the rounds already use, but the file read itself stays single-threaded
+// to avoid HDD seek thrash on the scalable path.
+template <typename Store, typename ChainSink>
+inline void id_seed_links(std::string const& path, uint64_t n_frags, uint32_t k, Store& store,
+                          ChainSink&& chain_sink) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) throw std::runtime_error("cannot open links spill: " + path);
+    const uint32_t kbytes = (2u * k + 7u) / 8u;
+    const size_t recsize = (size_t)1 + 2 * kbytes;
+    std::vector<uint8_t> buf(recsize);
+    for (uint64_t i = 0; i < n_frags; ++i) {
+        if (std::fread(buf.data(), 1, recsize, f) != recsize) {
+            std::fclose(f);
+            throw std::runtime_error("short read of links record from " + path);
+        }
+        const uint8_t of = buf[0];
+        if (k < 2 || of == 0) {
+            chain_sink(id_chain{std::vector<uint64_t>{id_entry(i, false)}, 0});
+            continue;
+        }
+        id_tig t;
+        t.open_flags = of;
+        t.rng = id_rng_seed(i);
+        t.entries.push_back(id_entry(i, false));
+        if (of & UNITIG_OPEN_LEFT) {
+            kmer_int_t kl = 0;
+            for (uint32_t b = 0; b < kbytes; ++b) kl |= (kmer_int_t)buf[1 + b] << (8 * b);
+            t.kl = kl;
+        }
+        if (of & UNITIG_OPEN_RIGHT) {
+            kmer_int_t kr = 0;
+            for (uint32_t b = 0; b < kbytes; ++b) kr |= (kmer_int_t)buf[1 + kbytes + b] << (8 * b);
+            t.kr = kr;
+        }
+        id_route(std::move(t), k, store);
+    }
+    std::fclose(f);
+    store.advance();
+}
+
 // Doubling rounds on id-tigs. Each round pairs co-bucketed tigs presenting the
 // same canonical boundary k-mer with compatible orientation, joins them, and
 // re-routes survivors; closed tigs are emitted as chains. Terminates when a
@@ -913,7 +962,7 @@ template <typename ForEachFrag, typename Sink>
 inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frags, uint32_t k,
                                     std::string const& dir, Sink&& sink, uint32_t num_buckets = 0,
                                     uint32_t frag_ranges = 0, uint32_t chain_buckets = 0,
-                                    uint32_t num_threads = 1) {
+                                    uint32_t num_threads = 1, std::string const& links_path = "") {
     using namespace detail;
     if (num_buckets == 0) num_buckets = 1024;
     if (frag_ranges == 0) frag_ranges = 64;
@@ -945,7 +994,12 @@ inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frag
     };
 
     auto t_seed = std::chrono::steady_clock::now();
-    {
+    if (!links_path.empty()) {
+        // Links-only seed: read ~17 B/fragment from the precomputed links spill
+        // instead of streaming every base out of the frag spill. The first of the
+        // two frag-spill passes vanishes; phase 2 still reads the bases once.
+        id_seed_links(links_path, n_frags, k, store, chain_sink);
+    } else {
         // Seed reads each fragment's open_flags + boundary k-mers (it ignores
         // runs, but the reader fills them). frag_id = iteration order.
         uint64_t fid = 0;

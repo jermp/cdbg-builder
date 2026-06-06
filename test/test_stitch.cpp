@@ -32,6 +32,7 @@
 #include "gen.hpp"
 #include "stitch.hpp"
 #include "stitch_extmem.hpp"
+#include "unitig_spill.hpp"  // frag_unitig_writer (+ companion links spill) + reader
 
 namespace {
 uint64_t g_tmp_counter = 0;
@@ -61,6 +62,7 @@ enum class which_stitch {
     compact_mem,
     compact_file,
     compact_scalable,
+    compact_scalable_links,
     compact_inram
 };
 
@@ -78,6 +80,8 @@ char const* stitch_name(which_stitch w) {
             return "compact_file";
         case which_stitch::compact_scalable:
             return "compact_scalable";
+        case which_stitch::compact_scalable_links:
+            return "compact_scalable_links";
         default:
             return "compact_inram";
     }
@@ -137,6 +141,36 @@ void run_stitch(which_stitch w, std::vector<stitchable_unitig>& frags, uint32_t 
         // sink; output is a thread-count-independent multiset (compared canonical).
         cdbg::compact_stitch_scalable(for_each, src.size(), k, dir, sink, /*num_buckets=*/16,
                                       /*frag_ranges=*/4, /*chain_buckets=*/4, /*num_threads=*/4);
+        std::filesystem::remove_all(dir);
+    } else if (w == which_stitch::compact_scalable_links) {
+        // Same as compact_scalable, but the seed reads the companion LINKS spill
+        // written by the real frag_unitig_writer (the production producer) rather
+        // than recomputing boundary k-mers from the bases. Routes the frags
+        // through the writer (frag spill + links), then runs the scalable stitch
+        // with links_path set. Must match the oracle exactly.
+        std::string dir = std::filesystem::temp_directory_path().string() +
+                          "/cdbg_stitch_test_" + std::to_string(::getpid()) + "_" +
+                          std::to_string(g_tmp_counter++);
+        std::filesystem::create_directories(dir);
+        std::string spill = dir + "/frag_unitigs.bin";
+        cdbg::frag_unitig_writer fw(spill, k);
+        for (auto const& u : frags) {
+            stitchable_unitig copy = u;  // writer moves the seq out
+            fw(std::move(copy));
+        }
+        fw.close_for_writing();
+        const std::string links = fw.links_path();
+        const uint64_t n = fw.count();
+        auto for_each = [&](auto&& fn) {
+            cdbg::frag_unitig_stream_reader rd(spill);
+            uint8_t of;
+            std::vector<cdbg::color_run> runs;
+            std::string seq;
+            while (rd.next(of, runs, seq)) fn(of, runs, seq);
+        };
+        cdbg::compact_stitch_scalable(for_each, n, k, dir, sink, /*num_buckets=*/16,
+                                      /*frag_ranges=*/4, /*chain_buckets=*/4, /*num_threads=*/4,
+                                      links);
         std::filesystem::remove_all(dir);
     } else if (w == which_stitch::compact_inram) {
         // In-RAM arena path: load fragments into the compact arena, then seed +
@@ -228,8 +262,10 @@ bool run_case(uint64_t seed, uint32_t k, uint64_t num_unitigs, uint64_t max_len,
     bool e = run_case_impl(which_stitch::compact_mem, seed, k, num_unitigs, max_len, max_frags);
     bool f = run_case_impl(which_stitch::compact_file, seed, k, num_unitigs, max_len, max_frags);
     bool g = run_case_impl(which_stitch::compact_scalable, seed, k, num_unitigs, max_len, max_frags);
+    bool gl =
+        run_case_impl(which_stitch::compact_scalable_links, seed, k, num_unitigs, max_len, max_frags);
     bool h = run_case_impl(which_stitch::compact_inram, seed, k, num_unitigs, max_len, max_frags);
-    return b && c && d && e && f && g && h;
+    return b && c && d && e && f && g && gl && h;
 }
 
 // Shared-cid branchy correctness case. Builds `num_clusters` branch
@@ -275,8 +311,9 @@ bool run_branch_case(uint64_t seed, uint32_t k, uint64_t num_clusters) {
     bool e = run_branch_case_impl(which_stitch::compact_mem, seed, k, num_clusters);
     bool f = run_branch_case_impl(which_stitch::compact_file, seed, k, num_clusters);
     bool g = run_branch_case_impl(which_stitch::compact_scalable, seed, k, num_clusters);
+    bool gl = run_branch_case_impl(which_stitch::compact_scalable_links, seed, k, num_clusters);
     bool h = run_branch_case_impl(which_stitch::compact_inram, seed, k, num_clusters);
-    return b && c && d && e && f && g && h;
+    return b && c && d && e && f && g && gl && h;
 }
 
 // Larger case: report timing + fragment/unitig counts, plus the same
@@ -304,7 +341,7 @@ bool run_scale(uint64_t seed, uint32_t k, uint64_t num_unitigs) {
     for (which_stitch w :
          {which_stitch::ext_mem, which_stitch::ext_file, which_stitch::ext_file_mt,
           which_stitch::compact_mem, which_stitch::compact_file, which_stitch::compact_scalable,
-          which_stitch::compact_inram}) {
+          which_stitch::compact_scalable_links, which_stitch::compact_inram}) {
         auto t0 = std::chrono::steady_clock::now();
         run_stitch(w, frags, k, out);
         auto t1 = std::chrono::steady_clock::now();
