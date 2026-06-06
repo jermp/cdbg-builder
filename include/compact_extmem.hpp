@@ -17,14 +17,19 @@
 // id-only doubling and the assembly fold validated here are reused unchanged.
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <iostream>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <lz4.h>
@@ -408,10 +413,14 @@ inline void id_seed(Source& frag, uint32_t k, Store& store, ChainSink&& chain_si
 // same canonical boundary k-mer with compatible orientation, joins them, and
 // re-routes survivors; closed tigs are emitted as chains. Terminates when a
 // round makes zero joins, then flushes the remaining open tigs as terminal
-// chains. Single-threaded (Step 1); the parallel driver is added with the file
-// store. Structure mirrors ext_run_rounds' process_bucket exactly.
+// chains. Buckets within a round are independent (own waiting-map; id-seeded
+// rng), so a persistent worker pool fans the per-round bucket loop across
+// num_threads -- same structure as ext_run_rounds. `chain_sink` MUST be
+// thread-safe when num_threads > 1 (it is called from worker threads).
 template <typename Store, typename ChainSink>
-inline void id_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, ChainSink&& chain_sink) {
+inline void id_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, ChainSink&& chain_sink,
+                          uint32_t num_threads = 1) {
+    if (num_threads == 0) num_threads = 1;
     constexpr uint32_t MAX_ROUNDS = 4096;
 
     auto process_bucket = [&](uint32_t b) -> uint64_t {
@@ -470,20 +479,97 @@ inline void id_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, ChainS
         return joined;
     };
 
+    // Persistent worker pool, spawned once and reused across rounds (round count
+    // is O(log L); per-round re-spawn adds measurable barrier overhead). Mirrors
+    // ext_run_rounds: the main thread publishes a fresh cursor + generation and
+    // signals go; workers drain buckets via the shared next_b cursor; the last
+    // to finish signals done. A generation counter avoids lost/duplicate wakeups.
+    std::mutex pool_mu;
+    std::condition_variable cv_go, cv_done;
+    std::atomic<uint32_t> next_b{0};
+    std::atomic<uint64_t> joined_this_round{0};
+    uint32_t generation = 0;
+    uint32_t active = 0;
+    bool pool_stop = false;
+    const bool parallel = (num_threads > 1);
+
+    std::vector<std::thread> pool;
+    if (parallel) {
+        pool.reserve(num_threads);
+        for (uint32_t t = 0; t < num_threads; ++t) {
+            pool.emplace_back([&]() {
+                uint32_t seen = 0;
+                for (;;) {
+                    {
+                        std::unique_lock<std::mutex> lk(pool_mu);
+                        cv_go.wait(lk, [&] { return pool_stop || generation != seen; });
+                        if (pool_stop) return;
+                        seen = generation;
+                    }
+                    uint64_t local = 0;
+                    for (;;) {
+                        uint32_t b = next_b.fetch_add(1, std::memory_order_relaxed);
+                        if (b >= num_buckets) break;
+                        local += process_bucket(b);
+                    }
+                    joined_this_round.fetch_add(local, std::memory_order_relaxed);
+                    {
+                        std::unique_lock<std::mutex> lk(pool_mu);
+                        if (--active == 0) cv_done.notify_one();
+                    }
+                }
+            });
+        }
+    }
+    struct pool_guard {
+        std::mutex& mu;
+        std::condition_variable& cv;
+        bool& stop;
+        std::vector<std::thread>& pool;
+        ~pool_guard() {
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                stop = true;
+            }
+            cv.notify_all();
+            for (auto& w : pool) w.join();
+        }
+    } guard{pool_mu, cv_go, pool_stop, pool};
+
+    auto t_rounds0 = std::chrono::steady_clock::now();
+    uint32_t rounds_run = 0;
+
     for (uint32_t round_no = 0;; ++round_no) {
-        uint64_t joined = 0;
-        for (uint32_t b = 0; b < num_buckets; ++b) joined += process_bucket(b);
+        joined_this_round.store(0, std::memory_order_relaxed);
+        if (!parallel) {
+            for (uint32_t b = 0; b < num_buckets; ++b)
+                joined_this_round.fetch_add(process_bucket(b), std::memory_order_relaxed);
+        } else {
+            std::unique_lock<std::mutex> lk(pool_mu);
+            next_b.store(0, std::memory_order_relaxed);
+            active = num_threads;
+            ++generation;
+            cv_go.notify_all();
+            cv_done.wait(lk, [&] { return active == 0; });
+        }
         store.advance();
+        ++rounds_run;
+        const uint64_t joined = joined_this_round.load(std::memory_order_relaxed);
         if (joined == 0 || round_no >= MAX_ROUNDS) {
+            if (round_no >= MAX_ROUNDS)
+                std::cerr << "[id-stitch] WARNING: round cap " << MAX_ROUNDS << " hit\n";
             // No further join is possible: flush every remaining open tig as a
             // terminal chain (its open end has no partner in the graph).
             for (uint32_t b = 0; b < num_buckets; ++b) {
                 std::vector<id_tig> rem = store.take_input_bucket(b);
                 for (auto& t : rem) chain_sink(id_chain{std::move(t.entries), t.open_flags});
             }
-            return;
+            break;
         }
     }
+    double secs =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_rounds0).count();
+    std::cout << "  [id-stitch] " << rounds_run << " rounds, " << secs << "s\n";
 }
 
 // Split an assembled tig into monochromatic unitigs. Kept separate so the
@@ -691,7 +777,8 @@ inline void compact_stitch_file(Source& frag, uint32_t k, std::string const& tmp
 template <typename ForEachFrag, typename Sink>
 inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frags, uint32_t k,
                                     std::string const& dir, Sink&& sink, uint32_t num_buckets = 0,
-                                    uint32_t frag_ranges = 0, uint32_t chain_buckets = 0) {
+                                    uint32_t frag_ranges = 0, uint32_t chain_buckets = 0,
+                                    uint32_t num_threads = 1) {
     using namespace detail;
     if (num_buckets == 0) num_buckets = 1024;
     if (frag_ranges == 0) frag_ranges = 64;
@@ -702,9 +789,11 @@ inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frag
     // --- seed + doubling: emit member records bucketed by frag_id range ------
     id_round_store_file store(dir, num_buckets);
     frame_spill_writer members(dir, "idmem_", frag_ranges);
-    uint64_t chain_counter = 0;
+    // Atomic: chain_sink is called from the round driver's worker threads. Only
+    // uniqueness matters (chains bucket by chain_id % C), not order.
+    std::atomic<uint64_t> chain_counter{0};
     auto chain_sink = [&](id_chain&& c) {
-        const uint64_t cid = chain_counter++;
+        const uint64_t cid = chain_counter.fetch_add(1, std::memory_order_relaxed);
         const uint8_t of = c.open_flags;
         for (uint32_t pos = 0; pos < c.entries.size(); ++pos) {
             const uint64_t fid = id_entry_frag(c.entries[pos]);
@@ -742,7 +831,7 @@ inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frag
         });
         store.advance();
     }
-    id_run_rounds(store, k, num_buckets, chain_sink);
+    id_run_rounds(store, k, num_buckets, chain_sink, num_threads);
     members.close();
 
     // --- phase 2: attach bases, re-bucket by chain_id % C --------------------

@@ -123,8 +123,10 @@ void run_stitch(which_stitch w, std::vector<stitchable_unitig>& frags, uint32_t 
                 fn(src.open_flags(i), runs, seq);
             }
         };
+        // 4 threads exercises the parallel round driver + thread-safe chain
+        // sink; output is a thread-count-independent multiset (compared canonical).
         cdbg::compact_stitch_scalable(for_each, src.size(), k, dir, sink, /*num_buckets=*/16,
-                                      /*frag_ranges=*/4, /*chain_buckets=*/4);
+                                      /*frag_ranges=*/4, /*chain_buckets=*/4, /*num_threads=*/4);
         std::filesystem::remove_all(dir);
     } else {
         cdbg::vector_frag_source src(frags);

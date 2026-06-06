@@ -354,7 +354,9 @@ struct builder {
                         first_pass = false;
                     };
                     compact_stitch_scalable(for_each_frag, n_frags, m_cfg.k, tmp_dir,
-                                            std::ref(*uwriter_ptr), stitch_buckets);
+                                            std::ref(*uwriter_ptr), stitch_buckets,
+                                            /*frag_ranges=*/0, /*chain_buckets=*/0,
+                                            m_cfg.num_threads);
                 } else {
                     frag_unitig_stream_reader frag_reader(frag_sink.path());
                     stitch_unitigs_extmem_file_stream(frag_reader, m_cfg.k, tmp_dir,
