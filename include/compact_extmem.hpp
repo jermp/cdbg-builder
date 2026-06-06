@@ -782,7 +782,9 @@ inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frag
     using namespace detail;
     if (num_buckets == 0) num_buckets = 1024;
     if (frag_ranges == 0) frag_ranges = 64;
-    if (chain_buckets == 0) chain_buckets = 64;
+    // More chain buckets than threads so phase 3 load-balances and only a few
+    // small buckets are co-resident per worker.
+    if (chain_buckets == 0) chain_buckets = std::max<uint32_t>(64, num_threads * 8);
     if (n_frags == 0) return;
     const uint64_t range_size = (n_frags + frag_ranges - 1) / frag_ranges;
 
@@ -905,6 +907,10 @@ inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frag
               << "s\n";
 
     // --- phase 3: per chain bucket, group + sort + fold-assemble + split -----
+    // Chain buckets are fully independent (a chain lives in exactly one), so the
+    // work fans across num_threads. The sink is not thread-safe, so each worker
+    // batches its split unitigs and drains them under sink_mu (same scheme as
+    // ext_run_rounds). Peak extra RAM is num_threads co-resident chain buckets.
     auto t_p3 = std::chrono::steady_clock::now();
     struct BaseRec {
         uint32_t pos;
@@ -912,9 +918,17 @@ inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frag
         std::string seq;
         std::vector<color_run> runs;
     };
-    for (uint32_t cb = 0; cb < chain_buckets; ++cb) {
+    std::mutex sink_mu;
+    constexpr size_t SINK_BATCH_BYTES = 2u * 1024 * 1024;
+    auto flush_batch = [&](std::vector<stitchable_unitig>& batch) {
+        if (batch.empty()) return;
+        std::lock_guard<std::mutex> lk(sink_mu);
+        for (auto& u : batch) sink(std::move(u));
+        batch.clear();
+    };
+    auto process_cb = [&](uint32_t cb) {
         std::vector<uint8_t> raw = read_spill_bucket_decoded(bases.bucket_path(cb));
-        if (raw.empty()) continue;
+        if (raw.empty()) return;
         ankerl::unordered_dense::map<uint64_t, std::vector<BaseRec>> groups;
         size_t p = 0;
         while (p + 17 <= raw.size()) {
@@ -943,6 +957,8 @@ inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frag
             }
             groups[cid].push_back(std::move(br));
         }
+        std::vector<stitchable_unitig> batch;
+        size_t batch_bytes = 0;
         for (auto& kv : groups) {
             std::vector<BaseRec>& recs = kv.second;
             std::sort(recs.begin(), recs.end(),
@@ -954,8 +970,33 @@ inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frag
                 ext_concat_runs(runs, std::move(recs[i].runs));
                 seq.append(recs[i].seq.begin() + k, recs[i].seq.end());
             }
-            id_tig_assembled_split(seq, runs, of, k, sink);
+            id_tig_assembled_split(seq, runs, of, k, [&](stitchable_unitig&& u) {
+                batch_bytes += u.seq.size();
+                batch.push_back(std::move(u));
+                if (batch_bytes >= SINK_BATCH_BYTES) {
+                    flush_batch(batch);
+                    batch_bytes = 0;
+                }
+            });
         }
+        flush_batch(batch);
+    };
+    if (num_threads <= 1) {
+        for (uint32_t cb = 0; cb < chain_buckets; ++cb) process_cb(cb);
+    } else {
+        std::atomic<uint32_t> next_cb{0};
+        std::vector<std::thread> workers;
+        workers.reserve(num_threads);
+        for (uint32_t t = 0; t < num_threads; ++t) {
+            workers.emplace_back([&]() {
+                for (;;) {
+                    uint32_t cb = next_cb.fetch_add(1, std::memory_order_relaxed);
+                    if (cb >= chain_buckets) break;
+                    process_cb(cb);
+                }
+            });
+        }
+        for (auto& w : workers) w.join();
     }
     std::cout << "  [id-stitch] phase3 (assemble+split) "
               << std::chrono::duration<double>(std::chrono::steady_clock::now() - t_p3).count()
