@@ -730,11 +730,13 @@ inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t nu
                 process_prof().ns_merge.fetch_add(bucket_process_prof::since(t_merge),
                                                   std::memory_order_relaxed);
             }
-            for (auto& u : bucket_unitigs) {
+            for (auto& u : bucket_unitigs)
                 for (auto& r : u.runs)
                     if (r.cid != COLOR_RUN_FOREIGN) r.cid = local_to_global[r.cid];
-                sink(std::move(u));
-            }
+            // One lock acquisition for the whole bucket (see write_batch): the
+            // per-fragment sink call was the bucket-process lock-contention /
+            // voluntary-context-switch hot spot.
+            sink.write_batch(bucket_unitigs);
             // Release this bucket's memory admission: kmer_info + local_dict +
             // bucket_unitigs for bucket b are done (kmer_info/local_dict freed
             // inside process_bucket and at scope end; bucket_unitigs just
