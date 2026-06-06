@@ -261,7 +261,7 @@ struct builder {
                     bp_budget = (uint64_t)(BUCKET_PROCESS_BUDGET_FRAC * (double)total);
                 }
                 process_buckets(*writer, m_cfg.k, m_num_colors, m_cfg.num_threads,
-                                std::ref(frag_sink), global_dict, global_mu, &done,
+                                frag_sink, global_dict, global_mu, &done,
                                 bp_budget);
                 prog.stop();
                 std::cout << "  bucket fragments: " << frag_sink.count() << "\n";

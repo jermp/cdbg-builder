@@ -414,6 +414,72 @@ public:
         std::string().swap(u.seq);
     }
 
+    // Write a whole bucket's fragments under ONE lock acquisition instead of one
+    // per fragment. process_buckets drains thousands of fragments per bucket from
+    // 32 threads; calling operator() per fragment took the frag-sink mutex
+    // O(num_fragments) times (~92.5 M on bw20k), and that lock churn was the
+    // dominant source of bucket-process voluntary context switches. Here the frag
+    // + link bytes are serialized into thread-local buffers OUTSIDE the lock; the
+    // lock then guards only two fwrites. frag_id order matches the link spill
+    // (both written together per batch) and is the order batches arrive.
+    void write_batch(std::vector<stitchable_unitig>& batch) {
+        if (batch.empty()) return;
+        auto put = [](std::vector<uint8_t>& b, void const* p, size_t n) {
+            uint8_t const* q = (uint8_t const*)p;
+            b.insert(b.end(), q, q + n);
+        };
+        std::vector<uint8_t> fbuf, lbuf;
+        uint64_t add_count = 0, add_seq = 0;
+        for (auto const& u : batch) {
+            const uint8_t flags = u.open_flags;
+            const uint32_t nruns = (uint32_t)u.runs.size();
+            const uint32_t seq_len = (uint32_t)u.seq.size();
+            put(fbuf, &flags, sizeof(flags));
+            put(fbuf, &nruns, sizeof(nruns));
+            for (auto const& r : u.runs) {
+                put(fbuf, &r.cid, sizeof(r.cid));
+                put(fbuf, &r.num_kmers, sizeof(r.num_kmers));
+            }
+            put(fbuf, &seq_len, sizeof(seq_len));
+            put(fbuf, u.seq.data(), seq_len);
+            if (m_links_file) {
+                kmer_int_t kl = 0, kr = 0;
+                if (flags & UNITIG_OPEN_LEFT) {
+                    kmer_int_t v = 0;
+                    for (uint32_t i = 0; i < m_k; ++i)
+                        v = (v << 2) | (kmer_int_t)nuc_to_2bit(u.seq[i]);
+                    kl = v;
+                }
+                if (flags & UNITIG_OPEN_RIGHT) {
+                    kmer_int_t v = 0;
+                    char const* p = u.seq.data() + (size_t)(seq_len - m_k);
+                    for (uint32_t i = 0; i < m_k; ++i)
+                        v = (v << 2) | (kmer_int_t)nuc_to_2bit(p[i]);
+                    kr = v;
+                }
+                uint8_t rec[1 + 32];
+                rec[0] = flags;
+                for (uint32_t b = 0; b < m_kbytes; ++b) rec[1 + b] = (uint8_t)(kl >> (8 * b));
+                for (uint32_t b = 0; b < m_kbytes; ++b)
+                    rec[1 + m_kbytes + b] = (uint8_t)(kr >> (8 * b));
+                put(lbuf, rec, (size_t)1 + 2 * m_kbytes);
+            }
+            ++add_count;
+            add_seq += seq_len;
+        }
+        {
+            std::lock_guard<std::mutex> lk(m_mu);
+            if (!fbuf.empty() && std::fwrite(fbuf.data(), 1, fbuf.size(), m_file) != fbuf.size())
+                throw std::runtime_error("short write to " + m_path);
+            if (m_links_file && !lbuf.empty() &&
+                std::fwrite(lbuf.data(), 1, lbuf.size(), m_links_file) != lbuf.size())
+                throw std::runtime_error("short write to " + m_links_path);
+            m_count += add_count;
+            m_total_seq_bytes += add_seq;
+        }
+        for (auto& u : batch) std::string().swap(u.seq);
+    }
+
     uint64_t count() const { return m_count; }
     // Total raw seq bytes across all fragments written. Lets the stitch
     // size its bucket count without an index-walk over the spill (the old
