@@ -17,12 +17,17 @@
 // id-only doubling and the assembly fold validated here are reused unchanged.
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include <lz4.h>
 #include <unordered_dense/unordered_dense.h>
 
 #include "kmer.hpp"           // kmer_int_t, reverse_complement, kmer_hasher, nuc_to_2bit
@@ -199,6 +204,159 @@ private:
     std::vector<std::vector<id_tig>> m_in, m_out;
     std::vector<std::mutex> m_locks;
     uint32_t m_num_buckets;
+};
+
+// --- id-tig (de)serialization for the file store ----------------------------
+// Layout: [u8 open_flags][u64 rng][kmer kl][kmer kr][u32 n_entries][u64 entries...].
+// Mirrors ext_tig_serialize but carries ids + end-kmers instead of seq + runs.
+inline void id_tig_serialize(id_tig const& t, std::vector<uint8_t>& out) {
+    auto put = [&](void const* p, size_t n) {
+        uint8_t const* b = (uint8_t const*)p;
+        out.insert(out.end(), b, b + n);
+    };
+    put(&t.open_flags, 1);
+    put(&t.rng, sizeof(t.rng));
+    put(&t.kl, sizeof(t.kl));
+    put(&t.kr, sizeof(t.kr));
+    uint32_t n = (uint32_t)t.entries.size();
+    put(&n, sizeof(n));
+    if (n) put(t.entries.data(), (size_t)n * sizeof(uint64_t));
+}
+
+// Returns bytes consumed, 0 on malformed/EOF.
+inline size_t id_tig_deserialize(uint8_t const* buf, size_t buf_len, id_tig& t) {
+    constexpr size_t HDR = 1 + sizeof(uint64_t) + 2 * sizeof(kmer_int_t) + sizeof(uint32_t);
+    if (buf_len < HDR) return 0;
+    size_t p = 0;
+    t.open_flags = buf[p];
+    p += 1;
+    std::memcpy(&t.rng, buf + p, sizeof(t.rng));
+    p += sizeof(t.rng);
+    std::memcpy(&t.kl, buf + p, sizeof(t.kl));
+    p += sizeof(t.kl);
+    std::memcpy(&t.kr, buf + p, sizeof(t.kr));
+    p += sizeof(t.kr);
+    uint32_t n;
+    std::memcpy(&n, buf + p, sizeof(n));
+    p += sizeof(n);
+    if (buf_len < p + (size_t)n * sizeof(uint64_t)) return 0;
+    t.entries.resize(n);
+    if (n) std::memcpy(t.entries.data(), buf + p, (size_t)n * sizeof(uint64_t));
+    p += (size_t)n * sizeof(uint64_t);
+    return p;
+}
+
+// File-backed id-tig round store: one LZ4-framed file per bucket per round, one
+// bucket resident at a time. Clone of round_store_file (stitch_extmem.hpp) with
+// the id_tig codec; see there for the frame format and concurrency notes.
+class id_round_store_file {
+public:
+    id_round_store_file(std::string dir, uint32_t num_buckets)
+        : m_dir(std::move(dir)), m_num_buckets(num_buckets), m_batch(num_buckets),
+          m_files(num_buckets, nullptr), m_locks(num_buckets) {}
+
+    ~id_round_store_file() {
+        for (auto* f : m_files)
+            if (f) std::fclose(f);
+    }
+
+    id_round_store_file(id_round_store_file const&) = delete;
+    id_round_store_file& operator=(id_round_store_file const&) = delete;
+
+    uint32_t num_buckets() const { return m_num_buckets; }
+
+    void emit(uint32_t b, id_tig&& t) {
+        std::lock_guard<std::mutex> lk(m_locks[b]);
+        id_tig_serialize(t, m_batch[b]);
+        if (m_batch[b].size() >= FRAME_BUDGET) flush_frame(b);
+    }
+
+    std::vector<id_tig> take_input_bucket(uint32_t b) {
+        std::vector<id_tig> out;
+        std::string path = bucket_path(m_in_round, b);
+        std::FILE* f = std::fopen(path.c_str(), "rb");
+        if (!f) return out;  // empty bucket: no file was created
+        std::vector<uint8_t> comp, raw;
+        for (;;) {
+            uint32_t u = 0;
+            if (std::fread(&u, sizeof(u), 1, f) != 1) break;
+            if (u == 0) break;
+            uint32_t c = 0;
+            if (std::fread(&c, sizeof(c), 1, f) != 1) break;
+            if (comp.size() < c) comp.resize(c);
+            if (std::fread(comp.data(), 1, c, f) != c) break;
+            size_t base = raw.size();
+            raw.resize(base + u);
+            int decoded = LZ4_decompress_safe((char const*)comp.data(), (char*)raw.data() + base,
+                                              (int)c, (int)u);
+            if (decoded < 0 || (uint32_t)decoded != u)
+                throw std::runtime_error("id-stitch round bucket LZ4 decode failed: " + path);
+        }
+        std::fclose(f);
+        std::remove(path.c_str());
+        size_t pos = 0;
+        while (pos < raw.size()) {
+            id_tig t;
+            size_t got = id_tig_deserialize(raw.data() + pos, raw.size() - pos, t);
+            if (got == 0) break;
+            pos += got;
+            out.push_back(std::move(t));
+        }
+        return out;
+    }
+
+    void advance() {
+        for (uint32_t b = 0; b < m_num_buckets; ++b) {
+            if (!m_batch[b].empty()) flush_frame(b);
+            if (m_files[b]) {
+                uint32_t eof = 0;
+                std::fwrite(&eof, sizeof(eof), 1, m_files[b]);
+                std::fclose(m_files[b]);
+                m_files[b] = nullptr;
+            }
+        }
+        m_in_round = m_out_round;
+        m_out_round = m_in_round + 1;
+    }
+
+private:
+    static constexpr size_t FRAME_BUDGET = 4u * 1024 * 1024;
+
+    std::string bucket_path(uint32_t round, uint32_t b) const {
+        return m_dir + "/idstitch_r" + std::to_string(round) + "_b" + std::to_string(b) + ".bin";
+    }
+
+    void flush_frame(uint32_t b) {  // caller holds m_locks[b], or single-threaded
+        auto& batch = m_batch[b];
+        if (batch.empty()) return;
+        if (!m_files[b]) {
+            std::string path = bucket_path(m_out_round, b);
+            m_files[b] = std::fopen(path.c_str(), "wb");
+            if (!m_files[b])
+                throw std::runtime_error("cannot open id-stitch round file: " + path + ": " +
+                                         std::strerror(errno));
+        }
+        int src = (int)batch.size();
+        int bound = LZ4_compressBound(src);
+        std::vector<uint8_t> scratch((size_t)bound);
+        int comp = LZ4_compress_default((char const*)batch.data(), (char*)scratch.data(), src,
+                                        (int)scratch.size());
+        if (comp <= 0) throw std::runtime_error("id-stitch LZ4 compress failed");
+        uint32_t u = (uint32_t)src, c = (uint32_t)comp;
+        std::FILE* f = m_files[b];
+        if (std::fwrite(&u, sizeof(u), 1, f) != 1 || std::fwrite(&c, sizeof(c), 1, f) != 1 ||
+            std::fwrite(scratch.data(), 1, (size_t)comp, f) != (size_t)comp)
+            throw std::runtime_error("short write to id-stitch round file");
+        batch.clear();
+    }
+
+    std::string m_dir;
+    uint32_t m_num_buckets;
+    std::vector<std::vector<uint8_t>> m_batch;
+    std::vector<std::FILE*> m_files;
+    std::vector<std::mutex> m_locks;
+    uint32_t m_in_round = 0;
+    uint32_t m_out_round = 0;
 };
 
 // Route an id-tig to a round-output bucket by its presented end's canonical
@@ -380,6 +538,22 @@ template <typename Source, typename Sink>
 inline void compact_stitch_mem(Source& frag, uint32_t k, Sink&& sink, uint32_t num_buckets = 0) {
     if (num_buckets == 0) num_buckets = 256;
     detail::id_round_store_mem store(num_buckets);
+    std::vector<detail::id_chain> chains;
+    auto chain_sink = [&](detail::id_chain&& c) { chains.push_back(std::move(c)); };
+    detail::id_seed(frag, k, store, chain_sink);
+    detail::id_run_rounds(store, k, num_buckets, chain_sink);
+    for (auto const& c : chains) detail::id_assemble_chain(c, frag, k, sink);
+}
+
+// File-backed id-only compaction stitch (STEP B.1): same as compact_stitch_mem
+// but the doubling round store lives on disk (one bucket resident), validating
+// the id_tig codec + file store. Chains and assembly are still in RAM here; the
+// scalable disk-based chain spill + re-bucket assembly come in B.2.
+template <typename Source, typename Sink>
+inline void compact_stitch_file(Source& frag, uint32_t k, std::string const& tmp_dir, Sink&& sink,
+                                uint32_t num_buckets = 0) {
+    if (num_buckets == 0) num_buckets = 1024;
+    detail::id_round_store_file store(tmp_dir, num_buckets);
     std::vector<detail::id_chain> chains;
     auto chain_sink = [&](detail::id_chain&& c) { chains.push_back(std::move(c)); };
     detail::id_seed(frag, k, store, chain_sink);
