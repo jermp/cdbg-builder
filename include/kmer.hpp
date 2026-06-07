@@ -8,17 +8,29 @@
 
 namespace cdbg {
 
-// 2-bit packed k-mer for k <= 63, stored canonical (min of forward / RC).
+// 2-bit packed k-mer, stored canonical (min of forward / RC).
 // Encoding: A=0, C=1, G=2, T=3. Position 0 is the lowest two bits, so the
 // first nucleotide of the k-mer ends up in the highest two used bits.
 //
 // This convention matches SSHash's 2-bit canonical k-mer encoding used by
 // Fulgor downstream (forward k-mer is read left-to-right and shifted in
 // from the LSB side; RC built by inverting and reversing the 2-bit pairs).
-
+//
+// kmer_int_t width is a COMPILE-TIME choice (mirrors SSHash). The default is
+// uint64_t, which holds k <= 31 (2*31 = 62 bits) -- the common case -- and uses
+// cheaper 64-bit arithmetic plus half the memory in every k-mer-keyed structure
+// (notably bucket-process's kmer_info map). Define CDBG_LARGE_K (the CMake
+// option of the same name, which adds -DCDBG_LARGE_K) to widen to __uint128_t
+// and allow k <= 63. The on-disk formats adapt automatically: each k-mer is
+// serialized in ceil(2k/8) bytes or sizeof(kmer_int_t), both derived from the
+// active width.
+#ifdef CDBG_LARGE_K
 using kmer_int_t = __uint128_t;
-
 constexpr uint32_t MAX_K = 63;
+#else
+using kmer_int_t = uint64_t;
+constexpr uint32_t MAX_K = 31;
+#endif
 
 inline uint8_t nuc_to_2bit(char c) {
     switch (c) {
@@ -45,7 +57,10 @@ inline char twobit_to_nuc(uint8_t x) {
 }
 
 inline kmer_int_t kmer_mask(uint32_t k) {
-    if (k == 64) return ~kmer_int_t(0);
+    // A shift equal to the type width is UB, so special-case the full-width k
+    // (k==32 for uint64_t, k==64 for __uint128_t). Valid k <= MAX_K never hits
+    // it, but keep it robust.
+    if (2 * k >= sizeof(kmer_int_t) * 8) return ~kmer_int_t(0);
     return (kmer_int_t(1) << (2 * k)) - 1;
 }
 
@@ -104,16 +119,21 @@ struct kmer_hasher {
     using is_avalanching = void;
 
     size_t operator()(kmer_int_t x) const noexcept {
-        // splitmix-style 64x64 mix on the two halves, combined.
-        uint64_t lo = (uint64_t)x;
-        uint64_t hi = (uint64_t)(x >> 64);
         auto mix = [](uint64_t z) {
             z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
             z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
             z = z ^ (z >> 31);
             return z;
         };
-        return (size_t)(mix(lo) ^ (mix(hi + 0x9e3779b97f4a7c15ULL) << 1));
+        uint64_t lo = (uint64_t)x;
+        // For the 128-bit width, mix both halves (identical to the prior hash).
+        // For uint64_t, x >> 64 is UB, so hash the single word.
+        if constexpr (sizeof(kmer_int_t) > sizeof(uint64_t)) {
+            uint64_t hi = (uint64_t)(x >> 64);
+            return (size_t)(mix(lo) ^ (mix(hi + 0x9e3779b97f4a7c15ULL) << 1));
+        } else {
+            return (size_t)mix(lo);
+        }
     }
 };
 
