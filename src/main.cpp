@@ -64,8 +64,8 @@ bool parse_args(int argc, char** argv, cdbg::build_config& cfg) {
     if (parser.parsed("max_ram_gb")) cfg.max_ram_gb = parser.get<double>("max_ram_gb");
     if (parser.parsed("alpha")) cfg.alpha = parser.get<double>("alpha");
     if (parser.parsed("beta")) cfg.beta = parser.get<double>("beta");
-    if (parser.parsed("flush_bases")) cfg.flush_bases = parser.get<size_t>("flush_bases");
-    if (parser.parsed("spill_bytes")) cfg.spill_bytes = parser.get<size_t>("spill_bytes");
+    if (parser.parsed("flush_bases")) cfg.flush_bases = parser.get<uint64_t>("flush_bases");
+    if (parser.parsed("spill_bytes")) cfg.spill_bytes = parser.get<uint64_t>("spill_bytes");
     if (parser.parsed("verbose")) cfg.verbose = parser.get<bool>("verbose");
     return true;
 }

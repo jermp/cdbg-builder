@@ -46,8 +46,8 @@ struct build_config {
     // Per-bucket batching payloads in bytes (0 = built-in default). flush_bases
     // = thread->compactor handoff size; spill_bytes = compactor dedup window
     // before a disk frame. Smaller -> larger derived bucket count B.
-    size_t flush_bases = 0;
-    size_t spill_bytes = 0;
+    uint64_t flush_bases = 0;
+    uint64_t spill_bytes = 0;
     // Soft RAM budget in GiB. 0 = no budget. When set, the builder
     // auto-picks bucket_log2 (more buckets -> smaller per-bucket data
     // structures) and streams the encoded color bit_vector to a
@@ -61,15 +61,22 @@ struct build_config {
 
 // ---- timer ------------------------------------------------------------------
 
-// RAII phase timer: prints "[label] X.XX s" on destruction. Used to bracket
-// individual stages inside cdbg_builder::build().
+// Wall-clock stopwatch reporting elapsed time in SECONDS (as a double), for
+// ad-hoc measurements: start(), stop(), then elapsed() returns seconds.
+// essentials::timer parameterized with a seconds duration, so elapsed() needs
+// no unit conversion. This is the one timing mechanism in the codebase.
+using seconds_timer = essentials::timer<essentials::clock_type, std::chrono::duration<double>>;
+
+// RAII scope timer: starts a seconds_timer on construction and prints
+// "[label] X s" on destruction. The convenience wrapper for bracketing a whole
+// phase/scope (e.g. `timer _("bucket-write");`); it just adds the auto-print on
+// top of seconds_timer, so there is no separate clock.
 class timer {
 public:
-    timer(char const* label) : m_label(label), m_t0(std::chrono::steady_clock::now()) {}
+    explicit timer(char const* label) : m_label(label) { m_t.start(); }
     ~timer() {
-        auto t1 = std::chrono::steady_clock::now();
-        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - m_t0).count();
-        std::cout << "[" << m_label << "] " << (ms / 1000.0) << " s\n";
+        m_t.stop();
+        std::cout << "[" << m_label << "] " << m_t.elapsed() << " s\n";
     }
 
     timer(timer const&) = delete;
@@ -77,14 +84,8 @@ public:
 
 private:
     char const* m_label;
-    std::chrono::steady_clock::time_point m_t0;
+    seconds_timer m_t;
 };
-
-// Wall-clock stopwatch reporting elapsed time in SECONDS (as a double), shared
-// across the codebase for ad-hoc measurements. essentials::timer parameterized
-// with a seconds duration, so elapsed() needs no unit conversion: start(),
-// stop(), then elapsed() returns seconds.
-using seconds_timer = essentials::timer<essentials::clock_type, std::chrono::duration<double>>;
 
 // ---- process-memory query ---------------------------------------------------
 //
@@ -125,24 +126,9 @@ inline ctx_switch_counts process_ctx_switches() {
     return {(uint64_t)ru.ru_nvcsw, (uint64_t)ru.ru_nivcsw};
 }
 
-// Pretty-printer: 3.42 GiB / 728 MiB / 12 KiB, picking the largest
-// unit at which the number is >= 1.
-inline std::string format_bytes(uint64_t b) {
-    static char const* units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
-    double v = b;
-    int u = 0;
-    while (v >= 1024.0 and u + 1 < (int)(sizeof(units) / sizeof(units[0]))) {
-        v /= 1024.0;
-        ++u;
-    }
-    char buf[64];
-    if (u == 0) {
-        std::snprintf(buf, sizeof(buf), "%llu B", (unsigned long long)b);
-    } else {
-        std::snprintf(buf, sizeof(buf), "%.2f %s", v, units[u]);
-    }
-    return buf;
-}
+// Byte-size pretty-printing. format_bytes_in() renders in a *fixed* unit;
+// byte_unit_index() picks the unit; format_bytes() composes them to auto-scale.
+// Used only for logging / the (throttled) progress bar -- never in a hot loop.
 
 // The unit index format_bytes() would pick for `b` (0=B,1=KiB,2=MiB,...).
 inline int byte_unit_index(uint64_t b) {
@@ -171,6 +157,10 @@ inline std::string format_bytes_in(uint64_t b, int u) {
     return buf;
 }
 
+// Pretty-printer: 3.42 GiB / 728 MiB / 12 KiB, auto-scaling to the largest
+// unit at which the number is >= 1.
+inline std::string format_bytes(uint64_t b) { return format_bytes_in(b, byte_unit_index(b)); }
+
 // Current resident set size in bytes (live RSS, not the lifetime peak).
 // Linux: parses VmRSS from /proc/self/status using a single read()
 // syscall to be robust against environments where stdio fopen() is
@@ -186,6 +176,8 @@ inline uint64_t current_rss_bytes() {
     int fd = ::open("/proc/self/status", O_RDONLY | O_CLOEXEC);
     if (fd < 0) return 0;
     char buf[4096];
+    // ssize_t / size_t here are the POSIX read() contract (read returns ssize_t,
+    // takes a size_t count), not an arbitrary width choice -- keep them as-is.
     ssize_t total = 0;
     for (;;) {
         ssize_t n = ::read(fd, buf + total, sizeof(buf) - 1 - (size_t)total);
