@@ -74,7 +74,7 @@
 #include <unordered_dense/unordered_dense.h>
 
 #include "phase2_bucket_process/bucket_walker.hpp"  // stitchable_unitig, UNITIG_OPEN_*
-#include "phase1_bucket_write/kmer.hpp"
+#include "kmer.hpp"
 #include "phase3_stitch/stitch.hpp"  // detail::side_junction_canonical, SIDE_*, revcomp_string
 
 namespace cdbg {
@@ -119,8 +119,8 @@ inline void ext_split_monochromatic(ext_tig& t, uint32_t k, uint8_t open_flags, 
     // a k-mer was lost from the graph; it does not occur because every boundary
     // k-mer is primary in exactly one bucket, and is asserted against below.)
     size_t lo = 0, hi = nruns;  // [lo, hi) runs to emit
-    if (lo < hi && t.runs[lo].cid == COLOR_RUN_FOREIGN) ++lo;
-    if (lo < hi && t.runs[hi - 1].cid == COLOR_RUN_FOREIGN) --hi;
+    if (lo < hi and t.runs[lo].cid == COLOR_RUN_FOREIGN) ++lo;
+    if (lo < hi and t.runs[hi - 1].cid == COLOR_RUN_FOREIGN) --hi;
     // k-mer offset of the first emitted run (foreign-dropped prefix k-mers).
     size_t base_off = 0;
     for (size_t i = 0; i < lo; ++i) base_off += t.runs[i].num_kmers;
@@ -184,7 +184,7 @@ inline void ext_concat_runs(std::vector<color_run>& a, std::vector<color_run> b)
             // topological tig, and the monochromatic split then shatters one
             // tig into thousands of unitigs (salmonella-10: 2123 runs/tig ->
             // 409k unitigs instead of 87,297).
-            if (a.size() >= 2 && a[a.size() - 2].cid == real) {
+            if (a.size() >= 2 and a[a.size() - 2].cid == real) {
                 a[a.size() - 2].num_kmers += a.back().num_kmers;
                 a.pop_back();
             }
@@ -194,7 +194,7 @@ inline void ext_concat_runs(std::vector<color_run>& a, std::vector<color_run> b)
     if (--b.front().num_kmers == 0) b.erase(b.begin());
     if (b.empty()) return;
     size_t bi = 0;
-    if (!a.empty() && a.back().cid == b.front().cid) {
+    if (!a.empty() and a.back().cid == b.front().cid) {
         a.back().num_kmers += b.front().num_kmers;
         bi = 1;
     }
@@ -272,7 +272,7 @@ struct ext_end {
 inline bool ext_choose_side(ext_tig const& t, uint8_t& out_side) {
     bool l = (t.open_flags & UNITIG_OPEN_LEFT) != 0;
     bool r = (t.open_flags & UNITIG_OPEN_RIGHT) != 0;
-    if (l && r) {
+    if (l and r) {
         out_side = ext_mix_bit(t.rng) ? SIDE_RIGHT : SIDE_LEFT;
         return true;
     }
@@ -489,7 +489,7 @@ public:
             raw.resize(base + u);
             int decoded = LZ4_decompress_safe((char const*)comp.data(), (char*)raw.data() + base,
                                               (int)c, (int)u);
-            if (decoded < 0 || (uint32_t)decoded != u)
+            if (decoded < 0 or (uint32_t) decoded != u)
                 throw std::runtime_error("ext-stitch round bucket LZ4 decode failed: " + path);
         }
         std::fclose(f);
@@ -557,7 +557,7 @@ private:
         if (comp <= 0) throw std::runtime_error("ext-stitch LZ4 compress failed");
         uint32_t u = (uint32_t)src, c = (uint32_t)comp;
         std::FILE* f = m_files[b];
-        if (std::fwrite(&u, sizeof(u), 1, f) != 1 || std::fwrite(&c, sizeof(c), 1, f) != 1 ||
+        if (std::fwrite(&u, sizeof(u), 1, f) != 1 or std::fwrite(&c, sizeof(c), 1, f) != 1 or
             std::fwrite(scratch.data(), 1, (size_t)comp, f) != (size_t)comp)
             throw std::runtime_error("short write to stitch round file");
         batch.clear();
@@ -677,7 +677,7 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
         // pass treat each as terminal-on-this-end (carried, re-rolled,
         // or sunk if its other end also fails to join).
         for (uint64_t i = 0; i < NT; ++i) {
-            if (consumed[i] || !has_end[i]) continue;
+            if (consumed[i] or !has_end[i]) continue;
             kmer_int_t j = ends[i].junction;
             auto it = waiting.find(j);
             if (it == waiting.end()) {
@@ -733,7 +733,7 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
                 continue;
             }
             ext_tig t = std::move(tigs[i]);
-            bool both = (t.open_flags & UNITIG_OPEN_LEFT) && (t.open_flags & UNITIG_OPEN_RIGHT);
+            bool both = (t.open_flags & UNITIG_OPEN_LEFT) and (t.open_flags & UNITIG_OPEN_RIGHT);
             if (both) detail::ext_rng_next(t.rng);  // re-roll presented end
             uint64_t dummy = 0;
             detail::ext_route(std::move(t), k, store, dummy);
@@ -777,7 +777,7 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
                 for (;;) {
                     {
                         std::unique_lock<std::mutex> lk(pool_mu);
-                        cv_go.wait(lk, [&] { return pool_stop || generation != seen; });
+                        cv_go.wait(lk, [&] { return pool_stop or generation != seen; });
                         if (pool_stop) return;
                         seen = generation;
                     }
@@ -815,12 +815,14 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
     // Coarse timing so we can see where stitch time goes (round count and
     // wall time; the per-round file I/O of late, near-empty rounds vs the
     // CPU-heavy early rounds). Printed once at the end -- negligible cost.
-    auto t_rounds0 = std::chrono::steady_clock::now();
+    seconds_timer t_rounds0;
+    t_rounds0.start();
     uint32_t rounds_run = 0;
     double early_secs = 0.0;  // rounds 0-4 (the heavy ones)
 
     for (uint32_t round_no = 0;; ++round_no) {
-        auto t_r0 = std::chrono::steady_clock::now();
+        seconds_timer t_r0;
+        t_r0.start();
         joined_this_round.store(0, std::memory_order_relaxed);
 
         if (!parallel) {
@@ -843,9 +845,8 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
         const uint64_t joined = joined_this_round.load(std::memory_order_relaxed);
         ++rounds_run;
         {
-            double rs =
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - t_r0).count();
-            if (round_no < 5) early_secs += rs;
+            t_r0.stop();
+            if (round_no < 5) early_secs += t_r0.elapsed();
         }
 #ifdef CDGB_STITCH_DEBUG
         std::cerr << "[ext-stitch round " << round_no << "] joined=" << joined << "\n";
@@ -855,7 +856,7 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
         // further join is possible, so flush every remaining open tig as a
         // terminal unitig (its open end has no partner in the graph) and
         // finish.
-        if (joined == 0 || round_no >= MAX_ROUNDS) {
+        if (joined == 0 or round_no >= MAX_ROUNDS) {
             if (round_no >= MAX_ROUNDS)
                 std::cerr << "[ext-stitch] WARNING: round cap " << MAX_ROUNDS << " hit\n";
             std::vector<stitchable_unitig> rem_batch;
@@ -874,9 +875,8 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
             break;
         }
     }
-    double total_round_secs =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_rounds0).count();
-    std::cout << "  [stitch] " << rounds_run << " rounds, " << total_round_secs << "s total ("
+    t_rounds0.stop();
+    std::cout << "  [stitch] " << rounds_run << " rounds, " << t_rounds0.elapsed() << "s total ("
               << early_secs << "s in rounds 0-4)\n";
 }
 
@@ -894,7 +894,7 @@ template <typename Store, typename Sink>
 inline void ext_seed_one(ext_tig&& t, uint32_t k, Store& store, Sink&& sink,
                          std::atomic<uint64_t>* done) {
     t.rng = ext_seed_from_seq(t.seq);
-    if (k < 2 || t.open_flags == 0) {
+    if (k < 2 or t.open_flags == 0) {
         // Already closed: split at color-run boundaries and sink.
         ext_split_monochromatic(t, k, t.open_flags, [&](stitchable_unitig&& u) {
             if (done) done->fetch_add(1, std::memory_order_relaxed);

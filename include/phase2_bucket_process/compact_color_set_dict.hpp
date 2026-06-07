@@ -70,10 +70,8 @@ struct compact_color_set_dict {
         if (id >= m_classes.size())
             throw std::out_of_range("compact_color_set_dict::at id out of range");
         out.clear();
-        bits::bit_vector::iterator it(
-            m_bvb.data().empty() ? nullptr : m_bvb.data().data(),
-            m_bvb.data().size(),
-            m_classes[id].bit_offset);
+        bits::bit_vector::iterator it(m_bvb.data().empty() ? nullptr : m_bvb.data().data(),
+                                      m_bvb.data().size(), m_classes[id].bit_offset);
         decode_one_(it, out);
     }
 
@@ -103,11 +101,11 @@ private:
         bool operator()(uint32_t a, uint32_t b) const noexcept {
             auto const& ea = (*classes)[a];
             auto const& eb = (*classes)[b];
-            return ea.primary == eb.primary && ea.secondary == eb.secondary;
+            return ea.primary == eb.primary and ea.secondary == eb.secondary;
         }
         bool operator()(uint32_t a, hash_pair const& h) const noexcept {
             auto const& ea = (*classes)[a];
-            return ea.primary == h.primary && ea.secondary == h.secondary;
+            return ea.primary == h.primary and ea.secondary == h.secondary;
         }
         bool operator()(hash_pair const& h, uint32_t a) const noexcept { return (*this)(a, h); }
     };
@@ -169,7 +167,7 @@ private:
             // Emit positions in [0, m_num_colors) NOT in absent.
             size_t a = 0;
             for (uint32_t v = 0; v < m_num_colors; ++v) {
-                if (a < absent.size() && absent[a] == v) {
+                if (a < absent.size() and absent[a] == v) {
                     ++a;
                 } else {
                     out.push_back(v);
@@ -179,8 +177,7 @@ private:
     }
 
     static uint64_t wyhash_(std::vector<uint32_t> const& v) noexcept {
-        return ankerl::unordered_dense::detail::wyhash::hash(
-            v.data(), v.size() * sizeof(uint32_t));
+        return ankerl::unordered_dense::detail::wyhash::hash(v.data(), v.size() * sizeof(uint32_t));
     }
     static uint64_t fnv1a_(std::vector<uint32_t> const& v) noexcept {
         uint64_t h = 1469598103934665603ULL;

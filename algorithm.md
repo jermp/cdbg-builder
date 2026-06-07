@@ -978,25 +978,22 @@ running concurrently with bucketing).
 
 ## 11. File index
 
-| file | role |
-|---|---|
-| `src/main.cpp`                              | CLI entry point |
 `include/` is organized into one subfolder per pipeline phase (each with its
-own `README.md`); the orchestrator sits at the root. Cross-phase files live in
-the phase that primarily owns them.
+own `README.md`); the orchestrator and the cross-phase primitives sit at the
+root. Other shared files live in the phase that primarily owns them.
 
 | file | role |
 |---|---|
 | `src/main.cpp`                                       | CLI entry point |
 | `include/builder.hpp`                                | top-level `build()` orchestrator + auto-tune (drives all 4 phases) |
+| `include/kmer.hpp`                                   | 2-bit canonical k-mer encoding (foundational; used by all phases) |
+| `include/util.hpp`                                   | timers, `seconds_timer`, RSS, profiling counters, `build_config` (used by all phases) |
 | **Phase 1 — `include/phase1_bucket_write/`** | |
 | `bucket_ingester.hpp`                                | parse + minimizer + bucketing per input file |
 | `bucket_io.hpp`                                      | per-bucket compactor, LZ4 framing, RSS watcher |
 | `minimizer.hpp`                                      | canonical ntHash + sliding-window minimum |
 | `seq_reader.hpp`                                     | mmap + libdeflate FASTA/FASTQ iterator (kseq over mem_stream) |
 | `super_kmer.hpp`                                     | super-k-mer record format (varint + 2-bit) |
-| `kmer.hpp`                                           | 2-bit canonical k-mer encoding (foundational; used by all phases) |
-| `util.hpp`                                           | timers, RSS, profiling counters, `build_config` (infra; used by all phases) |
 | **Phase 2 — `include/phase2_bucket_process/`** | |
 | `bucket_walker.hpp`                                  | per-bucket dBG load + walk; multi-thread driver + admission gate |
 | `compact_color_set_dict.hpp`                         | per-bucket color-set dict (hybrid in-memory) |

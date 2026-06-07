@@ -26,9 +26,7 @@ See `algorithm.md` §3 for the full description.
 | `minimizer.hpp` | canonical ntHash + sliding-window minimum |
 | `seq_reader.hpp` | mmap + libdeflate FASTA/FASTQ iterator |
 | `super_kmer.hpp` | super-k-mer record format (varint + 2-bit) — this phase's output record |
-| `kmer.hpp` | 2-bit canonical k-mer encoding (foundational primitive; also used by later phases) |
-| `util.hpp` | timers, RSS, profiling counters, `build_config` (infra; used by all phases) |
 
-> `kmer.hpp` and `util.hpp` are foundational primitives used across all phases;
-> they live here as the first/foundational consumer rather than in a separate
-> shared folder.
+> The foundational primitives used across all phases — `kmer.hpp` and
+> `util.hpp` — live at `include/` root next to the `builder.hpp` orchestrator,
+> not in any one phase folder.
