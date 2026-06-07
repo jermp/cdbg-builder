@@ -98,7 +98,7 @@ public:
             throw std::runtime_error("short write of unitig cid to bucket " + std::to_string(b));
         if (std::fwrite(&seq_len, sizeof(seq_len), 1, f) != 1)
             throw std::runtime_error("short write of unitig len to bucket " + std::to_string(b));
-        if (seq_len > 0 && std::fwrite(u.seq.data(), 1, seq_len, f) != (size_t)seq_len) {
+        if (seq_len > 0 and std::fwrite(u.seq.data(), 1, seq_len, f) != (size_t)seq_len) {
             throw std::runtime_error("short write of unitig seq to bucket " + std::to_string(b));
         }
         ++m_total_unitigs;
@@ -141,7 +141,7 @@ public:
                 throw std::runtime_error("short read of unitig len in bucket " + std::to_string(b));
             std::string seq;
             seq.resize(seq_len);
-            if (seq_len > 0 && std::fread(seq.data(), 1, seq_len, f) != (size_t)seq_len) {
+            if (seq_len > 0 and std::fread(seq.data(), 1, seq_len, f) != (size_t)seq_len) {
                 throw std::runtime_error("short read of unitig seq in bucket " + std::to_string(b));
             }
             out.push_back({cid, std::move(seq)});
@@ -181,15 +181,15 @@ public:
             if (std::fread(&seq_len, sizeof(seq_len), 1, fp) != 1)
                 throw std::runtime_error("short read of len in bucket " + std::to_string(b));
             r.seq.resize(seq_len);
-            if (seq_len > 0 && std::fread(r.seq.data(), 1, seq_len, fp) != (size_t)seq_len)
+            if (seq_len > 0 and std::fread(r.seq.data(), 1, seq_len, fp) != (size_t)seq_len)
                 throw std::runtime_error("short read of seq in bucket " + std::to_string(b));
             return true;
         };
         auto write_one = [&](std::FILE* fp, record const& r) {
             uint32_t seq_len = (uint32_t)r.seq.size();
-            if (std::fwrite(&r.cid, sizeof(r.cid), 1, fp) != 1 ||
-                std::fwrite(&seq_len, sizeof(seq_len), 1, fp) != 1 ||
-                (seq_len > 0 && std::fwrite(r.seq.data(), 1, seq_len, fp) != (size_t)seq_len))
+            if (std::fwrite(&r.cid, sizeof(r.cid), 1, fp) != 1 or
+                std::fwrite(&seq_len, sizeof(seq_len), 1, fp) != 1 or
+                (seq_len > 0 and std::fwrite(r.seq.data(), 1, seq_len, fp) != (size_t)seq_len))
                 throw std::runtime_error("short write of run record for bucket " +
                                          std::to_string(b));
         };
@@ -282,7 +282,7 @@ public:
 
 private:
     uint32_t bucket_for_cid(uint64_t cid) const {
-        if (m_num_color_classes == 0 || m_num_buckets <= 1) return 0;
+        if (m_num_color_classes == 0 or m_num_buckets <= 1) return 0;
         // Cids in [b * S, (b+1) * S) live in bucket b, where
         // S = ceil(num_color_classes / num_buckets). Last bucket
         // mops up any rounding remainder.
@@ -388,21 +388,21 @@ public:
         }
 
         std::lock_guard<std::mutex> lk(m_mu);
-        if (std::fwrite(&flags, sizeof(flags), 1, m_file) != 1 ||
+        if (std::fwrite(&flags, sizeof(flags), 1, m_file) != 1 or
             std::fwrite(&nruns, sizeof(nruns), 1, m_file) != 1)
             throw std::runtime_error("short write to " + m_path);
         for (auto const& r : u.runs) {
-            if (std::fwrite(&r.cid, sizeof(r.cid), 1, m_file) != 1 ||
+            if (std::fwrite(&r.cid, sizeof(r.cid), 1, m_file) != 1 or
                 std::fwrite(&r.num_kmers, sizeof(r.num_kmers), 1, m_file) != 1)
                 throw std::runtime_error("short write to " + m_path);
         }
         if (std::fwrite(&seq_len, sizeof(seq_len), 1, m_file) != 1)
             throw std::runtime_error("short write to " + m_path);
-        if (seq_len > 0 && std::fwrite(u.seq.data(), 1, seq_len, m_file) != (size_t)seq_len)
+        if (seq_len > 0 and std::fwrite(u.seq.data(), 1, seq_len, m_file) != (size_t)seq_len)
             throw std::runtime_error("short write to " + m_path);
         ++m_count;
         m_total_seq_bytes += seq_len;
-        if (lrsz && std::fwrite(lrec, 1, lrsz, m_links_file) != lrsz)
+        if (lrsz and std::fwrite(lrec, 1, lrsz, m_links_file) != lrsz)
             throw std::runtime_error("short write to " + m_links_path);
         // Free the merged seq's backing storage in place: the caller
         // already moved into us.
@@ -463,9 +463,9 @@ public:
         }
         {
             std::lock_guard<std::mutex> lk(m_mu);
-            if (!fbuf.empty() && std::fwrite(fbuf.data(), 1, fbuf.size(), m_file) != fbuf.size())
+            if (!fbuf.empty() and std::fwrite(fbuf.data(), 1, fbuf.size(), m_file) != fbuf.size())
                 throw std::runtime_error("short write to " + m_path);
-            if (m_links_file && !lbuf.empty() &&
+            if (m_links_file and !lbuf.empty() and
                 std::fwrite(lbuf.data(), 1, lbuf.size(), m_links_file) != lbuf.size())
                 throw std::runtime_error("short write to " + m_links_path);
             m_count += add_count;
@@ -522,7 +522,7 @@ public:
             stitchable_unitig u;
             u.runs.resize(nruns);
             for (uint32_t r = 0; r < nruns; ++r) {
-                if (std::fread(&u.runs[r].cid, sizeof(uint64_t), 1, f) != 1 ||
+                if (std::fread(&u.runs[r].cid, sizeof(uint64_t), 1, f) != 1 or
                     std::fread(&u.runs[r].num_kmers, sizeof(uint32_t), 1, f) != 1) {
                     std::fclose(f);
                     throw std::runtime_error("short read of run from " + m_path);
@@ -535,7 +535,7 @@ public:
             }
             u.open_flags = flags;
             u.seq.resize(seq_len);
-            if (seq_len > 0 && std::fread(u.seq.data(), 1, seq_len, f) != (size_t)seq_len) {
+            if (seq_len > 0 and std::fread(u.seq.data(), 1, seq_len, f) != (size_t)seq_len) {
                 std::fclose(f);
                 throw std::runtime_error("short read of seq from " + m_path);
             }
@@ -613,7 +613,7 @@ public:
             throw std::runtime_error("short read of nruns from " + m_path);
         runs.resize(nruns);
         for (uint32_t r = 0; r < nruns; ++r) {
-            if (std::fread(&runs[r].cid, sizeof(uint64_t), 1, m_file) != 1 ||
+            if (std::fread(&runs[r].cid, sizeof(uint64_t), 1, m_file) != 1 or
                 std::fread(&runs[r].num_kmers, sizeof(uint32_t), 1, m_file) != 1)
                 throw std::runtime_error("short read of run from " + m_path);
         }
@@ -622,7 +622,7 @@ public:
             throw std::runtime_error("short read of seq_len from " + m_path);
         open_flags = flags;
         seq.resize(seq_len);
-        if (seq_len > 0 && std::fread(seq.data(), 1, seq_len, m_file) != (size_t)seq_len)
+        if (seq_len > 0 and std::fread(seq.data(), 1, seq_len, m_file) != (size_t)seq_len)
             throw std::runtime_error("short read of seq from " + m_path);
         return true;
     }

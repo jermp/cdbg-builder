@@ -27,7 +27,7 @@
 #include <vector>
 
 #include "phase2_bucket_process/bucket_walker.hpp"
-#include "phase1_bucket_write/kmer.hpp"
+#include "kmer.hpp"
 
 namespace cdbg {
 

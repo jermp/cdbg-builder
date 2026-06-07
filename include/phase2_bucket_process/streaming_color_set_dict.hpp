@@ -79,7 +79,7 @@
 #include <unordered_dense/unordered_dense.h>
 
 #include "phase2_bucket_process/hybrid_color_sets.hpp"
-#include "phase1_bucket_write/util.hpp"
+#include "util.hpp"
 
 namespace cdbg {
 
@@ -91,16 +91,14 @@ struct streaming_color_set_dict {
         , m_output_path(std::move(output_path))
         , m_offsets_path(m_output_path + ".tmp_offsets") {
         m_file = std::fopen(m_output_path.c_str(), "wb+");
-        if (!m_file)
-            throw std::runtime_error("cannot open color-set output: " + m_output_path);
+        if (!m_file) throw std::runtime_error("cannot open color-set output: " + m_output_path);
         char hdr[HEADER_BYTES] = {};
         if (std::fwrite(hdr, 1, HEADER_BYTES, m_file) != HEADER_BYTES)
             throw std::runtime_error("short write of header to " + m_output_path);
 
         m_offsets_file = std::fopen(m_offsets_path.c_str(), "wb+");
         if (!m_offsets_file)
-            throw std::runtime_error("cannot open color-set offsets sidecar: " +
-                                     m_offsets_path);
+            throw std::runtime_error("cannot open color-set offsets sidecar: " + m_offsets_path);
     }
 
     ~streaming_color_set_dict() {
@@ -148,7 +146,7 @@ struct streaming_color_set_dict {
     // globally sequential in append order, so the on-disk format is
     // unchanged. Callers no longer need an external lock.
     uint64_t intern_with_hashes(std::vector<uint32_t>&& candidate, precomputed_hash h) {
-        assert(!m_released && "intern() after release_index()");
+        assert(!m_released and "intern() after release_index()");
         const hash_pair key{h.primary, h.secondary};
         shard_t& shard = m_shards[h.secondary & (NUM_SHARDS - 1)];
 
@@ -213,7 +211,7 @@ struct streaming_color_set_dict {
         const uint64_t n = m_class_count.load(std::memory_order_relaxed);
         // Each shard entry holds the 128-bit hash key (16 B) + the cid (8 B);
         // ankerl's flat backing adds ~0.6x slack at the default load factor.
-        return (uint64_t)((double)n * 24.0 * 1.6);
+        return n * 24.0 * 1.6;
     }
 
     // Finalize the on-disk file: flush trailing partial word, build &
@@ -316,7 +314,7 @@ private:
     };
     struct hp_eq {
         bool operator()(hash_pair const& a, hash_pair const& b) const noexcept {
-            return a.primary == b.primary && a.secondary == b.secondary;
+            return a.primary == b.primary and a.secondary == b.secondary;
         }
     };
 
@@ -358,8 +356,7 @@ private:
     };
 
     static uint64_t wyhash_(std::vector<uint32_t> const& v) noexcept {
-        return ankerl::unordered_dense::detail::wyhash::hash(
-            v.data(), v.size() * sizeof(uint32_t));
+        return ankerl::unordered_dense::detail::wyhash::hash(v.data(), v.size() * sizeof(uint32_t));
     }
     static uint64_t fnv1a_(std::vector<uint32_t> const& v) noexcept {
         uint64_t h = 1469598103934665603ULL;
@@ -409,8 +406,8 @@ private:
     // resident_bytes() can read it lock-free as a monotone gauge.
     std::atomic<uint64_t> m_class_count{0};
 
-    bool m_released = false;          // release_index() called (interning done)
-    uint64_t m_released_count = 0;    // class count stashed before release
+    bool m_released = false;        // release_index() called (interning done)
+    uint64_t m_released_count = 0;  // class count stashed before release
 
     // Sharded dedup index (hash -> cid). No per-shard value cap concern: each
     // shard holds < total/NUM_SHARDS entries, well under the standard 2^32.

@@ -103,7 +103,7 @@ struct seq_reader {
 
         // gzip magic 1f 8b? Empty files fall through as "not gzipped";
         // kseq will then immediately hit EOF.
-        bool is_gz = m_in_size >= 2 && m_in[0] == 0x1f && m_in[1] == 0x8b;
+        bool is_gz = m_in_size >= 2 and m_in[0] == 0x1f and m_in[1] == 0x8b;
 
         if (is_gz) {
             decompress_gzip_(path);
@@ -120,7 +120,7 @@ struct seq_reader {
 
     ~seq_reader() {
         if (m_kseq) kseq_destroy(m_kseq);
-        if (m_in && m_in_size > 0) ::munmap((void*)m_in, m_in_size);
+        if (m_in and m_in_size > 0) ::munmap((void*)m_in, m_in_size);
     }
 
     seq_reader(seq_reader const&) = delete;
@@ -164,9 +164,8 @@ private:
                     m_decompressed.resize(m_decompressed.size() * 2 + 4096);
                 }
                 enum libdeflate_result r = libdeflate_gzip_decompress_ex(
-                    dec, m_in + in_off, m_in_size - in_off,
-                    m_decompressed.data() + out_off, m_decompressed.size() - out_off,
-                    &in_consumed, &out_produced);
+                    dec, m_in + in_off, m_in_size - in_off, m_decompressed.data() + out_off,
+                    m_decompressed.size() - out_off, &in_consumed, &out_produced);
                 if (r == LIBDEFLATE_SUCCESS) break;
                 if (r == LIBDEFLATE_INSUFFICIENT_SPACE) {
                     m_decompressed.resize(m_decompressed.size() * 2 + 4096);
