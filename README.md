@@ -45,6 +45,14 @@ make -j
 If you cloned without `--recursive`, run `git submodule update --init --recursive`
 first.
 
+By default k-mers are stored in a 64-bit integer, supporting `k ≤ 31` (cheaper
+arithmetic and half the memory of k-mer-keyed structures). To support `k ≤ 63`,
+configure with 128-bit k-mers:
+
+```bash
+cmake .. -DCDBG_LARGE_K=ON
+```
+
 The build produces a single executable, `cdbg-build`, in the `build/` directory.
 
 ## Usage
@@ -58,7 +66,7 @@ Options:
 | Flag         | Description                                                       | Default |
 |--------------|-------------------------------------------------------------------|---------|
 | `-i PATH`    | Text file with one input path per line (one color each)           | —       |
-| `-k INT`     | k-mer length (≤ 63)                                               | —       |
+| `-k INT`     | k-mer length (≤ 31 by default; build with `-DCDBG_LARGE_K=ON` for ≤ 63) | —  |
 | `-o NAME`    | Output basename; writes `NAME.fa`, `NAME.u2c`, and `NAME.color_sets` | —    |
 | `-t INT`     | Number of worker threads                                          | 1       |
 | `-m INT`     | Minimizer length used for bucketing                               | auto    |
