@@ -60,7 +60,7 @@
 #include <unordered_dense/unordered_dense.h>
 
 #include "phase1_bucket_write/super_kmer.hpp"
-#include "phase1_bucket_write/util.hpp"
+#include "util.hpp"
 
 namespace cdbg {
 
@@ -241,19 +241,17 @@ private:
             throw std::runtime_error("spill batch exceeds LZ4_MAX_INPUT_SIZE on " + m_path);
         int src_size = (int)m_batch_buf.size();
         int bound = LZ4_compressBound(src_size);
-        if (bound <= 0)
-            throw std::runtime_error("LZ4_compressBound failed on " + m_path);
+        if (bound <= 0) throw std::runtime_error("LZ4_compressBound failed on " + m_path);
         if (m_out_buf.size() < (size_t)bound) m_out_buf.resize((size_t)bound);
-        int compressed = LZ4_compress_default((char const*)m_batch_buf.data(),
-                                              (char*)m_out_buf.data(), src_size,
-                                              (int)m_out_buf.size());
-        if (compressed <= 0)
-            throw std::runtime_error("LZ4_compress_default failed on " + m_path);
+        int compressed =
+            LZ4_compress_default((char const*)m_batch_buf.data(), (char*)m_out_buf.data(), src_size,
+                                 (int)m_out_buf.size());
+        if (compressed <= 0) throw std::runtime_error("LZ4_compress_default failed on " + m_path);
         // Write per-spill frame: [u32 uncompressed][u32 compressed][bytes].
         uint32_t u = (uint32_t)src_size;
         uint32_t c = (uint32_t)compressed;
-        if (std::fwrite(&u, sizeof(u), 1, m_file) != 1 ||
-            std::fwrite(&c, sizeof(c), 1, m_file) != 1 ||
+        if (std::fwrite(&u, sizeof(u), 1, m_file) != 1 or
+            std::fwrite(&c, sizeof(c), 1, m_file) != 1 or
             std::fwrite(m_out_buf.data(), 1, (size_t)compressed, m_file) != (size_t)compressed) {
             throw std::runtime_error("short write to " + m_path);
         }
@@ -419,7 +417,7 @@ public:
         std::sort(v.begin(), v.end());
         const size_t n = v.size();
         auto pct = [&](double p) -> uint64_t {
-            size_t i = (size_t)(p * (double)(n - 1));
+            size_t i = p * (n - 1);
             return v[i];
         };
         uint64_t total = 0;
@@ -432,20 +430,18 @@ public:
         uint64_t top_sum = 0;
         for (size_t i = (n > concurrency ? n - concurrency : 0); i < n; ++i) top_sum += v[i];
         uint32_t nonempty = 0;
-        for (uint64_t x : v) if (x) ++nonempty;
+        for (uint64_t x : v)
+            if (x) ++nonempty;
         std::fprintf(stderr,
-            "[bucket size dist] buckets=%zu nonempty=%u  uncompressed bytes:\n"
-            "  mean=%.2f MiB  p50=%.2f  p90=%.2f  p99=%.2f  p999=%.2f  max=%.2f MiB\n"
-            "  largest-%u-sum=%.2f GiB (worst-case co-resident bucket bytes; "
-            "kmer_info RAM is a ~constant multiple of this)\n"
-            "  max-bucket=%llu bytes  total=%.2f GiB\n",
-            n, nonempty,
-            (double)total / n / 1048576.0,
-            (double)pct(0.50) / 1048576.0, (double)pct(0.90) / 1048576.0,
-            (double)pct(0.99) / 1048576.0, (double)pct(0.999) / 1048576.0,
-            (double)v[n - 1] / 1048576.0,
-            concurrency, (double)top_sum / 1073741824.0,
-            (unsigned long long)v[n - 1], (double)total / 1073741824.0);
+                     "[bucket size dist] buckets=%zu nonempty=%u  uncompressed bytes:\n"
+                     "  mean=%.2f MiB  p50=%.2f  p90=%.2f  p99=%.2f  p999=%.2f  max=%.2f MiB\n"
+                     "  largest-%u-sum=%.2f GiB (worst-case co-resident bucket bytes; "
+                     "kmer_info RAM is a ~constant multiple of this)\n"
+                     "  max-bucket=%llu bytes  total=%.2f GiB\n",
+                     n, nonempty, (double)total / n / 1048576.0, pct(0.50) / 1048576.0,
+                     pct(0.90) / 1048576.0, pct(0.99) / 1048576.0, pct(0.999) / 1048576.0,
+                     v[n - 1] / 1048576.0, concurrency, top_sum / 1073741824.0,
+                     (unsigned long long)v[n - 1], total / 1073741824.0);
     }
 
     uint64_t total_bytes() const { return m_total_compressed.load(std::memory_order_relaxed); }
@@ -514,9 +510,7 @@ public:
         if (m_watcher_thread.joinable()) m_watcher_thread.join();
     }
 
-    bool under_pressure() const {
-        return m_under_pressure.load(std::memory_order_relaxed);
-    }
+    bool under_pressure() const { return m_under_pressure.load(std::memory_order_relaxed); }
 
     // Highest live RSS observed by the watcher during bucket-write.
     // Useful for verifying that the cap actually held (vs the lifetime
@@ -544,9 +538,8 @@ private:
                 if (rss == 0) continue;  // can't enforce on this platform
             }
             uint64_t prev_high = m_observed_rss_high.load(std::memory_order_relaxed);
-            while (rss > prev_high &&
-                   !m_observed_rss_high.compare_exchange_weak(prev_high, rss,
-                                                              std::memory_order_relaxed)) {}
+            while (rss > prev_high and !m_observed_rss_high.compare_exchange_weak(
+                                           prev_high, rss, std::memory_order_relaxed)) {}
             // Hysteresis on the pressure flag (informational; useful for
             // the post-phase log line). Sweep semantics are independent:
             // we sweep whenever RSS is at/above HIGH, regardless of the
@@ -673,7 +666,7 @@ public:
             if (m_buf.size() < out_off + u) m_buf.resize(out_off + u);
             int decoded = LZ4_decompress_safe((char const*)comp_buf.data(),
                                               (char*)m_buf.data() + out_off, (int)c, (int)u);
-            if (decoded < 0 || (uint32_t)decoded != u) {
+            if (decoded < 0 or (uint32_t) decoded != u) {
                 std::fclose(f);
                 throw std::runtime_error("LZ4_decompress_safe failed on " + path);
             }

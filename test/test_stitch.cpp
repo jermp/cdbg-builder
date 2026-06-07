@@ -240,7 +240,7 @@ bool run_case_impl(which_stitch w, uint64_t seed, uint32_t k, uint64_t num_uniti
     for (auto const& o : out)
         if (o.open_flags != 0) ++open_outputs;
 
-    if (!ok || open_outputs != 0) {
+    if (!ok or open_outputs != 0) {
         std::fprintf(stderr,
                      "[FAIL %s] seed=%llu k=%u unitigs=%llu: want %zu distinct, got %zu "
                      "distinct, out_count=%zu open_outputs=%llu\n",
@@ -264,7 +264,7 @@ bool run_case(uint64_t seed, uint32_t k, uint64_t num_unitigs, uint64_t max_len,
     bool gl = run_case_impl(which_stitch::compact_scalable_links, seed, k, num_unitigs, max_len,
                             max_frags);
     bool h = run_case_impl(which_stitch::compact_inram, seed, k, num_unitigs, max_len, max_frags);
-    return b && c && d && e && f && g && gl && h;
+    return b and c and d and e and f and g and gl and h;
 }
 
 // Shared-cid branchy correctness case. Builds `num_clusters` branch
@@ -291,7 +291,7 @@ bool run_branch_case_impl(which_stitch w, uint64_t seed, uint32_t k, uint64_t nu
     for (auto const& o : out)
         if (o.open_flags != 0) ++open_outputs;
 
-    if (!ok || open_outputs != 0) {
+    if (!ok or open_outputs != 0) {
         std::fprintf(stderr,
                      "[FAIL branch %s] seed=%llu k=%u clusters=%llu: want %zu distinct, got %zu "
                      "distinct, out_count=%zu open_outputs=%llu\n",
@@ -311,7 +311,7 @@ bool run_branch_case(uint64_t seed, uint32_t k, uint64_t num_clusters) {
     bool g = run_branch_case_impl(which_stitch::compact_scalable, seed, k, num_clusters);
     bool gl = run_branch_case_impl(which_stitch::compact_scalable_links, seed, k, num_clusters);
     bool h = run_branch_case_impl(which_stitch::compact_inram, seed, k, num_clusters);
-    return b && c && d && e && f && g && gl && h;
+    return b and c and d and e and f and g and gl and h;
 }
 
 // Larger case: report timing + fragment/unitig counts, plus the same
@@ -340,15 +340,15 @@ bool run_scale(uint64_t seed, uint32_t k, uint64_t num_unitigs) {
          {which_stitch::ext_mem, which_stitch::ext_file, which_stitch::ext_file_mt,
           which_stitch::compact_mem, which_stitch::compact_file, which_stitch::compact_scalable,
           which_stitch::compact_scalable_links, which_stitch::compact_inram}) {
-        auto t0 = std::chrono::steady_clock::now();
+        cdbg::seconds_timer sw;
+        sw.start();
         run_stitch(w, frags, k, out);
-        auto t1 = std::chrono::steady_clock::now();
-        double ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+        sw.stop();
         bool this_ok = (want == to_multiset(out));
-        ok = ok && this_ok;
-        std::fprintf(stderr, "[scale %s] unitigs=%llu frags=%llu out=%zu time=%.0fms %s\n",
+        ok = ok and this_ok;
+        std::fprintf(stderr, "[scale %s] unitigs=%llu frags=%llu out=%zu time=%.3fs %s\n",
                      stitch_name(w), (unsigned long long)num_unitigs, (unsigned long long)n_frags,
-                     out.size(), ms, this_ok ? "OK" : "MISMATCH");
+                     out.size(), sw.elapsed(), this_ok ? "OK" : "MISMATCH");
     }
     return ok;
 }

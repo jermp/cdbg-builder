@@ -18,7 +18,7 @@
 #include <bit_vector.hpp>
 #include <essentials.hpp>
 
-#include "phase1_bucket_write/util.hpp"  // timer, format_bytes
+#include "util.hpp"  // timer, format_bytes
 #include "phase2_bucket_process/streaming_color_set_dict.hpp"
 #include "phase2_bucket_process/unitig_spill.hpp"  // unitig_bucket_writer
 
@@ -68,7 +68,7 @@ inline void emit_fasta(unitig_bucket_writer& uwriter, std::string const& out_bas
     auto emit_record = [&](uint64_t cid, std::string_view seq) {
         // cid is globally non-decreasing (buckets ascending by cid range, sorted
         // within), so cid != prev_cid is exactly a color-set group boundary.
-        if (emitted > 0 && cid != prev_cid) u2c_bvb.set(emitted - 1, 1);
+        if (emitted > 0 and cid != prev_cid) u2c_bvb.set(emitted - 1, 1);
         prev_cid = cid;
         ++emitted;
 

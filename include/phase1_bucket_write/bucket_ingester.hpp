@@ -20,7 +20,7 @@
 #include <vector>
 
 #include "phase1_bucket_write/bucket_io.hpp"
-#include "phase1_bucket_write/kmer.hpp"
+#include "kmer.hpp"
 #include "phase1_bucket_write/minimizer.hpp"
 #include "phase1_bucket_write/seq_reader.hpp"
 #include "phase1_bucket_write/super_kmer.hpp"
@@ -75,7 +75,7 @@ inline void emit_super_kmers(uint8_t const* bases, uint32_t L, uint32_t k, uint3
 
     uint32_t run_a = 0;  // first (k-1)-mer index of the running minimizer block
     bool is_first_super = true;
-    bool cur_owns_first = true;  // first super's idx0 is the ACGT-begin (not a boundary)
+    bool cur_owns_first = true;        // first super's idx0 is the ACGT-begin (not a boundary)
     uint64_t cur_min = mq.min_hash();  // minimizer of (k-1)-mer 0
     uint32_t cur_bucket = bucket_of(cur_min);
 
@@ -129,8 +129,8 @@ inline void emit_super_kmers(uint8_t const* bases, uint32_t L, uint32_t k, uint3
     // Run-end super: its last k-mer is the ACGT-end terminus (not a cross-bucket
     // boundary), so it always owns it; its first k-mer ownership was decided at
     // the preceding split (cur_owns_first).
-    emit_super(first_kmer, K - 1, cur_bucket, is_first_super, /*is_run_end=*/true,
-               cur_owns_first, /*owns_last=*/true);
+    emit_super(first_kmer, K - 1, cur_bucket, is_first_super, /*is_run_end=*/true, cur_owns_first,
+               /*owns_last=*/true);
 }
 
 inline void ingest_file_bucketed(std::string const& path, uint32_t k, uint32_t m,
@@ -154,21 +154,20 @@ inline void ingest_file_bucketed(std::string const& path, uint32_t k, uint32_t m
             // time it separately from emit_super_kmers.
             auto t_scan = bucket_write_prof::clock::now();
             size_t end = pos;
-            while (end < l && nuc_to_2bit(s[end]) != 0xff) ++end;
+            while (end < l and nuc_to_2bit(s[end]) != 0xff) ++end;
             size_t run_len = end - pos;
             bool have_run = run_len >= k;
             if (have_run) {
                 bases_buf.resize(run_len);
                 for (size_t i = 0; i < run_len; ++i) { bases_buf[i] = nuc_to_2bit(s[pos + i]); }
             }
-            prof.ns_scan2bit.fetch_add(bucket_write_prof::since(t_scan),
-                                       std::memory_order_relaxed);
+            prof.ns_scan2bit.fetch_add(bucket_write_prof::since(t_scan), std::memory_order_relaxed);
             if (have_run) {
                 emit_super_kmers(bases_buf.data(), (uint32_t)run_len, k, m, color, num_buckets,
                                  sink);
             }
             pos = end;
-            while (pos < l && nuc_to_2bit(s[pos]) == 0xff) ++pos;
+            while (pos < l and nuc_to_2bit(s[pos]) == 0xff) ++pos;
         }
         prof.ns_loop_body.fetch_add(bucket_write_prof::since(t_body), std::memory_order_relaxed);
     }
@@ -203,7 +202,7 @@ inline void ingest_bucketed(std::vector<std::string> const& files, uint32_t k, u
             // Advance the byte-based progress by this file's on-disk size, so
             // the bar tracks work (bytes) rather than file count -- files vary
             // ~3x in size, so file-% badly misreports true progress.
-            if (done_bytes && file_sizes && i < file_sizes->size())
+            if (done_bytes and file_sizes and i < file_sizes->size())
                 done_bytes->fetch_add((*file_sizes)[i], std::memory_order_relaxed);
         }
         bufs.flush_all();

@@ -30,10 +30,10 @@
 
 #include "phase1_bucket_write/bucket_io.hpp"
 #include "phase2_bucket_process/compact_color_set_dict.hpp"
-#include "phase1_bucket_write/kmer.hpp"
+#include "kmer.hpp"
 #include "phase2_bucket_process/streaming_color_set_dict.hpp"
 #include "phase1_bucket_write/super_kmer.hpp"
-#include "phase1_bucket_write/util.hpp"
+#include "util.hpp"
 
 namespace cdbg {
 
@@ -132,7 +132,7 @@ inline constexpr uint8_t KMER_BOUND_RIGHT = 1u << 1;
 // both ends) is NOT a break -- the k-mer is walked THROUGH as interior; flags
 // == 0 is a plain interior k-mer. (GGCAT hashmap.rs:291-292.)
 inline bool is_contig_break(uint8_t flags) {
-    return flags == KMER_BOUND_LEFT || flags == KMER_BOUND_RIGHT;
+    return flags == KMER_BOUND_LEFT or flags == KMER_BOUND_RIGHT;
 }
 
 struct bucket_kmer_info {
@@ -214,8 +214,8 @@ inline void load_bucket(std::string const& path, uint32_t k, bucket_kmer_map& ou
             kmer_int_t can = is_fwd ? fwd : rc;
 
             uint8_t contrib = 0;
-            if (!begin_incl && idx == 0) contrib |= is_fwd ? KMER_BOUND_LEFT : KMER_BOUND_RIGHT;
-            if (!end_incl && idx == last_idx)
+            if (!begin_incl and idx == 0) contrib |= is_fwd ? KMER_BOUND_LEFT : KMER_BOUND_RIGHT;
+            if (!end_incl and idx == last_idx)
                 contrib |= is_fwd ? KMER_BOUND_RIGHT : KMER_BOUND_LEFT;
 
             bucket_kmer_info& info = out[can];
@@ -230,8 +230,8 @@ inline void load_bucket(std::string const& path, uint32_t k, bucket_kmer_map& ou
             const bool is_first = (idx == 0);
             const bool is_last = (idx == last_idx);
             bool owned = true;
-            if (is_first && !owns_first) owned = false;
-            if (is_last && !owns_last) owned = false;
+            if (is_first and !owns_first) owned = false;
+            if (is_last and !owns_last) owned = false;
             if (owned) {
                 info.colors.add(rsid);
                 info.primary = true;
@@ -418,7 +418,7 @@ inline void process_bucket(std::string const& path, uint32_t k, uint64_t num_col
     // Append one k-mer's cid to the RLE run sequence, merging with the back
     // run if equal. This is GGCAT's extend_forward (colors/managers/multiple.rs).
     auto push_cid = [](std::vector<color_run>& runs, uint64_t cid) {
-        if (!runs.empty() && runs.back().cid == cid)
+        if (!runs.empty() and runs.back().cid == cid)
             runs.back().num_kmers += 1;
         else
             runs.push_back({cid, 1});
@@ -624,8 +624,7 @@ inline void process_buckets(bucket_writer const& writer, uint32_t k, uint64_t nu
         for (;;) {
             uint32_t b = next.fetch_add(1);
             if (b >= B) break;
-            const uint64_t cost =
-                (uint64_t)(WORKING_SET_OVERHEAD * (double)writer.bucket_unc_bytes(b));
+            const uint64_t cost = WORKING_SET_OVERHEAD * writer.bucket_unc_bytes(b);
             // Admission: wait until this bucket fits the budget, or it would be
             // the only one running (so an oversized bucket never deadlocks).
             if (mem_budget_bytes > 0) {

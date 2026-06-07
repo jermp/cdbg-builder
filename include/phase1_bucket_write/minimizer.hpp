@@ -14,7 +14,7 @@
 #include <cstring>
 #include <vector>
 
-#include "phase1_bucket_write/kmer.hpp"
+#include "kmer.hpp"
 
 namespace cdbg {
 
@@ -100,7 +100,7 @@ struct min_queue {
     int32_t cur_min_pos = -1;
 
     void reset(int32_t window) {
-        assert(window > 0 && window <= MAX_W);
+        assert(window > 0 and window <= MAX_W);
         window_size = window;
         cur_min = ~uint64_t(0);
         cur_min_pos = -1;
