@@ -113,6 +113,23 @@ inline void write_super_kmer(uint8_t flags, uint32_t const* colors, uint32_t num
     pack_2bit(bases, len, out);
 }
 
+// Same on-disk record as write_super_kmer(), but the bases are ALREADY 2-bit
+// packed (ceil(base_len/4) bytes) -- used by the compactor, whose dedup keys are
+// kept packed in RAM, so spill appends them directly with no re-packing.
+inline void write_super_kmer_packed(uint8_t flags, uint32_t const* colors, uint32_t num_colors,
+                                    uint8_t const* packed, uint32_t base_len,
+                                    std::vector<uint8_t>& out) {
+    varint_write(num_colors, out);
+    uint32_t prev = 0;
+    for (uint32_t i = 0; i < num_colors; ++i) {
+        uint32_t c = colors[i];
+        varint_write((uint64_t)(c - prev), out);
+        prev = c;
+    }
+    varint_write(((uint64_t)base_len << 4) | (flags & 0xfu), out);
+    out.insert(out.end(), packed, packed + (base_len + 3) / 4);
+}
+
 // Returns the byte length consumed; sets out_flags, out_colors and copies
 // bases into out_bases. Returns 0 on malformed/EOF.
 inline size_t read_super_kmer(uint8_t const* buf, size_t buf_len, uint8_t& out_flags,
