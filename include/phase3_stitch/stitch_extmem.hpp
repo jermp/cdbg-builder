@@ -3,7 +3,12 @@
 // External-memory cross-bucket stitch via GGCAT-style hash-bucketed
 // iterative doubling.
 //
-// Replaces the in-RAM stitch (stitch.hpp), whose by_junction map + adj
+// NOTE: this is no longer the production stitch -- the builder uses the
+// id-only compaction stitch in compact_extmem.hpp. This base-carrying
+// implementation is retained as the independent reference oracle that
+// test_stitch cross-checks the production path against.
+//
+// It supersedes the in-RAM stitch (stitch.hpp), whose by_junction map + adj
 // array + visited array are all O(num_fragments) resident -- hundreds of
 // GB on the Blackwell 661k pangenome (5.7e9 fragments). The doubling
 // approach holds only one hash-bucket's worth of tigs in RAM at a time,
@@ -46,8 +51,8 @@
 // monochromatic split at emit (cdbg output unitigs are monochromatic).
 //
 // Two stores share one round driver: round_store_mem (in-RAM rounds;
-// fast, used by tests/reference) and round_store_file (LZ4-framed files,
-// one bucket resident at a time; the production external-memory path).
+// fast) and round_store_file (LZ4-framed files, one bucket resident at a
+// time; the external-memory variant). Both are exercised by test_stitch.
 
 #include <array>
 #include <atomic>
@@ -68,9 +73,9 @@
 #include <lz4.h>
 #include <unordered_dense/unordered_dense.h>
 
-#include "bucket_walker.hpp"  // stitchable_unitig, UNITIG_OPEN_*
-#include "kmer.hpp"
-#include "stitch.hpp"  // detail::side_junction_canonical, SIDE_*, revcomp_string
+#include "phase2_bucket_process/bucket_walker.hpp"  // stitchable_unitig, UNITIG_OPEN_*
+#include "phase1_bucket_write/kmer.hpp"
+#include "phase3_stitch/stitch.hpp"  // detail::side_junction_canonical, SIDE_*, revcomp_string
 
 namespace cdbg {
 
@@ -308,7 +313,7 @@ inline ext_tig ext_join(ext_tig const& a, uint8_t a_side, ext_tig const& b, uint
     m.runs = a.runs;
     if (a_side != SIDE_RIGHT) ext_reverse_runs(m.runs);  // as = revcomp(a) when a_side==LEFT
     std::vector<color_run> b_runs = b.runs;
-    if (b_side != SIDE_LEFT) ext_reverse_runs(b_runs);   // bs = revcomp(b) when b_side==RIGHT
+    if (b_side != SIDE_LEFT) ext_reverse_runs(b_runs);  // bs = revcomp(b) when b_side==RIGHT
     ext_concat_runs(m.runs, std::move(b_runs));
     m.seq.reserve(as.size() + bs.size() - k);
     m.seq = as;
@@ -329,8 +334,8 @@ inline ext_tig ext_join(ext_tig const& a, uint8_t a_side, ext_tig const& b, uint
     //   b_side==RIGHT (bs=revcomp(b)):   merged-right open == b OPEN_LEFT
     bool right_open = (b_side == SIDE_LEFT) ? (b.open_flags & UNITIG_OPEN_RIGHT)
                                             : (b.open_flags & UNITIG_OPEN_LEFT);
-    m.open_flags = (uint8_t)((left_open ? UNITIG_OPEN_LEFT : 0) |
-                             (right_open ? UNITIG_OPEN_RIGHT : 0));
+    m.open_flags =
+        (uint8_t)((left_open ? UNITIG_OPEN_LEFT : 0) | (right_open ? UNITIG_OPEN_RIGHT : 0));
     return m;
 }
 
@@ -341,8 +346,7 @@ inline ext_tig ext_join(ext_tig const& a, uint8_t a_side, ext_tig const& b, uint
 // holds one bucket at a time.
 struct round_store_mem {
     explicit round_store_mem(uint32_t num_buckets)
-        : m_in(num_buckets), m_out(num_buckets), m_locks(num_buckets),
-          m_num_buckets(num_buckets) {}
+        : m_in(num_buckets), m_out(num_buckets), m_locks(num_buckets), m_num_buckets(num_buckets) {}
 
     uint32_t num_buckets() const { return m_num_buckets; }
 
@@ -437,8 +441,11 @@ inline size_t ext_tig_deserialize(uint8_t const* buf, size_t buf_len, ext_tig& t
 class round_store_file {
 public:
     round_store_file(std::string dir, uint32_t num_buckets)
-        : m_dir(std::move(dir)), m_num_buckets(num_buckets), m_batch(num_buckets),
-          m_files(num_buckets, nullptr), m_locks(num_buckets) {
+        : m_dir(std::move(dir))
+        , m_num_buckets(num_buckets)
+        , m_batch(num_buckets)
+        , m_files(num_buckets, nullptr)
+        , m_locks(num_buckets) {
         open_round_files(/*round=*/0);
     }
 
@@ -619,8 +626,7 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
     // Cut a finished topological tig at its color-run boundaries into
     // monochromatic output unitigs (verify.py requires monochromaticity),
     // appending them to the caller's batch (drained via flush_batch).
-    auto sink_unitig = [&](ext_tig& t, std::vector<stitchable_unitig>& batch,
-                           size_t& batch_bytes) {
+    auto sink_unitig = [&](ext_tig& t, std::vector<stitchable_unitig>& batch, size_t& batch_bytes) {
         ext_split_monochromatic(t, k, t.open_flags, [&](stitchable_unitig&& u) {
             batch_bytes += u.seq.size();
             batch.push_back(std::move(u));
@@ -703,7 +709,10 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
             ++joined;
             if (is_terminal(merged)) {
                 sink_unitig(merged, out_batch, out_bytes);
-                if (out_bytes >= SINK_BATCH_BYTES) { flush_batch(out_batch); out_bytes = 0; }
+                if (out_bytes >= SINK_BATCH_BYTES) {
+                    flush_batch(out_batch);
+                    out_bytes = 0;
+                }
             } else {
                 uint64_t dummy = 0;
                 detail::ext_route(std::move(merged), k, store, dummy);
@@ -717,12 +726,14 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
             if (consumed[i]) continue;
             if (is_terminal(tigs[i])) {
                 sink_unitig(tigs[i], out_batch, out_bytes);
-                if (out_bytes >= SINK_BATCH_BYTES) { flush_batch(out_batch); out_bytes = 0; }
+                if (out_bytes >= SINK_BATCH_BYTES) {
+                    flush_batch(out_batch);
+                    out_bytes = 0;
+                }
                 continue;
             }
             ext_tig t = std::move(tigs[i]);
-            bool both = (t.open_flags & UNITIG_OPEN_LEFT) &&
-                        (t.open_flags & UNITIG_OPEN_RIGHT);
+            bool both = (t.open_flags & UNITIG_OPEN_LEFT) && (t.open_flags & UNITIG_OPEN_RIGHT);
             if (both) detail::ext_rng_next(t.rng);  // re-roll presented end
             uint64_t dummy = 0;
             detail::ext_route(std::move(t), k, store, dummy);
@@ -752,9 +763,9 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
     std::condition_variable cv_go, cv_done;
     std::atomic<uint32_t> next_b{0};
     std::atomic<uint64_t> joined_this_round{0};
-    uint32_t generation = 0;       // bumped once per round to release workers
-    uint32_t active = 0;           // workers still draining this generation
-    bool pool_stop = false;        // set at teardown to retire workers
+    uint32_t generation = 0;  // bumped once per round to release workers
+    uint32_t active = 0;      // workers still draining this generation
+    bool pool_stop = false;   // set at teardown to retire workers
     const bool parallel = (num_threads > 1);
 
     std::vector<std::thread> pool;
@@ -832,8 +843,8 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
         const uint64_t joined = joined_this_round.load(std::memory_order_relaxed);
         ++rounds_run;
         {
-            double rs = std::chrono::duration<double>(
-                            std::chrono::steady_clock::now() - t_r0).count();
+            double rs =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t_r0).count();
             if (round_no < 5) early_secs += rs;
         }
 #ifdef CDGB_STITCH_DEBUG
@@ -853,7 +864,10 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
                 std::vector<ext_tig> rem = store.take_input_bucket(b);
                 for (auto& t : rem) {
                     sink_unitig(t, rem_batch, rem_bytes);
-                    if (rem_bytes >= SINK_BATCH_BYTES) { flush_batch(rem_batch); rem_bytes = 0; }
+                    if (rem_bytes >= SINK_BATCH_BYTES) {
+                        flush_batch(rem_batch);
+                        rem_bytes = 0;
+                    }
                 }
             }
             flush_batch(rem_batch);
@@ -862,8 +876,8 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
     }
     double total_round_secs =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t_rounds0).count();
-    std::cout << "  [stitch] " << rounds_run << " rounds, " << total_round_secs
-              << "s total (" << early_secs << "s in rounds 0-4)\n";
+    std::cout << "  [stitch] " << rounds_run << " rounds, " << total_round_secs << "s total ("
+              << early_secs << "s in rounds 0-4)\n";
 }
 
 // Seed round 0 from the fragment source into `store`, sinking already-
@@ -910,33 +924,6 @@ inline void ext_seed_round0(Source& frag, uint32_t k, Store& store, Sink&& sink,
     store.advance();  // round-0 emissions become round-1 input
 }
 
-// Streaming seed path: pulls fragments one at a time from a Reader exposing
-// `bool next(uint8_t& open_flags, std::vector<color_run>& runs,
-// std::string& seq)` (frag_unitig_stream_reader). Peak RAM is ONE fragment, so
-// the stitch carries no O(num_fragments) index -- this is what makes the whole
-// stitch phase bounded by the round-store bucket count, not the fragment count.
-//
-// Single-threaded: the read and the route (which LZ4-compresses each round-0
-// output frame) pipeline naturally in one pass. A batch-parallel variant was
-// tried and REVERTED -- it alternated a serial read phase with a short parallel
-// route burst (barrier + thread-spawn per 64K batch), which broke that
-// pipelining and made the 10K seed slower (26s->32s total stitch). The frag
-// spill has no record index, so the READ can't be sharded by offset; a real
-// speedup needs a producer/consumer overlap (1 reader feeding N LZ4-routers),
-// not a batch barrier. `num_threads` is accepted for interface symmetry but the
-// seed is intentionally single-threaded.
-template <typename Reader, typename Store, typename Sink>
-inline void ext_seed_round0_stream(Reader& reader, uint32_t k, Store& store, Sink&& sink,
-                                   std::atomic<uint64_t>* done, uint32_t /*num_threads*/ = 1) {
-    ext_tig t;
-    while (reader.next(t.open_flags, t.runs, t.seq)) {
-        ext_seed_one(std::move(t), k, store, sink, done);
-        // ext_seed_one moved t's seq/runs into the store or the sink; the
-        // moved-from vectors/string are reused by the next next() call.
-    }
-    store.advance();  // round-0 emissions become round-1 input
-}
-
 }  // namespace detail
 
 // External-memory stitch with IN-RAM round storage. Fast; used by tests
@@ -944,10 +931,8 @@ inline void ext_seed_round0_stream(Reader& reader, uint32_t k, Store& store, Sin
 // stitch_unitigs_streaming. `num_buckets` controls hash fan-out; 0 picks
 // a default.
 template <typename Source, typename Sink>
-inline void stitch_unitigs_extmem(Source& frag, uint32_t k, Sink&& sink,
-                                  uint32_t num_buckets = 0,
-                                  std::atomic<uint64_t>* done = nullptr,
-                                  uint32_t num_threads = 1) {
+inline void stitch_unitigs_extmem(Source& frag, uint32_t k, Sink&& sink, uint32_t num_buckets = 0,
+                                  std::atomic<uint64_t>* done = nullptr, uint32_t num_threads = 1) {
     if (num_buckets == 0) num_buckets = 256;
     detail::round_store_mem store(num_buckets);
     detail::ext_seed_round0(frag, k, store, sink, done);
@@ -957,9 +942,10 @@ inline void stitch_unitigs_extmem(Source& frag, uint32_t k, Sink&& sink,
 // External-memory stitch with FILE-backed round storage, RANDOM-ACCESS source.
 // Peak RAM is one round-store bucket's tigs at a time (plus per-bucket write
 // batches), independent of fragment count -- EXCEPT that a random-access Source
-// (e.g. frag_unitig_reader) may itself hold an O(num_fragments) index. Used by
-// tests (vector_frag_source). Production uses the _stream overload below, whose
-// reader holds only one fragment, so the whole stitch is fragment-count-free.
+// (e.g. frag_unitig_reader) may itself hold an O(num_fragments) index. This
+// path is no longer used in production (the builder uses compact_stitch_scalable
+// in compact_extmem.hpp); it is retained as the independent reference oracle for
+// test_stitch (vector_frag_source).
 template <typename Source, typename Sink>
 inline void stitch_unitigs_extmem_file(Source& frag, uint32_t k, std::string const& tmp_dir,
                                        Sink&& sink, uint32_t num_buckets,
@@ -968,29 +954,6 @@ inline void stitch_unitigs_extmem_file(Source& frag, uint32_t k, std::string con
     if (num_buckets == 0) num_buckets = 1024;
     detail::round_store_file store(tmp_dir, num_buckets);
     detail::ext_seed_round0(frag, k, store, sink, done);
-    detail::ext_run_rounds(store, k, num_buckets, sink, done, num_threads);
-}
-
-// External-memory stitch with FILE-backed round storage, STREAMING source.
-// `reader` exposes `bool next(open_flags, runs, seq)` and holds only one
-// fragment resident (frag_unitig_stream_reader). Combined with the file-backed
-// round store, peak RAM is bounded by num_buckets, NOT by the fragment count --
-// no O(num_fragments) structure anywhere in the stitch. This is the production
-// path. `reader` is a template parameter so this header needn't depend on
-// unitig_spill.hpp.
-template <typename Reader, typename Sink>
-inline void stitch_unitigs_extmem_file_stream(Reader& reader, uint32_t k,
-                                              std::string const& tmp_dir, Sink&& sink,
-                                              uint32_t num_buckets,
-                                              std::atomic<uint64_t>* done = nullptr,
-                                              uint32_t num_threads = 1) {
-    if (num_buckets == 0) num_buckets = 1024;
-    detail::round_store_file store(tmp_dir, num_buckets);
-    auto t_seed = std::chrono::steady_clock::now();
-    detail::ext_seed_round0_stream(reader, k, store, sink, done, num_threads);
-    std::cout << "  [stitch] round-0 seed: "
-              << std::chrono::duration<double>(std::chrono::steady_clock::now() - t_seed).count()
-              << "s\n";
     detail::ext_run_rounds(store, k, num_buckets, sink, done, num_threads);
 }
 

@@ -35,7 +35,6 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
-#include <charconv>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -57,15 +56,16 @@
 #include <bit_vector.hpp>
 #include <essentials.hpp>
 
-#include "bucket_io.hpp"
-#include "bucket_ingester.hpp"
-#include "bucket_walker.hpp"
-#include "minimizer.hpp"
-#include "stitch.hpp"
-#include "stitch_extmem.hpp"
-#include "streaming_color_set_dict.hpp"
-#include "unitig_spill.hpp"
-#include "util.hpp"
+#include "phase1_bucket_write/bucket_io.hpp"
+#include "phase1_bucket_write/bucket_ingester.hpp"
+#include "phase2_bucket_process/bucket_walker.hpp"
+#include "phase1_bucket_write/minimizer.hpp"
+#include "phase3_stitch/compact_extmem.hpp"
+#include "phase3_stitch/stitch.hpp"
+#include "phase2_bucket_process/streaming_color_set_dict.hpp"
+#include "phase2_bucket_process/unitig_spill.hpp"
+#include "phase4_emit/emit.hpp"
+#include "phase1_bucket_write/util.hpp"
 
 namespace cdbg {
 
@@ -90,8 +90,8 @@ struct builder {
                   << ", num_threads = " << m_cfg.num_threads << ", num_buckets = " << num_buckets
                   << "\n";
         std::cout << "  bucket-write model: flush_bases=" << format_bytes(m_flush_bases)
-                  << ", spill_bytes=" << format_bytes(m_spill_bytes)
-                  << ", alpha=" << m_cfg.alpha << ", beta=" << m_cfg.beta;
+                  << ", spill_bytes=" << format_bytes(m_spill_bytes) << ", alpha=" << m_cfg.alpha
+                  << ", beta=" << m_cfg.beta;
         if (m_cfg.max_ram_gb > 0 && PLATFORM_RAM_OVERHEAD > 1.0) {
             std::cout << " (platform RAM overhead " << PLATFORM_RAM_OVERHEAD << "x)";
         }
@@ -108,8 +108,8 @@ struct builder {
         std::string const tmp_dir = resolve_tmp_dir();
         std::cout << "  tmp_dir = " << tmp_dir << "\n";
 
-        auto writer = std::make_unique<bucket_writer>(tmp_dir, num_buckets, m_flush_bases,
-                                                      m_spill_bytes);
+        auto writer =
+            std::make_unique<bucket_writer>(tmp_dir, num_buckets, m_flush_bases, m_spill_bytes);
         // When -g is set, arm a background RSS watcher with
         // hysteresis. Bucket-write must leave room for what comes
         // after: bucket-process adds ~1 GiB on top on multi-thousand-
@@ -127,8 +127,7 @@ struct builder {
         // pressure is sticky, and we do over-spill -- that's the
         // safer-but-slower path on platforms without VmRSS.
         if (m_cfg.max_ram_gb > 0) {
-            uint64_t budget_bytes =
-                (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0);
+            uint64_t budget_bytes = (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0);
             uint64_t high_threshold_bytes = (uint64_t)(0.60 * (double)budget_bytes);
             uint64_t low_threshold_bytes = (uint64_t)(0.45 * (double)budget_bytes);
             writer->start_rss_watcher(high_threshold_bytes, low_threshold_bytes);
@@ -163,8 +162,7 @@ struct builder {
                         ? std::make_unique<progress>("bucket-write", done_bytes, total_bytes,
                                                      /*render_bytes=*/true, &done,
                                                      (uint64_t)files.size(), "files")
-                        : std::make_unique<progress>("bucket-write", done,
-                                                     (uint64_t)files.size());
+                        : std::make_unique<progress>("bucket-write", done, (uint64_t)files.size());
                 ingest_bucketed(files, m_cfg.k, m_cfg.m, m_cfg.num_buckets, *writer,
                                 m_cfg.num_threads, &done, &file_sizes, &done_bytes);
                 prog->stop();
@@ -226,9 +224,12 @@ struct builder {
         // is just 16 bytes of metadata; the compressed bit_vector
         // never sits in RAM. EF offsets are appended to the file at
         // finalize().
-        frag_unitig_writer frag_sink(tmp_dir + "/frag_unitigs.bin");
-        streaming_color_set_dict global_dict(m_num_colors,
-                                             m_cfg.out_basename + ".color_sets");
+        // Emit the companion links spill (boundary k-mers per fragment, in
+        // frag_id order) during bucket-process, so the scalable stitch can seed
+        // from ~1.6 GB of links instead of re-reading the whole frag spill. The
+        // links file is a small disk-only cost that never counts against -g.
+        frag_unitig_writer frag_sink(tmp_dir + "/frag_unitigs.bin", m_cfg.k);
+        streaming_color_set_dict global_dict(m_num_colors, m_cfg.out_basename + ".color_sets");
         std::mutex global_mu;
         {
             phase_rss_marker rss("bucket-process");
@@ -248,13 +249,11 @@ struct builder {
                 // All num_threads threads stay alive; -t is never reduced.
                 uint64_t bp_budget = 0;
                 if (m_cfg.max_ram_gb > 0) {
-                    const uint64_t total =
-                        (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0);
+                    const uint64_t total = (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0);
                     bp_budget = (uint64_t)(BUCKET_PROCESS_BUDGET_FRAC * (double)total);
                 }
-                process_buckets(*writer, m_cfg.k, m_num_colors, m_cfg.num_threads,
-                                std::ref(frag_sink), global_dict, global_mu, &done,
-                                bp_budget);
+                process_buckets(*writer, m_cfg.k, m_num_colors, m_cfg.num_threads, frag_sink,
+                                global_dict, global_mu, &done, bp_budget);
                 prog.stop();
                 std::cout << "  bucket fragments: " << frag_sink.count() << "\n";
                 std::cout << "  distinct color classes: " << global_dict.size() << "\n";
@@ -309,10 +308,9 @@ struct builder {
 
                 const uint32_t unitig_bucket_count = pick_unitig_bucket_count_(
                     m_num_color_classes, total_frag_seq_bytes, m_cfg.max_ram_gb);
-                uwriter_ptr = std::make_unique<unitig_bucket_writer>(
-                    tmp_dir, m_num_color_classes, unitig_bucket_count);
+                uwriter_ptr = std::make_unique<unitig_bucket_writer>(tmp_dir, m_num_color_classes,
+                                                                     unitig_bucket_count);
 
-                frag_unitig_stream_reader frag_reader(frag_sink.path());
                 std::atomic<uint64_t> done{0};
                 progress prog("stitch", done, n_frags);
                 // External-memory iterative-doubling stitch: per-round
@@ -321,8 +319,8 @@ struct builder {
                 // once. We DIMENSION THE BUCKET COUNT (never the user's thread
                 // count) so num_threads resident buckets fit stitch's share of
                 // -g: more, smaller buckets. The user's -t is honored as-is.
-                const uint32_t stitch_buckets = pick_stitch_buckets_(
-                    total_frag_seq_bytes, m_cfg.max_ram_gb, m_cfg.num_threads);
+                const uint32_t stitch_buckets =
+                    pick_stitch_buckets_(total_frag_seq_bytes, m_cfg.max_ram_gb, m_cfg.num_threads);
                 std::cout << "  stitch buckets: " << stitch_buckets
                           << ", threads: " << m_cfg.num_threads << "\n";
                 // Parallel over the per-round bucket loop: buckets are
@@ -330,12 +328,50 @@ struct builder {
                 // RNG), so this fans out cleanly. Output is unchanged --
                 // emit_fasta sorts each cid-bucket, so .fa is identical
                 // regardless of which thread emitted which unitig.
-                stitch_unitigs_extmem_file_stream(frag_reader, m_cfg.k, tmp_dir,
-                                                  std::ref(*uwriter_ptr), stitch_buckets, &done,
-                                                  m_cfg.num_threads);
+                // GGCAT-style id-only compaction on a single, always-on-disk
+                // path: the doubling carries only fragment-id chains; bases +
+                // colors are assembled at the end through an on-disk re-bucket.
+                // The stores are RAM-FIRST: round store, member, and base
+                // records stay in RAM up to a -g-derived cap and spill only the
+                // overflow to disk. So when the working set fits, the whole
+                // stitch runs in RAM (no disk round-trip); when it does not, it
+                // degrades to disk and the -g bound is honored at all costs.
+                // Round 0 seeds from the precomputed links spill (boundary
+                // k-mers, ~17 B/fragment), not a second full frag-spill read.
+                //
+                // cap = -g minus the cross-phase carry (the color dict that
+                // stays resident through stitch) minus a working-set reserve
+                // for the per-bucket decode set. 0 means no -g => use all RAM.
+                size_t stitch_ram_cap = 0;
+                if (m_cfg.max_ram_gb > 0) {
+                    const uint64_t total = (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0);
+                    const uint64_t carry =
+                        global_dict.resident_bytes() + (uint64_t)(2.0 * 1024 * 1024 * 1024);
+                    stitch_ram_cap =
+                        total > carry ? (size_t)(total - carry) : (size_t)(256ull * 1024 * 1024);
+                }
+                std::cout << "  compact stitch: scalable, RAM-first cap "
+                          << (stitch_ram_cap ? format_bytes(stitch_ram_cap)
+                                             : std::string("unlimited"))
+                          << "\n";
+                auto for_each_frag = [&, first_pass = true](auto&& fn) mutable {
+                    frag_unitig_stream_reader rd(frag_sink.path());
+                    uint8_t of;
+                    std::vector<color_run> runs;
+                    std::string seq;
+                    const bool count = first_pass;
+                    while (rd.next(of, runs, seq)) {
+                        fn(of, runs, seq);
+                        if (count) done.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    first_pass = false;
+                };
+                compact_stitch_scalable(for_each_frag, n_frags, m_cfg.k, tmp_dir,
+                                        std::ref(*uwriter_ptr), stitch_buckets,
+                                        /*frag_ranges=*/0, /*chain_buckets=*/0, m_cfg.num_threads,
+                                        frag_sink.links_path(), stitch_ram_cap);
                 prog.stop();
                 std::cout << "  unitigs after stitching: " << uwriter_ptr->total_unitigs() << "\n";
-                // frag_reader destroyed here -- file handle closed.
             }
             rss.stop();
         }
@@ -343,9 +379,15 @@ struct builder {
         frag_sink.unlink();
         m_num_unitigs = uwriter_ptr->total_unitigs();
 
+        // Stitch allocates large transient buffers that are freed when it
+        // returns, but glibc keeps the freed pages in its per-thread arenas
+        // (RSS stays high), starving emit's bucket I/O of page cache. Hand them
+        // back to the OS before emit.
+        release_free_heap_to_os_();
+
         {
             phase_rss_marker rss("emit-fasta");
-            emit_fasta(*uwriter_ptr);
+            emit_fasta(*uwriter_ptr, m_cfg.out_basename, m_num_unitigs, m_cfg.max_ram_gb);
             rss.stop();
         }
         {
@@ -451,9 +493,8 @@ private:
         if (m_cfg.bucket_log2 != 0) {
             // -b override: forces a power-of-two count, range-checked.
             if (m_cfg.bucket_log2 < MIN_BUCKETS_LOG2 || m_cfg.bucket_log2 > MAX_BUCKETS_LOG2)
-                throw std::runtime_error("-b must be in [" +
-                                         std::to_string(MIN_BUCKETS_LOG2) + ", " +
-                                         std::to_string(MAX_BUCKETS_LOG2) + "]");
+                throw std::runtime_error("-b must be in [" + std::to_string(MIN_BUCKETS_LOG2) +
+                                         ", " + std::to_string(MAX_BUCKETS_LOG2) + "]");
             m_cfg.num_buckets = 1u << m_cfg.bucket_log2;
         } else {
             m_cfg.num_buckets = auto_bucket_count_();
@@ -479,8 +520,8 @@ private:
         const double g = m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0;
         const double M = BUCKET_WRITE_BUDGET_FRAC * g / PLATFORM_RAM_OVERHEAD;
         const double T = (double)std::max<uint32_t>(1, m_cfg.num_threads);
-        const double per_bucket = m_cfg.alpha * T * (double)m_flush_bases +
-                                  m_cfg.beta * (double)m_spill_bytes;
+        const double per_bucket =
+            m_cfg.alpha * T * (double)m_flush_bases + m_cfg.beta * (double)m_spill_bytes;
         double b = M / per_bucket;
         // Floor at a small sane minimum (avoid degenerate single-bucket runs at
         // tiny -g); the fd clamp handles the ceiling. If the model lands below
@@ -511,8 +552,8 @@ private:
         uint32_t avail = (uint32_t)nr.rlim_cur > HEADROOM ? (uint32_t)nr.rlim_cur - HEADROOM : 1;
         if (avail < count) {
             std::cerr << "warning: RLIMIT_NOFILE hard limit " << nr.rlim_max
-                      << " can't accommodate " << count << " buckets; clamping to "
-                      << avail << ". Raise the hard limit (e.g. ulimit -Hn) for tighter budgets.\n";
+                      << " can't accommodate " << count << " buckets; clamping to " << avail
+                      << ". Raise the hard limit (e.g. ulimit -Hn) for tighter budgets.\n";
             return avail;
         }
         return count;
@@ -561,8 +602,7 @@ private:
         std::error_code ec;
         if (std::filesystem::exists(m_cfg.tmp_dir, ec)) {
             if (!std::filesystem::is_directory(m_cfg.tmp_dir, ec))
-                throw std::runtime_error("-d " + m_cfg.tmp_dir +
-                                         " exists but is not a directory");
+                throw std::runtime_error("-d " + m_cfg.tmp_dir + " exists but is not a directory");
             if (!std::filesystem::is_empty(m_cfg.tmp_dir, ec))
                 throw std::runtime_error("-d " + m_cfg.tmp_dir +
                                          " is not empty (the tool will remove the directory on"
@@ -570,8 +610,7 @@ private:
         } else {
             std::filesystem::create_directories(m_cfg.tmp_dir, ec);
             if (ec)
-                throw std::runtime_error("cannot create -d " + m_cfg.tmp_dir + ": " +
-                                         ec.message());
+                throw std::runtime_error("cannot create -d " + m_cfg.tmp_dir + ": " + ec.message());
         }
         return m_cfg.tmp_dir;
     }
@@ -621,8 +660,7 @@ private:
         if (max_ram_gb <= 0 || total_seq_bytes_estimate == 0) {
             return (uint32_t)std::min<uint64_t>(num_color_classes, DEFAULT_K);
         }
-        const uint64_t budget_bytes =
-            (uint64_t)(max_ram_gb * 1024.0 * 1024.0 * 1024.0 * SHARE);
+        const uint64_t budget_bytes = (uint64_t)(max_ram_gb * 1024.0 * 1024.0 * 1024.0 * SHARE);
         if (budget_bytes == 0) {
             return (uint32_t)std::min<uint64_t>(num_color_classes, DEFAULT_K);
         }
@@ -674,8 +712,7 @@ private:
         // freed before stitch via release_index, so this is small now).
         const uint64_t carry_in = current_rss_bytes();
         const uint64_t budget_total = (uint64_t)(max_ram_gb * 1024.0 * 1024.0 * 1024.0);
-        const uint64_t avail =
-            budget_total > carry_in ? (budget_total - carry_in) : budget_total;
+        const uint64_t avail = budget_total > carry_in ? (budget_total - carry_in) : budget_total;
         const uint64_t budget = (uint64_t)((double)avail * SHARE);
         if (budget == 0) return DEFAULT_BUCKETS;
 
@@ -685,116 +722,6 @@ private:
         if (count < MIN_BUCKETS) count = MIN_BUCKETS;
         if (count > MAX_BUCKETS) count = MAX_BUCKETS;  // hard fd ceiling; see note below
         return (uint32_t)count;
-    }
-
-    // FASTA emit. Hand-rolled 1 MiB buffer + std::to_chars for the
-    // integer header + memcpy for the sequence body. Significantly
-    // faster than std::ofstream's default 8 KiB buffer + stream
-    // operators on millions of small records.
-    //
-    // Reads unitigs from the disk-backed bucket spill in bucket order
-    // (bucket 0 = lowest cids, ..., bucket K-1 = highest). Within a
-    // bucket records arrive in stitch order, so we sort by cid to
-    // make the .fa output strictly cid-ascending. Per-bucket peak
-    // in RAM is one bucket's seqs (~few MB on the 4546-genome
-    // workload) plus the per-record vector.
-    //
-    // While we already have the unitigs in their final cid-ascending
-    // emission order, also build the unitig-to-color-set "u2c"
-    // bit_vector and serialize it to <basename>.u2c. Bit i is set
-    // iff unitig i (in .fa emission order) is the last unitig of a
-    // color-set run. Length = num_unitigs, popcount =
-    // num_color_classes. Downstream consumers (Fulgor) recover the
-    // per-unitig color-set id via rank1(unitig_id) using a rank9
-    // index built at load time. Matches the bit_vector layout in
-    // https://github.com/jermp/fulgor/blob/main/include/index.hpp .
-    void emit_fasta(unitig_bucket_writer& uwriter) const {
-        timer _("emit fasta");
-
-        FILE* fa = std::fopen((m_cfg.out_basename + ".fa").c_str(), "wb");
-        if (!fa) throw std::runtime_error("cannot open " + m_cfg.out_basename + ".fa");
-        constexpr size_t BUF_BYTES = 1 << 20;
-        std::vector<char> buf(BUF_BYTES);
-        size_t pos = 0;
-        auto flush_buf = [&] {
-            if (pos == 0) return;
-            if (std::fwrite(buf.data(), 1, pos, fa) != pos) {
-                std::fclose(fa);
-                throw std::runtime_error("short write to " + m_cfg.out_basename + ".fa");
-            }
-            pos = 0;
-        };
-        auto reserve = [&](size_t n) {
-            if (pos + n > BUF_BYTES) flush_buf();
-        };
-
-        bits::bit_vector::builder u2c_bvb((uint64_t)m_num_unitigs, /*init=*/false);
-        size_t emitted = 0;
-        uint64_t prev_cid = 0;
-
-        // Per-bucket RAM cap for the cid-sort. read_bucket_sorted sorts in RAM
-        // when a bucket fits this, else external merge-sorts -- so the
-        // emit-fasta peak is bounded by this cap REGARDLESS of cid skew (which
-        // otherwise made one low-cid bucket dominate; 661k: +36 GiB). Use a
-        // modest share of -g; fall back to a fixed cap with no -g.
-        const uint64_t emit_mem_cap =
-            m_cfg.max_ram_gb > 0
-                ? (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0 * 0.10)
-                : (uint64_t)(1ull << 30);  // 1 GiB default
-
-        auto emit_record = [&](uint64_t cid, std::string_view seq) {
-            // Mark the final unitig of the previous run. cid is globally
-            // non-decreasing (buckets ascending by cid range, sorted within),
-            // so cid != prev_cid is exactly a color-set group boundary.
-            if (emitted > 0 && cid != prev_cid) u2c_bvb.set(emitted - 1, 1);
-            prev_cid = cid;
-            ++emitted;
-
-            reserve(22);  // '>' + up to 20 digits (uint64_t) + '\n'
-            buf[pos++] = '>';
-            auto rr = std::to_chars(buf.data() + pos, buf.data() + pos + 20, cid);
-            pos = (size_t)(rr.ptr - buf.data());
-            buf[pos++] = '\n';
-            size_t s_pos = 0;
-            while (s_pos < seq.size()) {
-                if (pos == BUF_BYTES) flush_buf();
-                size_t take = std::min(BUF_BYTES - pos, seq.size() - s_pos);
-                std::memcpy(buf.data() + pos, seq.data() + s_pos, take);
-                pos += take;
-                s_pos += take;
-            }
-            reserve(1);
-            buf[pos++] = '\n';
-        };
-
-        for (uint32_t b = 0; b < uwriter.num_buckets(); ++b) {
-            uwriter.read_bucket_sorted(b, emit_mem_cap, emit_record);
-        }
-        flush_buf();
-        std::fclose(fa);
-
-        std::cout << "  [emit-fasta] " << uwriter.num_buckets()
-                  << " buckets, cid-sort RAM cap " << format_bytes(emit_mem_cap)
-                  << " (external merge-sort if a bucket exceeds it)\n";
-
-        // Close out the very last run.
-        if (emitted > 0) u2c_bvb.set(emitted - 1, 1);
-        bits::bit_vector u2c;
-        u2c_bvb.build(u2c);
-        essentials::save(u2c, (m_cfg.out_basename + ".u2c").c_str());
-
-        uwriter.close_and_unlink();
-    }
-
-    void emit_colors(streaming_color_set_dict& global_dict) const {
-        timer _("emit color_sets");
-        // Encoding already happened during bucket-process via
-        // global_dict.intern(); each intern flushed complete 64-bit
-        // words to the final file. finalize() flushes the trailing
-        // partial word, builds + appends the elias_fano over per-
-        // class bit-offsets, then fseeks back to write the now-known
-        // header totals.
-        global_dict.finalize();
     }
 
     build_config m_cfg;
