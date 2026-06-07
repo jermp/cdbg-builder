@@ -9,3 +9,5 @@ in the minimizer.hpp file:
 where is `min_queue` used? didn't we say that a re-scan method is actually faster than a monotonic queue-based approach?
 See here https://github.com/jermp/sshash/blob/master/include/minimizer_iterator.hpp.
 
+this one in builder.hpp
+`essentials::timer<essentials::clock_type, std::chrono::duration<double>> build_timer;` could probably put under util.hpp to use it across the whole codebase?
