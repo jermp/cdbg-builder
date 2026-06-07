@@ -2,12 +2,9 @@
 
 // Public API for building a colored compacted dBG.
 //
-// Wraps the full pipeline (minimizer-bucketed ingest -> per-bucket dBG
-// build + global color interning -> stitch -> emit FASTA + .color_sets) so
+// Wraps the full pipeline so
 // that downstream tools can construct a `build_config`, instantiate a
-// `builder`, and call `build()`. Mirrors the call shape used by
-// Fulgor's `index<ColorSets>::builder` for its ccdBG dependency
-// (https://github.com/jermp/fulgor/blob/main/include/builders/builder.hpp).
+// `builder`, and call `build()`.
 //
 // Typical use:
 //
@@ -81,8 +78,9 @@ struct builder {
 
         auto files = read_filenames(m_cfg.filenames_list);
         if (files.empty()) throw std::runtime_error("no input files");
-        if (files.size() > (uint64_t)UINT32_MAX)
+        if (files.size() > (uint64_t)UINT32_MAX) {
             throw std::runtime_error("too many colors (max 2^32 - 1)");
+        }
         m_num_colors = (uint32_t)files.size();
 
         uint32_t const num_buckets = m_cfg.num_buckets;
@@ -110,6 +108,7 @@ struct builder {
 
         auto writer =
             std::make_unique<bucket_writer>(tmp_dir, num_buckets, m_flush_bases, m_spill_bytes);
+
         // When -g is set, arm a background RSS watcher with
         // hysteresis. Bucket-write must leave room for what comes
         // after: bucket-process adds ~1 GiB on top on multi-thousand-
@@ -127,27 +126,18 @@ struct builder {
         // pressure is sticky, and we do over-spill -- that's the
         // safer-but-slower path on platforms without VmRSS.
         if (m_cfg.max_ram_gb > 0) {
-            uint64_t budget_bytes = (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0);
-            uint64_t high_threshold_bytes = (uint64_t)(0.60 * (double)budget_bytes);
-            uint64_t low_threshold_bytes = (uint64_t)(0.45 * (double)budget_bytes);
+            uint64_t budget_bytes = m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0;
+            uint64_t high_threshold_bytes = 0.60 * budget_bytes;
+            uint64_t low_threshold_bytes = 0.45 * (double)budget_bytes;
             writer->start_rss_watcher(high_threshold_bytes, low_threshold_bytes);
         }
+
         {
             phase_rss_marker rss("bucket-write");
             {
                 timer _("bucket-write");
                 std::atomic<uint64_t> done{0};
 
-                // Drive the progress bar by *bytes of input* rather than file
-                // count. The input files vary ~3x in size, so a file-% bar
-                // badly misreports true progress -- e.g. on the 20k-genome set
-                // "50% of files" was only ~30% of the work, since the larger
-                // files cluster late. We learn each file's on-disk (compressed)
-                // size with a cheap stat() up front -- no read needed -- and
-                // sum it for the denominator. Compressed bytes is a proxy for
-                // work (uncompressed bases), far better than file count; the
-                // file counter rides along as secondary context. Fall back to
-                // the file-count bar if no size is available.
                 std::vector<uint64_t> file_sizes(files.size(), 0);
                 uint64_t total_bytes = 0;
                 for (size_t i = 0; i < files.size(); ++i) {
@@ -214,9 +204,7 @@ struct builder {
         // Instead each fragment is streamed through a disk-backed
         // frag_unitig_writer to a single tmp file. Stitch then reads
         // that file back with a streaming frag_unitig_stream_reader that
-        // holds one fragment at a time, so no full
-        // vector<stitchable_unitig> -- and no O(num_fragments) index --
-        // is ever materialised.
+        // holds one fragment at a time.
         //
         // Streaming dict: encodes each new color set into its bvb at
         // intern() time and immediately flushes complete 64-bit words
@@ -245,12 +233,12 @@ struct builder {
                 // re-reading the live dict each time. So as the dict grows,
                 // fewer buckets load at once -- the dict is reserved for
                 // dynamically, not left to overflow on top of a static
-                // kmer_info budget (the cause of the earlier 20.47 GiB peak).
+                // kmer_info budget.
                 // All num_threads threads stay alive; -t is never reduced.
                 uint64_t bp_budget = 0;
                 if (m_cfg.max_ram_gb > 0) {
-                    const uint64_t total = (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0);
-                    bp_budget = (uint64_t)(BUCKET_PROCESS_BUDGET_FRAC * (double)total);
+                    const uint64_t total = m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0;
+                    bp_budget = BUCKET_PROCESS_BUDGET_FRAC * total;
                 }
                 process_buckets(*writer, m_cfg.k, m_num_colors, m_cfg.num_threads, frag_sink,
                                 global_dict, global_mu, &done, bp_budget);
@@ -265,26 +253,13 @@ struct builder {
         }
         process_prof().print(m_cfg.num_threads);
         m_num_color_classes = global_dict.size();
+
         // Interning is done. Free the dict's dedup index + per-class hash
         // vector NOW (finalize only needs the class count + the on-disk
-        // bits/offsets). At high class counts this was the dominant cross-
-        // phase carry-in -- it stayed resident through stitch + emit and
-        // pushed stitch over budget (100K -g16: ~15 GiB carried into stitch).
+        // bits/offsets).
         global_dict.release_index();
         frag_sink.close_for_writing();
-        // bucket_writer's per-bucket compactor state (m_dict_classes
-        // and other reuse-friendly buffers) is alive at high-water
-        // until the writer is destroyed -- ~300 MB on 25K scale that
-        // would otherwise carry into stitch. Drop it now; the bucket
-        // *files* on disk are still there (cleanup_tmp_dir removes
-        // them at end of build), and process_buckets has already read
-        // them.
         writer.reset();
-        // glibc holds free'd allocations in per-thread arenas across
-        // phase boundaries; on a 16-thread bucket-process this can
-        // be 500 MB - 1 GB of "free but not returned to OS" memory
-        // that still counts toward RSS during stitch. Force release
-        // back to the kernel before stitch starts.
         release_free_heap_to_os_();
 
         // Stitch streams each finished unitig into a cid-range
@@ -295,7 +270,7 @@ struct builder {
         std::unique_ptr<unitig_bucket_writer> uwriter_ptr;
         {
             // The stitch reads the frag spill with a STREAMING reader that
-            // holds one fragment at a time -- no O(num_fragments) index. The
+            // holds one fragment at a time. The
             // total seq bytes (for bucket sizing) and fragment count (for the
             // progress bar) come from the writer's own counters, so we never
             // walk an index. emit only needs uwriter (cid-bucketed unitig
@@ -342,13 +317,11 @@ struct builder {
                 // cap = -g minus the cross-phase carry (the color dict that
                 // stays resident through stitch) minus a working-set reserve
                 // for the per-bucket decode set. 0 means no -g => use all RAM.
-                size_t stitch_ram_cap = 0;
+                uint64_t stitch_ram_cap = 0;
                 if (m_cfg.max_ram_gb > 0) {
-                    const uint64_t total = (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0);
-                    const uint64_t carry =
-                        global_dict.resident_bytes() + (uint64_t)(2.0 * 1024 * 1024 * 1024);
-                    stitch_ram_cap =
-                        total > carry ? (size_t)(total - carry) : (size_t)(256ull * 1024 * 1024);
+                    const uint64_t total = m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0;
+                    const uint64_t carry = global_dict.resident_bytes() + 2ull * 1024 * 1024 * 1024;
+                    stitch_ram_cap = total > carry ? total - carry : 256ull * 1024 * 1024;
                 }
                 std::cout << "  compact stitch: scalable, RAM-first cap "
                           << (stitch_ram_cap ? format_bytes(stitch_ram_cap)
@@ -405,7 +378,7 @@ struct builder {
         if (m_peak_rss_bytes) {
             std::cout << "[peak resident memory] " << format_bytes(m_peak_rss_bytes);
             if (m_cfg.max_ram_gb > 0) {
-                uint64_t budget = (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0);
+                uint64_t budget = m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0;
                 if (m_peak_rss_bytes <= budget) {
                     std::cout << "  (within budget of " << format_bytes(budget) << ")";
                 } else {
@@ -432,8 +405,7 @@ private:
     // Soft-cap policy. Reads m_cfg.max_ram_gb (0 = unset) and decides:
     //   - bucket_log2 (more buckets -> smaller per-bucket data structures)
     //   - color-bvb spill threshold (in bytes; 0 = never spill)
-    // Tighter budgets push bucket_log2 toward 13 (8192 buckets, GGCAT's
-    // upper end) and shrink the bvb spill threshold proportionally.
+    // Tighter budgets push bucket_log2 toward 16 and shrink the bvb spill threshold proportionally.
     // The user-facing CLI override (-b) takes precedence
     // over this auto-tune.
     // Bounds for the -b power-of-two override only. The auto path computes an
@@ -447,11 +419,9 @@ private:
     static constexpr uint32_t MIN_AUTO_BUCKETS = 64;
 
     // Fraction of -g the bucket-write phase is sized against. 0.50 matches the
-    // long-standing BUCKET_WRITE_SHARE that kept bucket-write lean (~10 GiB at
-    // g16 on the 100K input); 0.85 needlessly let it allocate more. Phase 1
+    // long-standing BUCKET_WRITE_SHARE that kept bucket-write lean. Phase 1
     // doesn't need most of -g -- only enough that B = M/(alpha*T*flush+beta*
-    // spill) is large enough for a 48-way bucket-process (~10k at 0.50, well
-    // above the ~6.7k needed).
+    // spill) is large enough for a 48-way bucket-process.
     static constexpr double BUCKET_WRITE_BUDGET_FRAC = 0.50;
 
     // Good default per-bucket batching payloads. B is derived as B = frac*g /
@@ -472,17 +442,21 @@ private:
     static constexpr double BUCKET_PROCESS_BUDGET_FRAC = 0.82;
 
     void validate_and_resolve_config() {
-        if (m_cfg.filenames_list.empty())
+        if (m_cfg.filenames_list.empty()) {
             throw std::runtime_error("build_config::filenames_list is empty");
-        if (m_cfg.out_basename.empty())
+        }
+        if (m_cfg.out_basename.empty()) {
             throw std::runtime_error("build_config::out_basename is empty");
-        if (m_cfg.k == 0 || m_cfg.k > MAX_K)
+        }
+        if (m_cfg.k == 0 || m_cfg.k > MAX_K) {
             throw std::runtime_error("k must satisfy 1 <= k <= " + std::to_string(MAX_K));
+        }
         if (m_cfg.num_threads == 0) m_cfg.num_threads = 1;
         if (m_cfg.m == 0) m_cfg.m = compute_best_m(m_cfg.k);
-        if (m_cfg.m < 2 || m_cfg.m > m_cfg.k)
+        if (m_cfg.m < 2 || m_cfg.m > m_cfg.k) {
             throw std::runtime_error("invalid m=" + std::to_string(m_cfg.m) +
                                      " (need 2 <= m <= k)");
+        }
         // Per-bucket batching knobs (CLI-overridable). The RAM model sizes the
         // bucket COUNT against these, so smaller values -> larger B -> smaller
         // buckets (faster bucket-process) while bucket-write stays in budget.
@@ -595,22 +569,26 @@ private:
                 (std::filesystem::temp_directory_path() / "cdbg_buckets_XXXXXX").string();
             std::vector<char> buf(tmpl.begin(), tmpl.end());
             buf.push_back('\0');
-            if (mkdtemp(buf.data()) == nullptr)
+            if (mkdtemp(buf.data()) == nullptr) {
                 throw std::runtime_error(std::string("mkdtemp failed: ") + std::strerror(errno));
+            }
             return std::string(buf.data());
         }
         std::error_code ec;
         if (std::filesystem::exists(m_cfg.tmp_dir, ec)) {
-            if (!std::filesystem::is_directory(m_cfg.tmp_dir, ec))
+            if (!std::filesystem::is_directory(m_cfg.tmp_dir, ec)) {
                 throw std::runtime_error("-d " + m_cfg.tmp_dir + " exists but is not a directory");
-            if (!std::filesystem::is_empty(m_cfg.tmp_dir, ec))
+            }
+            if (!std::filesystem::is_empty(m_cfg.tmp_dir, ec)) {
                 throw std::runtime_error("-d " + m_cfg.tmp_dir +
                                          " is not empty (the tool will remove the directory on"
                                          " exit, so it must start empty)");
+            }
         } else {
             std::filesystem::create_directories(m_cfg.tmp_dir, ec);
-            if (ec)
+            if (ec) {
                 throw std::runtime_error("cannot create -d " + m_cfg.tmp_dir + ": " + ec.message());
+            }
         }
         return m_cfg.tmp_dir;
     }
