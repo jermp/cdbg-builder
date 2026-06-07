@@ -321,7 +321,7 @@ inline bool walk_step(kmer_int_t can, bool rc, bool forward, uint32_t k, bucket_
     return true;
 }
 
-inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_colors,
+inline void process_bucket(std::string const& path, uint32_t k, uint64_t num_colors,
                            std::vector<stitchable_unitig>& out_local,
                            compact_color_set_dict& out_local_dict) {
     auto& prof = process_prof();
@@ -586,7 +586,7 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
 // thread count. One bucket is always allowed even if it alone exceeds the
 // budget (forward progress).
 template <typename Sink>
-inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t num_colors,
+inline void process_buckets(bucket_writer const& writer, uint32_t k, uint64_t num_colors,
                             uint32_t num_threads, Sink&& sink,
                             streaming_color_set_dict& global_dict, std::mutex& global_mu,
                             std::atomic<uint64_t>* done = nullptr, uint64_t mem_budget_bytes = 0) {
