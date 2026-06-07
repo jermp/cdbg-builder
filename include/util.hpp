@@ -136,10 +136,11 @@ inline std::string format_bytes(uint64_t b) {
         ++u;
     }
     char buf[64];
-    if (u == 0)
+    if (u == 0) {
         std::snprintf(buf, sizeof(buf), "%llu B", (unsigned long long)b);
-    else
+    } else {
         std::snprintf(buf, sizeof(buf), "%.2f %s", v, units[u]);
+    }
     return buf;
 }
 
@@ -224,8 +225,7 @@ inline uint64_t current_rss_bytes() {
 // the prior watermark shows +0.00) but it works wherever getrusage
 // works -- no /proc parsing, no sampler thread.
 
-class phase_rss_marker {
-public:
+struct phase_rss_marker {
     explicit phase_rss_marker(std::string label) : m_label(std::move(label)) {
         m_baseline = process_peak_rss_bytes();
         // Live RSS at phase entry = memory CARRIED IN from prior phases (e.g.
@@ -297,8 +297,7 @@ private:
 //
 // Workers don't talk to progress directly — they bump `counter`, and progress
 // only reads it. This keeps the hot path lock-free and progress optional.
-class progress {
-public:
+struct progress {
     // `render_bytes`: format counter/total via format_bytes (use when the
     // counter is a byte total, so the % reflects *work* rather than item
     // count). `secondary`/`secondary_total`/`secondary_label`: an optional
