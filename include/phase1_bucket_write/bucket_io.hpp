@@ -103,24 +103,27 @@ public:
         return m_total_uncompressed.load(std::memory_order_relaxed);
     }
 
-    // Insert a batch of records (parsed). `bases_storage` holds the 2-bit
-    // values (one per byte) for every record; each record points into it
-    // via [bases_off, bases_off + bases_len). The `hash` field is a
-    // wyhash of the bases, computed by the producer at append time
-    // while the bases are still hot in L1; we feed it directly to the
-    // dedup map's find() instead of rehashing the bases bytes here
-    // (where they are typically cold). Caller may clear/reset its
-    // buffers after this returns.
+    // Insert a batch of records (parsed). `key_storage` holds, for every record,
+    // its dedup KEY: a varint base-length followed by the 2-bit-PACKED bases
+    // (ceil(len/4) bytes). Each record points into it via [key_off, key_off +
+    // key_len). The bases are kept packed in RAM (4x smaller than one byte per
+    // base) so the keys are small enough to live inline in std::string (SSO,
+    // no heap alloc) and the spill writes them out unchanged. The length prefix
+    // disambiguates super-k-mers whose packings would otherwise collide (a 31-
+    // and a 32-base-ending-in-A super-k-mer pack to the same bytes). The `hash`
+    // is a wyhash of the whole key, computed by the producer at append time
+    // while the bytes are hot in L1; we feed it to the dedup map's find()
+    // instead of rehashing here (where the bytes are typically cold).
     struct pending_record {
         uint64_t hash;
         uint32_t color;
-        uint32_t bases_off;
-        uint32_t bases_len;
+        uint32_t key_off;
+        uint32_t key_len;
         uint8_t flags;
     };
 
     void insert_batch(std::vector<pending_record> const& recs,
-                      std::vector<uint8_t> const& bases_storage) {
+                      std::vector<uint8_t> const& key_storage) {
         if (recs.empty()) return;
         auto& prof = bucket_prof();
         auto t_lock = bucket_write_prof::clock::now();
@@ -129,10 +132,10 @@ public:
         auto t_map = bucket_write_prof::clock::now();
         uint64_t inserts = 0;  // accumulate locally; one atomic add per batch (below)
         for (auto const& r : recs) {
-            std::string_view key((char const*)bases_storage.data() + r.bases_off, r.bases_len);
+            std::string_view key((char const*)key_storage.data() + r.key_off, r.key_len);
             // Heterogeneous lookup with a precomputed hash. Our
             // string_hash::operator()(hashed_view) just returns h.hash,
-            // so find() doesn't re-hash the bases. The bases bytes are
+            // so find() doesn't re-hash the key. The key bytes are
             // only re-touched on a hash collision (then string_eq does
             // the byte compare).
             hashed_view hv{key, r.hash};
@@ -144,7 +147,16 @@ public:
                 // across batches/colors AND-shrink the begin/end bits.
                 e.flags = r.flags;
                 e.colors.push_back(r.color);
-                m_bytes += key.size() + sizeof(uint32_t);
+                // Charge the spill budget by the UNPACKED base length (the key's
+                // varint prefix), not the packed key size. The keys are 4x
+                // smaller now, but the per-entry cost that actually drives RAM is
+                // the colors vector + map node, not the key bytes. Counting
+                // unpacked keeps the spill cadence -- hence the resident entry
+                // count and peak RAM -- the same as before the 2-bit packing,
+                // independent of -g.
+                size_t vp = 0;
+                uint64_t base_len = varint_read((uint8_t const*)key.data(), key.size(), vp);
+                m_bytes += (size_t)base_len + sizeof(uint32_t);
                 m_dedup.emplace(std::string(key), std::move(e));
                 ++inserts;
             } else {
@@ -227,8 +239,14 @@ private:
             // amortising the per-block framing overhead across all of
             // the spill's records is what makes compression actually
             // pay off on inputs this small (~50-200 B per record).
-            write_super_kmer(e.flags, e.colors.data(), (uint32_t)e.colors.size(),
-                             (uint8_t const*)key.data(), (uint32_t)key.size(), m_batch_buf);
+            // The key is [varint base_len][2-bit packed bases]; the on-disk
+            // record stores the SAME packed bytes, so write them directly
+            // (no unpack/re-pack round-trip).
+            size_t p = 0;
+            uint64_t base_len = varint_read((uint8_t const*)key.data(), key.size(), p);
+            write_super_kmer_packed(e.flags, e.colors.data(), (uint32_t)e.colors.size(),
+                                    (uint8_t const*)key.data() + p, (uint32_t)base_len,
+                                    m_batch_buf);
         }
         if (m_batch_buf.empty()) {
             m_dedup.clear();
@@ -357,15 +375,15 @@ public:
     }
 
     void flush(uint32_t b, std::vector<bucket_compactor::pending_record>& recs,
-               std::vector<uint8_t>& bases_buf) {
+               std::vector<uint8_t>& key_buf) {
         if (recs.empty()) return;
         auto& prof = bucket_prof();
         auto t = bucket_write_prof::clock::now();
-        m_compactors[b]->insert_batch(recs, bases_buf);
+        m_compactors[b]->insert_batch(recs, key_buf);
         prof.ns_flush.fetch_add(bucket_write_prof::since(t), std::memory_order_relaxed);
         prof.n_flushes.fetch_add(1, std::memory_order_relaxed);
         recs.clear();
-        bases_buf.clear();
+        key_buf.clear();
     }
 
     void close() {
@@ -585,28 +603,32 @@ private:
 
 struct per_thread_bucket_buffers {
     std::vector<std::vector<bucket_compactor::pending_record>> recs;
-    std::vector<std::vector<uint8_t>> bases;
+    std::vector<std::vector<uint8_t>> keys;  // per-bucket packed dedup keys (see append)
     bucket_writer* sink = nullptr;
 
     explicit per_thread_bucket_buffers(bucket_writer& w)
-        : recs(w.num_buckets()), bases(w.num_buckets()), sink(&w) {}
+        : recs(w.num_buckets()), keys(w.num_buckets()), sink(&w) {}
 
+    // `sk_bases` is the super-k-mer's bases as 0-3 values, one per byte; `len` is
+    // the base count. We build the dedup key here -- [varint len][2-bit packed
+    // bases] -- so the bases live 4x smaller in RAM all the way to the spill.
     void append(uint32_t b, uint8_t flags, uint32_t color, uint8_t const* sk_bases, uint32_t len) {
-        auto& bbuf = bases[b];
-        uint32_t off = (uint32_t)bbuf.size();
-        bbuf.insert(bbuf.end(), sk_bases, sk_bases + len);
-        // Hash the bases now while they're still hot in L1 from the
-        // emit_super_kmers buffer; the compactor reuses this hash on
-        // its dedup-map find() instead of re-hashing the (typically
-        // cold) bytes from the writer's bases_storage.
-        uint64_t h = bucket_compactor::hash_bases(sk_bases, len);
-        recs[b].push_back({h, color, off, len, (uint8_t)(flags & 0xfu)});
-        if (bbuf.size() >= sink->flush_bases()) sink->flush(b, recs[b], bbuf);
+        auto& kbuf = keys[b];
+        uint32_t off = (uint32_t)kbuf.size();
+        varint_write(len, kbuf);         // length prefix (disambiguates packings)
+        pack_2bit(sk_bases, len, kbuf);  // 2-bit packed bases appended
+        uint32_t key_len = (uint32_t)kbuf.size() - off;
+        // Hash the key now while it's hot in L1; the compactor reuses this hash
+        // on its dedup-map find() instead of re-hashing the (typically cold)
+        // bytes from the writer's key_storage.
+        uint64_t h = bucket_compactor::hash_bases(kbuf.data() + off, key_len);
+        recs[b].push_back({h, color, off, key_len, (uint8_t)(flags & 0xfu)});
+        if (kbuf.size() >= sink->flush_bases()) sink->flush(b, recs[b], kbuf);
     }
 
     void flush_all() {
         for (uint32_t b = 0; b < (uint32_t)recs.size(); ++b) {
-            if (!recs[b].empty()) sink->flush(b, recs[b], bases[b]);
+            if (!recs[b].empty()) sink->flush(b, recs[b], keys[b]);
         }
     }
 };
