@@ -941,7 +941,16 @@ public:
         ram.swap(m_batch[b]);
         if (m_budget) m_budget->sub(ram.size());
         if (raw.empty()) return ram;
-        raw.insert(raw.end(), ram.begin(), ram.end());
+        // Append `ram` to `raw`. Done via resize + memcpy rather than
+        // raw.insert(raw.end(), ram.begin(), ram.end()) because GCC 13 emits a
+        // bogus -Wstringop-overflow on the inlined insert range-copy here (the
+        // warning reports a [-2^63, -1] destination offset, its tell for a false
+        // positive). resize + memcpy is equivalent and warning-clean.
+        if (!ram.empty()) {
+            const size_t off = raw.size();
+            raw.resize(off + ram.size());
+            std::memcpy(raw.data() + off, ram.data(), ram.size());
+        }
         return raw;
     }
 
