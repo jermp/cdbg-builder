@@ -338,7 +338,7 @@ public:
         m_file = std::fopen(m_path.c_str(), "wb+");
         if (!m_file) throw std::runtime_error("cannot open frag spill: " + m_path);
         if (m_k) {
-            m_kbytes = (2u * m_k + 7u) / 8u;  // <= 16 (kmer_int_t is 128-bit)
+            m_kbytes = (2u * m_k + 7u) / 8u;  // ceil(2k/8): <= 8 (k<=31) or <= 16 (k<=63)
             m_links_path = m_path + ".links";
             m_links_file = std::fopen(m_links_path.c_str(), "wb+");
             if (!m_links_file) throw std::runtime_error("cannot open links spill: " + m_links_path);
