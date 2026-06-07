@@ -1,7 +1,7 @@
 #pragma once
 
 // GGCAT-style id-only cross-bucket compaction + single base/color assembly.
-// Companion to stitch_extmem.hpp; see parallel-stitch-plan.md.
+// Companion to stitch_extmem.hpp (the base-carrying reference oracle).
 //
 // Same doubling algorithm as stitch_extmem (boundary-k-mer keying, colorless
 // join, structural branch separation, O(log L) rounds), but the doubling loop
