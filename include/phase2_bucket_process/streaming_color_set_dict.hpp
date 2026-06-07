@@ -184,7 +184,6 @@ struct streaming_color_set_dict {
     uint64_t size() const {
         return m_released ? m_released_count : m_class_count.load(std::memory_order_relaxed);
     }
-    uint64_t total_integers() const { return m_total_integers; }
     uint64_t total_bits() const { return m_flushed_words * 64 + m_bvb.num_bits(); }
 
     // Free the dedup shards once interning is DONE (after bucket-process).

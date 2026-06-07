@@ -1084,7 +1084,6 @@ public:
         return std::vector<color_run>(m_runs.begin() + (ptrdiff_t)m_runs_off[i],
                                       m_runs.begin() + (ptrdiff_t)m_runs_off[i + 1]);
     }
-    uint64_t seq_bytes() const { return m_seq.size(); }
 
 private:
     std::vector<char> m_seq;             // all fragment bases concatenated
