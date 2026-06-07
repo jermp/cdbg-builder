@@ -55,11 +55,6 @@ struct build_config {
     // budget is a soft target, not a hard cap).
     double max_ram_gb = 0.0;
     bool verbose = false;
-    // Experimental: use the GGCAT-style id-only compaction stitch
-    // (compact_stitch_scalable) instead of the base-carrying stitch. The
-    // doubling rounds carry only fragment-id chains (no bases/colors) and a
-    // single re-bucket pass assembles bases+colors at the end. Same output.
-    bool compact_stitch = false;
 };
 
 // ---- timer ------------------------------------------------------------------
