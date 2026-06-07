@@ -59,8 +59,8 @@
 
 #include <unordered_dense/unordered_dense.h>
 
-#include "super_kmer.hpp"
-#include "util.hpp"
+#include "phase1_bucket_write/super_kmer.hpp"
+#include "phase1_bucket_write/util.hpp"
 
 namespace cdbg {
 

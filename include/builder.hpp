@@ -57,15 +57,16 @@
 #include <bit_vector.hpp>
 #include <essentials.hpp>
 
-#include "bucket_io.hpp"
-#include "bucket_ingester.hpp"
-#include "bucket_walker.hpp"
-#include "minimizer.hpp"
-#include "compact_extmem.hpp"
-#include "stitch.hpp"
-#include "streaming_color_set_dict.hpp"
-#include "unitig_spill.hpp"
-#include "util.hpp"
+#include "phase1_bucket_write/bucket_io.hpp"
+#include "phase1_bucket_write/bucket_ingester.hpp"
+#include "phase2_bucket_process/bucket_walker.hpp"
+#include "phase1_bucket_write/minimizer.hpp"
+#include "phase3_stitch/compact_extmem.hpp"
+#include "phase3_stitch/stitch.hpp"
+#include "phase2_bucket_process/streaming_color_set_dict.hpp"
+#include "phase2_bucket_process/unitig_spill.hpp"
+#include "phase4_emit/emit.hpp"
+#include "phase1_bucket_write/util.hpp"
 
 namespace cdbg {
 
@@ -387,7 +388,7 @@ struct builder {
 
         {
             phase_rss_marker rss("emit-fasta");
-            emit_fasta(*uwriter_ptr);
+            emit_fasta(*uwriter_ptr, m_cfg.out_basename, m_num_unitigs, m_cfg.max_ram_gb);
             rss.stop();
         }
         {
@@ -722,115 +723,6 @@ private:
         if (count < MIN_BUCKETS) count = MIN_BUCKETS;
         if (count > MAX_BUCKETS) count = MAX_BUCKETS;  // hard fd ceiling; see note below
         return (uint32_t)count;
-    }
-
-    // FASTA emit. Hand-rolled 1 MiB buffer + std::to_chars for the
-    // integer header + memcpy for the sequence body. Significantly
-    // faster than std::ofstream's default 8 KiB buffer + stream
-    // operators on millions of small records.
-    //
-    // Reads unitigs from the disk-backed bucket spill in bucket order
-    // (bucket 0 = lowest cids, ..., bucket K-1 = highest). Within a
-    // bucket records arrive in stitch order, so we sort by cid to
-    // make the .fa output strictly cid-ascending. Per-bucket peak
-    // in RAM is one bucket's seqs (~few MB on the 4546-genome
-    // workload) plus the per-record vector.
-    //
-    // While we already have the unitigs in their final cid-ascending
-    // emission order, also build the unitig-to-color-set "u2c"
-    // bit_vector and serialize it to <basename>.u2c. Bit i is set
-    // iff unitig i (in .fa emission order) is the last unitig of a
-    // color-set run. Length = num_unitigs, popcount =
-    // num_color_classes. Downstream consumers (Fulgor) recover the
-    // per-unitig color-set id via rank1(unitig_id) using a rank9
-    // index built at load time. Matches the bit_vector layout in
-    // https://github.com/jermp/fulgor/blob/main/include/index.hpp .
-    void emit_fasta(unitig_bucket_writer& uwriter) const {
-        timer _("emit fasta");
-
-        FILE* fa = std::fopen((m_cfg.out_basename + ".fa").c_str(), "wb");
-        if (!fa) throw std::runtime_error("cannot open " + m_cfg.out_basename + ".fa");
-        constexpr size_t BUF_BYTES = 1 << 20;
-        std::vector<char> buf(BUF_BYTES);
-        size_t pos = 0;
-        auto flush_buf = [&] {
-            if (pos == 0) return;
-            if (std::fwrite(buf.data(), 1, pos, fa) != pos) {
-                std::fclose(fa);
-                throw std::runtime_error("short write to " + m_cfg.out_basename + ".fa");
-            }
-            pos = 0;
-        };
-        auto reserve = [&](size_t n) {
-            if (pos + n > BUF_BYTES) flush_buf();
-        };
-
-        bits::bit_vector::builder u2c_bvb((uint64_t)m_num_unitigs, /*init=*/false);
-        size_t emitted = 0;
-        uint64_t prev_cid = 0;
-
-        // Per-bucket RAM cap for the cid-sort. read_bucket_sorted sorts in RAM
-        // when a bucket fits this, else external merge-sorts -- so the
-        // emit-fasta peak is bounded by this cap REGARDLESS of cid skew (which
-        // otherwise made one low-cid bucket dominate; 661k: +36 GiB). Use a
-        // modest share of -g; fall back to a fixed cap with no -g.
-        const uint64_t emit_mem_cap =
-            m_cfg.max_ram_gb > 0 ? (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0 * 0.10)
-                                 : (uint64_t)(1ull << 30);  // 1 GiB default
-
-        auto emit_record = [&](uint64_t cid, std::string_view seq) {
-            // Mark the final unitig of the previous run. cid is globally
-            // non-decreasing (buckets ascending by cid range, sorted within),
-            // so cid != prev_cid is exactly a color-set group boundary.
-            if (emitted > 0 && cid != prev_cid) u2c_bvb.set(emitted - 1, 1);
-            prev_cid = cid;
-            ++emitted;
-
-            reserve(22);  // '>' + up to 20 digits (uint64_t) + '\n'
-            buf[pos++] = '>';
-            auto rr = std::to_chars(buf.data() + pos, buf.data() + pos + 20, cid);
-            pos = (size_t)(rr.ptr - buf.data());
-            buf[pos++] = '\n';
-            size_t s_pos = 0;
-            while (s_pos < seq.size()) {
-                if (pos == BUF_BYTES) flush_buf();
-                size_t take = std::min(BUF_BYTES - pos, seq.size() - s_pos);
-                std::memcpy(buf.data() + pos, seq.data() + s_pos, take);
-                pos += take;
-                s_pos += take;
-            }
-            reserve(1);
-            buf[pos++] = '\n';
-        };
-
-        for (uint32_t b = 0; b < uwriter.num_buckets(); ++b) {
-            uwriter.read_bucket_sorted(b, emit_mem_cap, emit_record);
-        }
-        flush_buf();
-        std::fclose(fa);
-
-        std::cout << "  [emit-fasta] " << uwriter.num_buckets() << " buckets, cid-sort RAM cap "
-                  << format_bytes(emit_mem_cap)
-                  << " (external merge-sort if a bucket exceeds it)\n";
-
-        // Close out the very last run.
-        if (emitted > 0) u2c_bvb.set(emitted - 1, 1);
-        bits::bit_vector u2c;
-        u2c_bvb.build(u2c);
-        essentials::save(u2c, (m_cfg.out_basename + ".u2c").c_str());
-
-        uwriter.close_and_unlink();
-    }
-
-    void emit_colors(streaming_color_set_dict& global_dict) const {
-        timer _("emit color_sets");
-        // Encoding already happened during bucket-process via
-        // global_dict.intern(); each intern flushed complete 64-bit
-        // words to the final file. finalize() flushes the trailing
-        // partial word, builds + appends the elias_fano over per-
-        // class bit-offsets, then fseeks back to write the now-known
-        // header totals.
-        global_dict.finalize();
     }
 
     build_config m_cfg;

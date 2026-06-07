@@ -5,8 +5,8 @@
 #include <parser.hpp>
 
 #include "builder.hpp"
-#include "kmer.hpp"
-#include "util.hpp"
+#include "phase1_bucket_write/kmer.hpp"
+#include "phase1_bucket_write/util.hpp"
 
 namespace {
 
