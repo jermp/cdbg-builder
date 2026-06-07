@@ -71,8 +71,7 @@ using seconds_timer = essentials::timer<essentials::clock_type, std::chrono::dur
 // "[label] X s" on destruction. The convenience wrapper for bracketing a whole
 // phase/scope (e.g. `timer _("bucket-write");`); it just adds the auto-print on
 // top of seconds_timer, so there is no separate clock.
-class timer {
-public:
+struct timer {
     explicit timer(char const* label) : m_label(label) { m_t.start(); }
     ~timer() {
         m_t.stop();

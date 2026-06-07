@@ -81,8 +81,9 @@ struct builder {
         std::vector<std::string> files;
         {
             std::ifstream in(m_cfg.filenames_list);
-            if (!in)
+            if (!in) {
                 throw std::runtime_error("cannot open filenames list: " + m_cfg.filenames_list);
+            }
             std::string line;
             while (std::getline(in, line)) {
                 if (!line.empty()) files.push_back(line);
