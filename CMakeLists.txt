@@ -11,6 +11,16 @@ endif()
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 
+# k-mer integer width. Default OFF -> uint64_t -> k <= 31 (cheaper 64-bit ops,
+# half the memory in k-mer-keyed structures). ON -> __uint128_t -> k <= 63.
+option(CDBG_LARGE_K "Use 128-bit k-mers to allow k up to 63 (default: 64-bit, k up to 31)" OFF)
+if(CDBG_LARGE_K)
+    add_compile_definitions(CDBG_LARGE_K)
+    message(STATUS "k-mer width: 128-bit (k <= 63)")
+else()
+    message(STATUS "k-mer width: 64-bit (k <= 31); -DCDBG_LARGE_K=ON for k <= 63")
+endif()
+
 if(UNIX AND (CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "x86_64"))
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native -mno-avx512f")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mbmi2 -msse4.2 -mpopcnt")
