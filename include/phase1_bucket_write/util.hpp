@@ -27,12 +27,12 @@ struct build_config {
     std::string out_basename;    // produces <basename>.fa and <basename>.colors
     uint32_t k = 31;
     uint32_t num_threads = 1;
-    uint32_t m = 0;             // minimizer length, 0 = auto (compute_best_m(k))
-    uint32_t bucket_log2 = 0;   // 0 = auto; if set via -b, forces num_buckets = 2^bucket_log2
-    uint32_t num_buckets = 0;   // resolved bucket COUNT (need not be a power of two);
-                                // 0 = auto. Derived in validate_and_resolve_config() from
-                                // the RAM model: B = frac*g / (alpha*T*flush + beta*spill).
-    std::string tmp_dir;        // scratch dir; empty -> mkdtemp under $TMPDIR
+    uint32_t m = 0;            // minimizer length, 0 = auto (compute_best_m(k))
+    uint32_t bucket_log2 = 0;  // 0 = auto; if set via -b, forces num_buckets = 2^bucket_log2
+    uint32_t num_buckets = 0;  // resolved bucket COUNT (need not be a power of two);
+                               // 0 = auto. Derived in validate_and_resolve_config() from
+                               // the RAM model: B = frac*g / (alpha*T*flush + beta*spill).
+    std::string tmp_dir;       // scratch dir; empty -> mkdtemp under $TMPDIR
     // RAM-model overhead multipliers (nominal payload -> resident RSS), exposed
     // as knobs so they can be re-calibrated per machine/allocator without code
     // surgery (see builder.hpp for the derivation):
@@ -139,7 +139,10 @@ inline std::string format_bytes(uint64_t b) {
 inline int byte_unit_index(uint64_t b) {
     int u = 0;
     double v = (double)b;
-    while (v >= 1024.0 && u + 1 < 5) { v /= 1024.0; ++u; }
+    while (v >= 1024.0 && u + 1 < 5) {
+        v /= 1024.0;
+        ++u;
+    }
     return u;
 }
 
@@ -263,8 +266,8 @@ public:
         ctx_switch_counts csw = process_ctx_switches();
         uint64_t vol = csw.voluntary - m_csw_baseline.voluntary;
         uint64_t invol = csw.involuntary - m_csw_baseline.involuntary;
-        std::cout << "  [" << m_label << " ctx-switch] voluntary " << vol
-                  << "  involuntary " << invol << "\n";
+        std::cout << "  [" << m_label << " ctx-switch] voluntary " << vol << "  involuntary "
+                  << invol << "\n";
     }
 
 private:
@@ -295,9 +298,8 @@ public:
     // alongside a byte-based bar) -- so a bar driven by work still shows the
     // item count and the user can't mistake "50% of files" for "50% done".
     progress(std::string label, std::atomic<uint64_t>& counter, uint64_t total,
-             bool render_bytes = false,
-             std::atomic<uint64_t> const* secondary = nullptr, uint64_t secondary_total = 0,
-             std::string secondary_label = "",
+             bool render_bytes = false, std::atomic<uint64_t> const* secondary = nullptr,
+             uint64_t secondary_total = 0, std::string secondary_label = "",
              std::ostream& os = std::cerr,
              std::chrono::milliseconds interval = std::chrono::milliseconds(500))
         : m_label(std::move(label))
@@ -350,10 +352,9 @@ private:
         // in the total Y's unit and right-justified to Y's width (X <= Y, same
         // unit => X is never wider, so it already has as many columns as Y).
         // Percentages use a fixed %5.1f field too.
-        std::string totstr =
-            m_render_bytes ? format_bytes(m_total) : std::to_string(m_total);
-        std::string valstr = m_render_bytes ? format_bytes_in(done, byte_unit_index(m_total))
-                                            : std::to_string(done);
+        std::string totstr = m_render_bytes ? format_bytes(m_total) : std::to_string(m_total);
+        std::string valstr =
+            m_render_bytes ? format_bytes_in(done, byte_unit_index(m_total)) : std::to_string(done);
         int hw = m_total ? (int)totstr.size() : (int)valstr.size();
 
         char buf[320];
@@ -479,8 +480,7 @@ struct bucket_write_prof {
             "    spill      %6.2fs   (sort+unique + write_super_kmer + gzwrite)\n"
             "  counts: files=%llu records=%llu flushes=%llu spills=%llu inserts=%llu\n",
             s(ns_seq_read), s_compute, s(ns_scan2bit), s(ns_flush), s(ns_lock_wait), s(ns_hashmap),
-            s(ns_spill),
-            (unsigned long long)load(n_files), (unsigned long long)load(n_records),
+            s(ns_spill), (unsigned long long)load(n_files), (unsigned long long)load(n_records),
             (unsigned long long)load(n_flushes), (unsigned long long)load(n_spills),
             (unsigned long long)load(n_inserts));
     }
@@ -535,10 +535,10 @@ struct bucket_process_prof {
 
     // ---- counters ----
     std::atomic<uint64_t> n_buckets{0};
-    std::atomic<uint64_t> n_records{0};       // total super-k-mer records read
-    std::atomic<uint64_t> n_kmers{0};         // total k-mers rolled (sum of bases.size()-k+1)
-    std::atomic<uint64_t> n_local_classes{0}; // sum of local_dict.size() across buckets
-    std::atomic<uint64_t> n_unitigs{0};       // total bucket_unitigs emitted
+    std::atomic<uint64_t> n_records{0};        // total super-k-mer records read
+    std::atomic<uint64_t> n_kmers{0};          // total k-mers rolled (sum of bases.size()-k+1)
+    std::atomic<uint64_t> n_local_classes{0};  // sum of local_dict.size() across buckets
+    std::atomic<uint64_t> n_unitigs{0};        // total bucket_unitigs emitted
 
     static inline uint64_t since(clock::time_point t0) {
         return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - t0)
@@ -565,10 +565,9 @@ struct bucket_process_prof {
             "  merge       %7.2fs   (global_dict.intern_with_hashes under global_mu)\n"
             "  counts: buckets=%llu records=%llu kmers=%llu local_classes=%llu unitigs=%llu\n",
             s(ns_load), s(ns_resolve), s(ns_walk), s(ns_pre_decode), s(ns_pre_hash),
-            s(ns_merge_lock_wait), s(ns_merge),
-            (unsigned long long)load_a(n_buckets), (unsigned long long)load_a(n_records),
-            (unsigned long long)load_a(n_kmers), (unsigned long long)load_a(n_local_classes),
-            (unsigned long long)load_a(n_unitigs));
+            s(ns_merge_lock_wait), s(ns_merge), (unsigned long long)load_a(n_buckets),
+            (unsigned long long)load_a(n_records), (unsigned long long)load_a(n_kmers),
+            (unsigned long long)load_a(n_local_classes), (unsigned long long)load_a(n_unitigs));
     }
 };
 

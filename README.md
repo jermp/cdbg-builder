@@ -65,13 +65,29 @@ Options:
 | `-b INT`     | log2 of the bucket count (`2^N` bucket files on disk)             | auto (derived from `-g` if set, else 10) |
 | `-d PATH`    | Scratch directory for the bucket files (created if missing; if it already exists it must be empty; removed on success) | mkdtemp |
 | `-g FLOAT`   | Soft RAM budget in GiB. Tunes bucket count + spill thresholds and arms a runtime RSS watcher; peak is reported at the end (not a hard cap) | unset |
+| `--alpha FLOAT` | RAM-model per-thread buffer overhead multiplier (re-calibrates the bucket-count model) | 2.0 |
+| `--beta FLOAT`  | RAM-model per-bucket compactor overhead multiplier (re-calibrates the bucket-count model) | 7.0 |
+| `--flush INT`   | Per-thread→compactor handoff size in bytes (smaller → more, smaller buckets) | 4096 |
+| `--spill INT`   | Compactor dedup window in bytes before a disk frame (smaller → more buckets, weaker dedup) | 65536 |
 | `--verbose`  | Verbose output                                                    | off     |
 
-The build pipeline is GGCAT-style: stream input → write super-k-mers
-into per-minimizer bucket files on disk → walk each bucket independently
-→ stitch fragments across buckets via shared (k-1)-mer junctions. RAM
-usage stays bounded by the largest single bucket rather than the full
-k-mer set.
+The build runs as four sequential, GGCAT-style phases (see `algorithm.md`
+for details), each communicating with the next only through on-disk
+artifacts:
+
+1. **bucket-write** — stream input, write super-k-mers into per-minimizer
+   bucket files on disk (minimizer over (k−1)-mers, so every dBG edge/branch
+   co-locates in one bucket).
+2. **bucket-process** — walk each bucket independently into open-ended
+   fragments and intern the global color sets.
+3. **stitch** — join fragments across buckets by matching their shared
+   **full boundary k-mer** (id-only doubling, then a single base/color
+   assembly pass).
+4. **emit** — write `.fa` + `.u2c` and finalize `.color_sets`.
+
+When `-g` is set, every phase sizes itself against that budget (and the
+phases that can, spill to disk), so peak RAM stays within the budget
+rather than scaling with the full k-mer set.
 
 ## Example: *Salmonella enterica* pangenome (4,546 genomes)
 

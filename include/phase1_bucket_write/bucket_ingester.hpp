@@ -19,11 +19,11 @@
 #include <thread>
 #include <vector>
 
-#include "bucket_io.hpp"
-#include "kmer.hpp"
-#include "minimizer.hpp"
-#include "seq_reader.hpp"
-#include "super_kmer.hpp"
+#include "phase1_bucket_write/bucket_io.hpp"
+#include "phase1_bucket_write/kmer.hpp"
+#include "phase1_bucket_write/minimizer.hpp"
+#include "phase1_bucket_write/seq_reader.hpp"
+#include "phase1_bucket_write/super_kmer.hpp"
 
 namespace cdbg {
 

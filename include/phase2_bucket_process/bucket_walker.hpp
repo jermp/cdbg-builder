@@ -28,12 +28,12 @@
 
 #include <unordered_dense/unordered_dense.h>
 
-#include "bucket_io.hpp"
-#include "compact_color_set_dict.hpp"
-#include "kmer.hpp"
-#include "streaming_color_set_dict.hpp"
-#include "super_kmer.hpp"
-#include "util.hpp"
+#include "phase1_bucket_write/bucket_io.hpp"
+#include "phase2_bucket_process/compact_color_set_dict.hpp"
+#include "phase1_bucket_write/kmer.hpp"
+#include "phase2_bucket_process/streaming_color_set_dict.hpp"
+#include "phase1_bucket_write/super_kmer.hpp"
+#include "phase1_bucket_write/util.hpp"
 
 namespace cdbg {
 
@@ -215,7 +215,8 @@ inline void load_bucket(std::string const& path, uint32_t k, bucket_kmer_map& ou
 
             uint8_t contrib = 0;
             if (!begin_incl && idx == 0) contrib |= is_fwd ? KMER_BOUND_LEFT : KMER_BOUND_RIGHT;
-            if (!end_incl && idx == last_idx) contrib |= is_fwd ? KMER_BOUND_RIGHT : KMER_BOUND_LEFT;
+            if (!end_incl && idx == last_idx)
+                contrib |= is_fwd ? KMER_BOUND_RIGHT : KMER_BOUND_LEFT;
 
             bucket_kmer_info& info = out[can];
             info.flags |= contrib;
@@ -299,8 +300,8 @@ inline b_step bstep(kmer_int_t can, bool rc, uint32_t k, uint8_t nt) {
 // has exactly one present neighbor facing back toward us (ocount==1, no incoming
 // branch). Returns false (no extension) otherwise. Boundary flags are NOT
 // consulted here -- the caller stops at a contig-break k-mer after stepping.
-inline bool walk_step(kmer_int_t can, bool rc, bool forward, uint32_t k,
-                      bucket_kmer_map const& m, b_step& out) {
+inline bool walk_step(kmer_int_t can, bool rc, bool forward, uint32_t k, bucket_kmer_map const& m,
+                      b_step& out) {
     uint8_t mask = local_ext_mask(can, k, m);
     uint8_t nib = forward ? fwd_nibble(mask, rc) : back_nibble(mask, rc);
     if (__builtin_popcount(nib) != 1) return false;
@@ -398,9 +399,8 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
                                               at_scratch.end());
                     }
                     std::sort(merged_scratch.begin(), merged_scratch.end());
-                    merged_scratch.erase(
-                        std::unique(merged_scratch.begin(), merged_scratch.end()),
-                        merged_scratch.end());
+                    merged_scratch.erase(std::unique(merged_scratch.begin(), merged_scratch.end()),
+                                         merged_scratch.end());
                     cid = out_local_dict.intern(merged_scratch);
                 }
             }
@@ -408,8 +408,7 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
             // Drop per-k-mer rsid storage immediately; phantom bits stay.
             e = kmer_entry{};
         }
-        prof.ns_resolve.fetch_add(bucket_process_prof::since(t_resolve),
-                                  std::memory_order_relaxed);
+        prof.ns_resolve.fetch_add(bucket_process_prof::since(t_resolve), std::memory_order_relaxed);
     }
 
     auto t_walk = bucket_process_prof::clock::now();
@@ -548,8 +547,7 @@ inline void process_bucket(std::string const& path, uint32_t k, uint32_t num_col
     }
     prof.ns_walk.fetch_add(bucket_process_prof::since(t_walk), std::memory_order_relaxed);
     prof.n_unitigs.fetch_add((uint64_t)out_local.size(), std::memory_order_relaxed);
-    prof.n_local_classes.fetch_add((uint64_t)out_local_dict.size(),
-                                   std::memory_order_relaxed);
+    prof.n_local_classes.fetch_add((uint64_t)out_local_dict.size(), std::memory_order_relaxed);
 }
 
 }  // namespace detail
@@ -591,8 +589,7 @@ template <typename Sink>
 inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t num_colors,
                             uint32_t num_threads, Sink&& sink,
                             streaming_color_set_dict& global_dict, std::mutex& global_mu,
-                            std::atomic<uint64_t>* done = nullptr,
-                            uint64_t mem_budget_bytes = 0) {
+                            std::atomic<uint64_t>* done = nullptr, uint64_t mem_budget_bytes = 0) {
     if (num_threads == 0) num_threads = 1;
     // global_dict is now internally sharded/thread-safe, so the caller's
     // global_mu is no longer used to guard the merge. Kept in the signature
@@ -647,8 +644,7 @@ inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t nu
                     // live color dict (read lock-free; m_classes.size() is a
                     // monotone gauge, a benign approximate race).
                     const uint64_t dyn = mem_carry + global_dict.resident_bytes();
-                    const uint64_t avail =
-                        mem_budget_bytes > dyn ? mem_budget_bytes - dyn : 0;
+                    const uint64_t avail = mem_budget_bytes > dyn ? mem_budget_bytes - dyn : 0;
                     return mem_in_use + cost <= avail;
                 });
                 mem_in_use += cost;
@@ -695,25 +691,24 @@ inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t nu
             std::vector<prepared_class> batch(MERGE_BATCH);
             std::vector<uint64_t> local_to_global(local_dict.size());
 
-            for (uint32_t lc_start = 0; lc_start < local_dict.size();
-                 lc_start += MERGE_BATCH) {
-                uint32_t batch_n = (uint32_t)std::min<size_t>(
-                    MERGE_BATCH, (size_t)local_dict.size() - lc_start);
+            for (uint32_t lc_start = 0; lc_start < local_dict.size(); lc_start += MERGE_BATCH) {
+                uint32_t batch_n =
+                    (uint32_t)std::min<size_t>(MERGE_BATCH, (size_t)local_dict.size() - lc_start);
 
                 // Lock-free phase: decode + hash.
                 auto t_dec = bucket_process_prof::clock::now();
                 for (uint32_t i = 0; i < batch_n; ++i) {
                     local_dict.at(lc_start + i, batch[i].colors);
                 }
-                process_prof().ns_pre_decode.fetch_add(
-                    bucket_process_prof::since(t_dec), std::memory_order_relaxed);
+                process_prof().ns_pre_decode.fetch_add(bucket_process_prof::since(t_dec),
+                                                       std::memory_order_relaxed);
 
                 auto t_hash = bucket_process_prof::clock::now();
                 for (uint32_t i = 0; i < batch_n; ++i) {
                     batch[i].h = streaming_color_set_dict::compute_hashes(batch[i].colors);
                 }
-                process_prof().ns_pre_hash.fetch_add(
-                    bucket_process_prof::since(t_hash), std::memory_order_relaxed);
+                process_prof().ns_pre_hash.fetch_add(bucket_process_prof::since(t_hash),
+                                                     std::memory_order_relaxed);
 
                 // Intern phase: intern_with_hashes is internally sharded and
                 // thread-safe -- per-shard dedup locks for the common
@@ -724,17 +719,19 @@ inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t nu
                 // mutex (this was ~14s of merge_wait / phase on bw20k).
                 auto t_merge = bucket_process_prof::clock::now();
                 for (uint32_t i = 0; i < batch_n; ++i) {
-                    local_to_global[lc_start + i] = global_dict.intern_with_hashes(
-                        std::move(batch[i].colors), batch[i].h);
+                    local_to_global[lc_start + i] =
+                        global_dict.intern_with_hashes(std::move(batch[i].colors), batch[i].h);
                 }
                 process_prof().ns_merge.fetch_add(bucket_process_prof::since(t_merge),
                                                   std::memory_order_relaxed);
             }
-            for (auto& u : bucket_unitigs) {
+            for (auto& u : bucket_unitigs)
                 for (auto& r : u.runs)
                     if (r.cid != COLOR_RUN_FOREIGN) r.cid = local_to_global[r.cid];
-                sink(std::move(u));
-            }
+            // One lock acquisition for the whole bucket (see write_batch): the
+            // per-fragment sink call was the bucket-process lock-contention /
+            // voluntary-context-switch hot spot.
+            sink.write_batch(bucket_unitigs);
             // Release this bucket's memory admission: kmer_info + local_dict +
             // bucket_unitigs for bucket b are done (kmer_info/local_dict freed
             // inside process_bucket and at scope end; bucket_unitigs just
