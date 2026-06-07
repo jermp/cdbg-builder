@@ -15,7 +15,9 @@ bool parse_args(int argc, char** argv, cdbg::build_config& cfg) {
     parser.add("filenames_list",
                "Text file with one input path per line. The file at line i has color i.", "-i",
                true);
-    parser.add("out_basename", "Output basename. Produces <basename>.fa and <basename>.colors.",
+    parser.add("out_basename",
+               "Output basename. Produces <basename>.fa, <basename>.u2c, and "
+               "<basename>.color_sets.",
                "-o", true);
     parser.add("k", "K-mer length (must be <= " + std::to_string(cdbg::MAX_K) + ").", "-k", true);
     parser.add("num_threads", "Number of worker threads (default 1).", "-t", false);
