@@ -158,15 +158,19 @@ using bucket_kmer_map = ankerl::unordered_dense::map<kmer_int_t, bucket_kmer_inf
 // themselves. See the kmer_entry comment for the memory rationale.
 inline void load_bucket(std::string const& path, uint32_t k, bucket_kmer_map& out,
                         compact_color_set_dict& record_sets) {
-    auto& prof = process_prof();
     bucket_reader reader(path);
     uint8_t flags = 0;
     std::vector<uint32_t> colors;
     std::vector<uint8_t> bases;
+    // Accumulate the profiling counts locally and publish them to the shared
+    // process_prof() atomics ONCE at the end of the bucket -- a per-record
+    // fetch_add on a global atomic would be 32-thread cache-line contention
+    // across hundreds of millions of records.
+    uint64_t loaded_records = 0, loaded_kmers = 0;
     while (reader.next(flags, colors, bases)) {
-        prof.n_records.fetch_add(1, std::memory_order_relaxed);
+        ++loaded_records;
         if (bases.size() < k) continue;
-        prof.n_kmers.fetch_add((uint64_t)(bases.size() - (k - 1)), std::memory_order_relaxed);
+        loaded_kmers += bases.size() - (k - 1);
 
         // Intern the record's already-sorted-deduped color list. Move
         // into the dict on a miss; on a hit it's just a heterogeneous
@@ -238,6 +242,9 @@ inline void load_bucket(std::string const& path, uint32_t k, bucket_kmer_map& ou
             }
         }
     }
+    auto& prof = process_prof();
+    prof.n_records.fetch_add(loaded_records, std::memory_order_relaxed);
+    prof.n_kmers.fetch_add(loaded_kmers, std::memory_order_relaxed);
 }
 
 // 8-bit local extension mask, bits 0..3 = forward-side successors of `can`,

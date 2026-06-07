@@ -127,6 +127,7 @@ public:
         std::lock_guard<std::mutex> lk(m_mu);
         prof.ns_lock_wait.fetch_add(bucket_write_prof::since(t_lock), std::memory_order_relaxed);
         auto t_map = bucket_write_prof::clock::now();
+        uint64_t inserts = 0;  // accumulate locally; one atomic add per batch (below)
         for (auto const& r : recs) {
             std::string_view key((char const*)bases_storage.data() + r.bases_off, r.bases_len);
             // Heterogeneous lookup with a precomputed hash. Our
@@ -145,7 +146,7 @@ public:
                 e.colors.push_back(r.color);
                 m_bytes += key.size() + sizeof(uint32_t);
                 m_dedup.emplace(std::string(key), std::move(e));
-                prof.n_inserts.fetch_add(1, std::memory_order_relaxed);
+                ++inserts;
             } else {
                 entry& e = it->second;
                 e.flags &= r.flags;  // AND across contributors
@@ -159,6 +160,7 @@ public:
         }
         prof.ns_hashmap.fetch_add(bucket_write_prof::since(t_map), std::memory_order_relaxed);
         prof.n_records.fetch_add(recs.size(), std::memory_order_relaxed);
+        prof.n_inserts.fetch_add(inserts, std::memory_order_relaxed);
         // Spill at the configured threshold only -- don't shred dedup
         // state by spilling on every batch under pressure. The
         // bucket_writer's RSS watcher provides backpressure
