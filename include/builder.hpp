@@ -62,7 +62,7 @@
 #include "phase2_bucket_process/streaming_color_set_dict.hpp"
 #include "phase2_bucket_process/unitig_spill.hpp"
 #include "phase4_emit/emit.hpp"
-#include "phase1_bucket_write/util.hpp"
+#include "util.hpp"
 
 namespace cdbg {
 
@@ -106,7 +106,7 @@ struct builder {
         }
         std::cout << "\n";
 
-        essentials::timer<essentials::clock_type, std::chrono::duration<double>> build_timer;
+        seconds_timer build_timer;
         build_timer.start();
 
         std::string const tmp_dir = resolve_tmp_dir();
@@ -134,7 +134,7 @@ struct builder {
         if (m_cfg.max_ram_gb > 0) {
             uint64_t budget_bytes = m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0;
             uint64_t high_threshold_bytes = 0.60 * budget_bytes;
-            uint64_t low_threshold_bytes = 0.45 * (double)budget_bytes;
+            uint64_t low_threshold_bytes = 0.45 * budget_bytes;
             writer->start_rss_watcher(high_threshold_bytes, low_threshold_bytes);
         }
 

@@ -18,6 +18,8 @@
 #include <thread>
 #include <unistd.h>
 
+#include <essentials.hpp>
+
 namespace cdbg {
 
 // ---- build configuration ----------------------------------------------------
@@ -78,6 +80,12 @@ private:
     std::chrono::steady_clock::time_point m_t0;
 };
 
+// Wall-clock stopwatch reporting elapsed time in SECONDS (as a double), shared
+// across the codebase for ad-hoc measurements. essentials::timer parameterized
+// with a seconds duration, so elapsed() needs no unit conversion: start(),
+// stop(), then elapsed() returns seconds.
+using seconds_timer = essentials::timer<essentials::clock_type, std::chrono::duration<double>>;
+
 // ---- process-memory query ---------------------------------------------------
 //
 // Peak resident set size in bytes via getrusage(RUSAGE_SELF) — POSIX,
@@ -121,9 +129,9 @@ inline ctx_switch_counts process_ctx_switches() {
 // unit at which the number is >= 1.
 inline std::string format_bytes(uint64_t b) {
     static char const* units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
-    double v = (double)b;
+    double v = b;
     int u = 0;
-    while (v >= 1024.0 && u + 1 < (int)(sizeof(units) / sizeof(units[0]))) {
+    while (v >= 1024.0 and u + 1 < (int)(sizeof(units) / sizeof(units[0]))) {
         v /= 1024.0;
         ++u;
     }
@@ -138,8 +146,8 @@ inline std::string format_bytes(uint64_t b) {
 // The unit index format_bytes() would pick for `b` (0=B,1=KiB,2=MiB,...).
 inline int byte_unit_index(uint64_t b) {
     int u = 0;
-    double v = (double)b;
-    while (v >= 1024.0 && u + 1 < 5) {
+    double v = b;
+    while (v >= 1024.0 and u + 1 < 5) {
         v /= 1024.0;
         ++u;
     }
@@ -155,7 +163,7 @@ inline std::string format_bytes_in(uint64_t b, int u) {
     if (u <= 0) {
         std::snprintf(buf, sizeof(buf), "%llu B", (unsigned long long)b);
     } else {
-        double v = (double)b;
+        double v = b;
         for (int i = 0; i < u; ++i) v /= 1024.0;
         std::snprintf(buf, sizeof(buf), "%.2f %s", v, units[u]);
     }
@@ -190,7 +198,7 @@ inline uint64_t current_rss_bytes() {
     char const* p = std::strstr(buf, "VmRSS:");
     if (!p) return 0;
     p += 6;
-    while (*p == ' ' || *p == '\t') ++p;
+    while (*p == ' ' or *p == '\t') ++p;
     char* end = nullptr;
     unsigned long kb = std::strtoul(p, &end, 10);
     if (end == p) return 0;
@@ -255,7 +263,7 @@ public:
         // hits the high-water mark vs a transient that VmHWM carried forward:
         // if exit_live << peak, the peak was a transient (e.g. a prior phase),
         // not this phase's steady working set.
-        if (m_entry_live > 0 || exit_live > 0)
+        if (m_entry_live > 0 or exit_live > 0)
             std::cout << " [live in " << format_bytes(m_entry_live) << " -> out "
                       << format_bytes(exit_live) << "]";
         std::cout << "\n";
@@ -363,18 +371,18 @@ private:
         char totbuf[64] = "";
         char pctbuf[24] = "";
         if (m_total) {
-            double pct = 100.0 * (double)done / (double)m_total;
+            double pct = 100.0 * done / m_total;
             std::snprintf(totbuf, sizeof(totbuf), "/%s", totstr.c_str());
             std::snprintf(pctbuf, sizeof(pctbuf), " (%5.1f%%)", pct);
         }
         char secbuf[160] = "";
         if (m_secondary) {
             uint64_t s = m_secondary->load(std::memory_order_relaxed);
-            if (final && m_secondary_total) s = m_secondary_total;
+            if (final and m_secondary_total) s = m_secondary_total;
             // Show the secondary's own % too: a bytes-% well below the
             // files-% (or vice versa) is exactly the non-uniform-input signal
             // -- e.g. "files 50% but bytes 30%" => the big files cluster late.
-            double spct = m_secondary_total ? 100.0 * (double)s / (double)m_secondary_total : 0.0;
+            double spct = m_secondary_total ? 100.0 * s / m_secondary_total : 0.0;
             std::string stot = std::to_string(m_secondary_total);
             std::snprintf(secbuf, sizeof(secbuf), " | %s %*llu/%s (%5.1f%%)",
                           m_secondary_label.c_str(), (int)stot.size(), (unsigned long long)s,
@@ -388,7 +396,7 @@ private:
             if (final) m_os << '\n';
         } else {
             // Skip mid-flight prints if nothing changed since last line.
-            if (!final && done == m_last_done) return;
+            if (!final and done == m_last_done) return;
             m_last_done = done;
             m_os << buf << '\n';
         }
@@ -462,12 +470,11 @@ struct bucket_write_prof {
         auto load = [](std::atomic<uint64_t> const& a) {
             return a.load(std::memory_order_relaxed);
         };
-        double per_thread = num_threads > 0 ? (double)num_threads : 1.0;
-        auto s = [&](std::atomic<uint64_t> const& a) { return (double)load(a) / 1e9 / per_thread; };
+        double per_thread = num_threads > 0 ? num_threads : 1.0;
+        auto s = [&](std::atomic<uint64_t> const& a) { return load(a) / 1e9 / per_thread; };
         uint64_t loop_body = load(ns_loop_body);
         uint64_t flush = load(ns_flush);
-        double s_compute =
-            (loop_body > flush ? (double)(loop_body - flush) : 0.0) / 1e9 / per_thread;
+        double s_compute = (loop_body > flush ? (loop_body - flush) : 0.0) / 1e9 / per_thread;
         std::fprintf(
             stderr,
             "[bucket-write profile] (per-thread time, ns/threads -> wall-equiv):\n"
@@ -549,10 +556,8 @@ struct bucket_process_prof {
         auto load_a = [](std::atomic<uint64_t> const& a) {
             return a.load(std::memory_order_relaxed);
         };
-        double per_thread = num_threads > 0 ? (double)num_threads : 1.0;
-        auto s = [&](std::atomic<uint64_t> const& a) {
-            return (double)load_a(a) / 1e9 / per_thread;
-        };
+        double per_thread = num_threads > 0 ? num_threads : 1.0;
+        auto s = [&](std::atomic<uint64_t> const& a) { return load_a(a) / 1e9 / per_thread; };
         std::fprintf(
             stderr,
             "[bucket-process profile] (per-thread time, ns/threads -> wall-equiv):\n"

@@ -35,10 +35,10 @@
 #include <lz4.h>
 #include <unordered_dense/unordered_dense.h>
 
-#include "phase1_bucket_write/kmer.hpp"           // kmer_int_t, reverse_complement, kmer_hasher, nuc_to_2bit
-#include "phase3_stitch/stitch.hpp"         // SIDE_*, UNITIG_OPEN_*, revcomp_string
+#include "kmer.hpp"                  // kmer_int_t, reverse_complement, kmer_hasher, nuc_to_2bit
+#include "phase3_stitch/stitch.hpp"  // SIDE_*, UNITIG_OPEN_*, revcomp_string
 #include "phase3_stitch/stitch_extmem.hpp"  // ext_mix_bit/ext_rng_next/ext_pair_compatible/ext_end,
-                              // ext_concat_runs/ext_reverse_runs/ext_split_monochromatic
+// ext_concat_runs/ext_reverse_runs/ext_split_monochromatic
 
 namespace cdbg {
 namespace detail {
@@ -111,7 +111,7 @@ inline kmer_int_t id_canon(kmer_int_t kf, uint32_t k, bool& fwd) {
 inline bool id_choose_side(uint8_t open_flags, uint64_t rng, uint8_t& side) {
     bool l = (open_flags & UNITIG_OPEN_LEFT) != 0;
     bool r = (open_flags & UNITIG_OPEN_RIGHT) != 0;
-    if (l && r) {
+    if (l and r) {
         side = ext_mix_bit(rng) ? SIDE_RIGHT : SIDE_LEFT;
         return true;
     }
@@ -326,7 +326,7 @@ public:
             raw.resize(base + u);
             int decoded = LZ4_decompress_safe((char const*)comp.data(), (char*)raw.data() + base,
                                               (int)c, (int)u);
-            if (decoded < 0 || (uint32_t)decoded != u)
+            if (decoded < 0 or (uint32_t) decoded != u)
                 throw std::runtime_error("id-stitch round bucket LZ4 decode failed: " + path);
         }
         std::fclose(f);
@@ -381,7 +381,7 @@ private:
         if (comp <= 0) throw std::runtime_error("id-stitch LZ4 compress failed");
         uint32_t u = (uint32_t)src, c = (uint32_t)comp;
         std::FILE* f = m_files[b];
-        if (std::fwrite(&u, sizeof(u), 1, f) != 1 || std::fwrite(&c, sizeof(c), 1, f) != 1 ||
+        if (std::fwrite(&u, sizeof(u), 1, f) != 1 or std::fwrite(&c, sizeof(c), 1, f) != 1 or
             std::fwrite(scratch.data(), 1, (size_t)comp, f) != (size_t)comp)
             throw std::runtime_error("short write to id-stitch round file");
         batch.clear();
@@ -502,7 +502,7 @@ private:
         if (comp <= 0) throw std::runtime_error("id-stitch LZ4 compress failed");
         uint32_t u = (uint32_t)src, c = (uint32_t)comp;
         std::FILE* f = m_spill_out_file[b];
-        if (std::fwrite(&u, sizeof(u), 1, f) != 1 || std::fwrite(&c, sizeof(c), 1, f) != 1 ||
+        if (std::fwrite(&u, sizeof(u), 1, f) != 1 or std::fwrite(&c, sizeof(c), 1, f) != 1 or
             std::fwrite(scratch.data(), 1, (size_t)comp, f) != (size_t)comp)
             throw std::runtime_error("short write to id-stitch spill file");
         if (m_budget) m_budget->sub(batch.size());
@@ -551,7 +551,7 @@ inline void id_seed(Source& frag, uint32_t k, Store& store, ChainSink&& chain_si
     const uint64_t n = (uint64_t)frag.size();
     auto seed_one = [&](uint64_t i) {
         uint8_t of = frag.open_flags(i);
-        if (k < 2 || of == 0) {
+        if (k < 2 or of == 0) {
             chain_sink(id_chain{std::vector<uint64_t>{id_entry(i, false)}, 0});
             return;
         }
@@ -622,7 +622,7 @@ inline void id_seed_links(std::string const& path, uint64_t n_frags, uint32_t k,
                 throw std::runtime_error("short read of links record from " + path);
             }
             const uint8_t of = buf[0];
-            if (k < 2 || of == 0) {
+            if (k < 2 or of == 0) {
                 chain_sink(id_chain{std::vector<uint64_t>{id_entry(i, false)}, 0});
                 continue;
             }
@@ -695,7 +695,7 @@ inline void id_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, ChainS
             }
         }
         for (uint64_t i = 0; i < NT; ++i) {
-            if (consumed[i] || !has_end[i]) continue;
+            if (consumed[i] or !has_end[i]) continue;
             kmer_int_t j = ends[i].junction;
             auto it = waiting.find(j);
             if (it == waiting.end()) {
@@ -725,7 +725,7 @@ inline void id_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, ChainS
                 continue;
             }
             id_tig t = std::move(tigs[i]);
-            bool both = (t.open_flags & UNITIG_OPEN_LEFT) && (t.open_flags & UNITIG_OPEN_RIGHT);
+            bool both = (t.open_flags & UNITIG_OPEN_LEFT) and (t.open_flags & UNITIG_OPEN_RIGHT);
             if (both) ext_rng_next(t.rng);  // re-roll presented end
             id_route(std::move(t), k, store);
         }
@@ -755,7 +755,7 @@ inline void id_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, ChainS
                 for (;;) {
                     {
                         std::unique_lock<std::mutex> lk(pool_mu);
-                        cv_go.wait(lk, [&] { return pool_stop || generation != seen; });
+                        cv_go.wait(lk, [&] { return pool_stop or generation != seen; });
                         if (pool_stop) return;
                         seen = generation;
                     }
@@ -789,7 +789,8 @@ inline void id_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, ChainS
         }
     } guard{pool_mu, cv_go, pool_stop, pool};
 
-    auto t_rounds0 = std::chrono::steady_clock::now();
+    seconds_timer t_rounds0;
+    t_rounds0.start();
     uint32_t rounds_run = 0;
 
     for (uint32_t round_no = 0;; ++round_no) {
@@ -808,7 +809,7 @@ inline void id_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, ChainS
         store.advance();
         ++rounds_run;
         const uint64_t joined = joined_this_round.load(std::memory_order_relaxed);
-        if (joined == 0 || round_no >= MAX_ROUNDS) {
+        if (joined == 0 or round_no >= MAX_ROUNDS) {
             if (round_no >= MAX_ROUNDS)
                 std::cerr << "[id-stitch] WARNING: round cap " << MAX_ROUNDS << " hit\n";
             // No further join is possible: flush every remaining open tig as a
@@ -820,9 +821,8 @@ inline void id_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, ChainS
             break;
         }
     }
-    double secs =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_rounds0).count();
-    std::cout << "  [id-stitch] " << rounds_run << " rounds, " << secs << "s\n";
+    t_rounds0.stop();
+    std::cout << "  [id-stitch] " << rounds_run << " rounds, " << t_rounds0.elapsed() << "s\n";
 }
 
 // Split an assembled tig into monochromatic unitigs. Kept separate so the
@@ -922,7 +922,7 @@ public:
     // batch is flushed first. Call once, after all puts.
     void close() {
         for (uint32_t b = 0; b < m_num_buckets; ++b) {
-            if (!m_budget && !m_batch[b].empty()) flush_frame(b);
+            if (!m_budget and !m_batch[b].empty()) flush_frame(b);
             if (m_files[b]) {
                 uint32_t eof = 0;
                 std::fwrite(&eof, sizeof(eof), 1, m_files[b]);
@@ -965,7 +965,7 @@ private:
         if (comp <= 0) throw std::runtime_error("spill LZ4 compress failed");
         uint32_t u = (uint32_t)src, c = (uint32_t)comp;
         std::FILE* f = m_files[b];
-        if (std::fwrite(&u, sizeof(u), 1, f) != 1 || std::fwrite(&c, sizeof(c), 1, f) != 1 ||
+        if (std::fwrite(&u, sizeof(u), 1, f) != 1 or std::fwrite(&c, sizeof(c), 1, f) != 1 or
             std::fwrite(scratch.data(), 1, (size_t)comp, f) != (size_t)comp)
             throw std::runtime_error("short write to spill file");
         if (m_budget) m_budget->sub(batch.size());
@@ -1001,7 +1001,7 @@ inline std::vector<uint8_t> read_spill_bucket_decoded(std::string const& path) {
         raw.resize(base + u);
         int decoded =
             LZ4_decompress_safe((char const*)comp.data(), (char*)raw.data() + base, (int)c, (int)u);
-        if (decoded < 0 || (uint32_t)decoded != u)
+        if (decoded < 0 or (uint32_t) decoded != u)
             throw std::runtime_error("spill bucket LZ4 decode failed: " + path);
     }
     std::fclose(f);
@@ -1106,17 +1106,18 @@ inline void compact_stitch_inram(Source& frag, uint32_t k, std::string const& tm
         chains.push_back(std::move(c));
     };
 
-    auto t_seed = std::chrono::steady_clock::now();
+    seconds_timer t_seed;
+    t_seed.start();
     id_seed(frag, k, store, chain_sink, num_threads);
-    std::cout << "  [id-stitch] seed "
-              << std::chrono::duration<double>(std::chrono::steady_clock::now() - t_seed).count()
-              << "s\n";
+    t_seed.stop();
+    std::cout << "  [id-stitch] seed " << t_seed.elapsed() << "s\n";
     id_run_rounds(store, k, num_buckets, chain_sink, num_threads);  // prints its own timing
 
     // Assemble: chains are independent, so fan across num_threads, reading each
     // fragment's bases directly from the arena. The sink is not thread-safe, so
     // each worker batches and drains under sink_mu.
-    auto t_a = std::chrono::steady_clock::now();
+    seconds_timer t_a;
+    t_a.start();
     std::mutex sink_mu;
     constexpr size_t SINK_BATCH_BYTES = 2u * 1024 * 1024;
     auto flush_batch = [&](std::vector<stitchable_unitig>& batch) {
@@ -1152,9 +1153,8 @@ inline void compact_stitch_inram(Source& frag, uint32_t k, std::string const& tm
         for (uint32_t t = 0; t < num_threads; ++t) ws.emplace_back(work);
         for (auto& w : ws) w.join();
     }
-    std::cout << "  [id-stitch] assemble "
-              << std::chrono::duration<double>(std::chrono::steady_clock::now() - t_a).count()
-              << "s\n";
+    t_a.stop();
+    std::cout << "  [id-stitch] assemble " << t_a.elapsed() << "s\n";
 }
 // RAM: the only resident structures are one round-store bucket, one frag-id
 // range's member array, and one chain bucket's bases -- so peak RAM is
@@ -1215,7 +1215,8 @@ inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frag
         }
     };
 
-    auto t_seed = std::chrono::steady_clock::now();
+    seconds_timer t_seed;
+    t_seed.start();
     if (!links_path.empty()) {
         // Links-only seed: read ~17 B/fragment from the precomputed links spill
         // instead of streaming every base out of the frag spill. The first of the
@@ -1229,7 +1230,7 @@ inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frag
         std::string seq;
         for_each_frag([&](uint8_t of, std::vector<color_run>& r, std::string& s) {
             (void)r;
-            if (k < 2 || of == 0) {
+            if (k < 2 or of == 0) {
                 chain_sink(id_chain{std::vector<uint64_t>{id_entry(fid, false)}, 0});
             } else {
                 id_tig t;
@@ -1245,9 +1246,8 @@ inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frag
         });
         store.advance();
     }
-    std::cout << "  [id-stitch] seed "
-              << std::chrono::duration<double>(std::chrono::steady_clock::now() - t_seed).count()
-              << "s\n";
+    t_seed.stop();
+    std::cout << "  [id-stitch] seed " << t_seed.elapsed() << "s\n";
     id_run_rounds(store, k, num_buckets, chain_sink, num_threads);
     members.close();
 
@@ -1259,7 +1259,8 @@ inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frag
     // REVERTED -- buffering stole the reader's buffers (forcing ~num_frags
     // reallocations) and, since phase 2 is read-bound here, the parallelism
     // could not pay that back. Peak extra RAM is one frag-id range's member array.
-    auto t_p2 = std::chrono::steady_clock::now();
+    seconds_timer t_p2;
+    t_p2.start();
     frame_spill_writer bases(dir, "idbase_", chain_buckets, &budget);
     {
         struct Slot {
@@ -1321,16 +1322,16 @@ inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frag
         });
     }
     bases.close();
-    std::cout << "  [id-stitch] phase2 (attach+rebucket) "
-              << std::chrono::duration<double>(std::chrono::steady_clock::now() - t_p2).count()
-              << "s\n";
+    t_p2.stop();
+    std::cout << "  [id-stitch] phase2 (attach+rebucket) " << t_p2.elapsed() << "s\n";
 
     // --- phase 3: per chain bucket, group + sort + fold-assemble + split -----
     // Chain buckets are fully independent (a chain lives in exactly one), so the
     // work fans across num_threads. The sink is not thread-safe, so each worker
     // batches its split unitigs and drains them under sink_mu (same scheme as
     // ext_run_rounds). Peak extra RAM is num_threads co-resident chain buckets.
-    auto t_p3 = std::chrono::steady_clock::now();
+    seconds_timer t_p3;
+    t_p3.start();
     struct BaseRec {
         uint32_t pos;
         uint8_t open_flags;
@@ -1417,9 +1418,8 @@ inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frag
         }
         for (auto& w : workers) w.join();
     }
-    std::cout << "  [id-stitch] phase3 (assemble+split) "
-              << std::chrono::duration<double>(std::chrono::steady_clock::now() - t_p3).count()
-              << "s\n";
+    t_p3.stop();
+    std::cout << "  [id-stitch] phase3 (assemble+split) " << t_p3.elapsed() << "s\n";
 }
 
 }  // namespace cdbg

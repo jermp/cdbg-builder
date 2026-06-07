@@ -50,11 +50,15 @@ if(NOT EXISTS ${LIBDEFLATE_DIR}/libdeflate.h)
         "Run: git submodule update --init --recursive")
 endif()
 
+# Our own include/ goes FIRST so a bare "util.hpp" / "kmer.hpp" resolves to
+# ours, not external/bits/include/util.hpp. Safe because every external
+# consumer of bits' "util.hpp" lives inside bits/include/ itself, where the
+# compiler's same-directory rule resolves it before any -I path.
+include_directories(${CMAKE_SOURCE_DIR}/include)
+include_directories(${CMAKE_SOURCE_DIR})
 include_directories(${BITS_INCLUDE_DIR})
 include_directories(${ESSENTIALS_INCLUDE_DIR})
 include_directories(${CMD_LINE_PARSER_INCLUDE_DIR})
-include_directories(${CMAKE_SOURCE_DIR})
-include_directories(${CMAKE_SOURCE_DIR}/include)
 include_directories(${CMAKE_SOURCE_DIR}/external)
 include_directories(${LZ4_DIR})
 
