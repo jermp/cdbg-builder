@@ -67,10 +67,7 @@
 namespace cdbg {
 
 struct builder {
-    // `explicit` so a build_config never implicitly converts to a builder
-    // (e.g. an accidental `builder b = cfg;` or a config passed where a builder
-    // is expected). Construction always takes a config -- a config-less builder
-    // can't do anything, so there is no default constructor.
+    // `explicit` to avoid an implicit build_config -> builder conversion.
     explicit builder(build_config const& cfg) : m_cfg(cfg) {}
 
     // Run the full pipeline. Throws std::runtime_error on bad config or
@@ -109,7 +106,8 @@ struct builder {
         }
         std::cout << "\n";
 
-        essentials::timer_type build_timer;
+        // Seconds (as double) directly, so elapsed() needs no unit conversion.
+        essentials::timer<essentials::clock_type, std::chrono::duration<double>> build_timer;
         build_timer.start();
 
         std::string const tmp_dir = resolve_tmp_dir();
@@ -406,7 +404,7 @@ struct builder {
         std::cout << "done. wrote " << m_cfg.out_basename << ".fa, " << m_cfg.out_basename
                   << ".u2c, and " << m_cfg.out_basename << ".color_sets\n";
         build_timer.stop();
-        std::cout << "[total construction time] " << build_timer.elapsed() / 1000000.0 << " s\n";
+        std::cout << "[total construction time] " << build_timer.elapsed() << " s\n";
     }
 
     // Stats populated by build(); zero before build() runs.
