@@ -950,7 +950,7 @@ working set is small to begin with; the bases are re-read from the frag
 spill once during assembly (§5.3) and held only one chain bucket at a
 time per worker. This hard spill cap replaced the old base-carrying
 stitch, which was sized by model only (no enforcement) and was the
-pipeline RAM peak — 41 GiB on the 661K run; see `todo.md`.
+pipeline RAM peak — 41 GiB on the 661K run.
 
 Emit peak: one cid-range bucket of records loaded for sorting (~3 MB
 on salmonella-25K), plus the u2c bit_vector builder.
