@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-#include "bucket_walker.hpp"  // cdbg::stitchable_unitig, UNITIG_OPEN_*
+#include "phase2_bucket_process/bucket_walker.hpp"  // cdbg::stitchable_unitig, UNITIG_OPEN_*
 
 namespace cdbg_test {
 

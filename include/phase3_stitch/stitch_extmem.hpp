@@ -73,9 +73,9 @@
 #include <lz4.h>
 #include <unordered_dense/unordered_dense.h>
 
-#include "bucket_walker.hpp"  // stitchable_unitig, UNITIG_OPEN_*
-#include "kmer.hpp"
-#include "stitch.hpp"  // detail::side_junction_canonical, SIDE_*, revcomp_string
+#include "phase2_bucket_process/bucket_walker.hpp"  // stitchable_unitig, UNITIG_OPEN_*
+#include "phase1_bucket_write/kmer.hpp"
+#include "phase3_stitch/stitch.hpp"  // detail::side_junction_canonical, SIDE_*, revcomp_string
 
 namespace cdbg {
 

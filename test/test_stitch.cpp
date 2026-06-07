@@ -28,11 +28,11 @@
 #include <filesystem>
 #include <unistd.h>
 
-#include "compact_extmem.hpp"  // GGCAT-style id-only compaction (parallel-stitch)
+#include "phase3_stitch/compact_extmem.hpp"  // GGCAT-style id-only compaction (parallel-stitch)
 #include "gen.hpp"
-#include "stitch.hpp"
-#include "stitch_extmem.hpp"
-#include "unitig_spill.hpp"  // frag_unitig_writer (+ companion links spill) + reader
+#include "phase3_stitch/stitch.hpp"
+#include "phase3_stitch/stitch_extmem.hpp"
+#include "phase2_bucket_process/unitig_spill.hpp"  // frag_unitig_writer (+ companion links spill) + reader
 
 namespace {
 uint64_t g_tmp_counter = 0;

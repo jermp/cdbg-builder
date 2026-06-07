@@ -14,7 +14,7 @@
 #include <cstring>
 #include <vector>
 
-#include "kmer.hpp"
+#include "phase1_bucket_write/kmer.hpp"
 
 namespace cdbg {
 

@@ -28,12 +28,12 @@
 
 #include <unordered_dense/unordered_dense.h>
 
-#include "bucket_io.hpp"
-#include "compact_color_set_dict.hpp"
-#include "kmer.hpp"
-#include "streaming_color_set_dict.hpp"
-#include "super_kmer.hpp"
-#include "util.hpp"
+#include "phase1_bucket_write/bucket_io.hpp"
+#include "phase2_bucket_process/compact_color_set_dict.hpp"
+#include "phase1_bucket_write/kmer.hpp"
+#include "phase2_bucket_process/streaming_color_set_dict.hpp"
+#include "phase1_bucket_write/super_kmer.hpp"
+#include "phase1_bucket_write/util.hpp"
 
 namespace cdbg {
 

@@ -78,8 +78,8 @@
 #include <util.hpp>
 #include <unordered_dense/unordered_dense.h>
 
-#include "hybrid_color_sets.hpp"
-#include "util.hpp"
+#include "phase2_bucket_process/hybrid_color_sets.hpp"
+#include "phase1_bucket_write/util.hpp"
 
 namespace cdbg {
 

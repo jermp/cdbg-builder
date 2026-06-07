@@ -42,7 +42,7 @@
 #include <integer_codes.hpp>
 #include <unordered_dense/unordered_dense.h>
 
-#include "hybrid_color_sets.hpp"
+#include "phase2_bucket_process/hybrid_color_sets.hpp"
 
 namespace cdbg {
 

@@ -35,9 +35,9 @@
 #include <lz4.h>
 #include <unordered_dense/unordered_dense.h>
 
-#include "kmer.hpp"           // kmer_int_t, reverse_complement, kmer_hasher, nuc_to_2bit
-#include "stitch.hpp"         // SIDE_*, UNITIG_OPEN_*, revcomp_string
-#include "stitch_extmem.hpp"  // ext_mix_bit/ext_rng_next/ext_pair_compatible/ext_end,
+#include "phase1_bucket_write/kmer.hpp"           // kmer_int_t, reverse_complement, kmer_hasher, nuc_to_2bit
+#include "phase3_stitch/stitch.hpp"         // SIDE_*, UNITIG_OPEN_*, revcomp_string
+#include "phase3_stitch/stitch_extmem.hpp"  // ext_mix_bit/ext_rng_next/ext_pair_compatible/ext_end,
                               // ext_concat_runs/ext_reverse_runs/ext_split_monochromatic
 
 namespace cdbg {

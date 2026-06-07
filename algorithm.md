@@ -74,7 +74,7 @@ streaming color dict, noted below). This is what lets a phase be
 optimized, or even swapped, in isolation: as long as it honors the
 artifact contract, the rest of the pipeline is unaffected.
 
-**Phase 1 — bucket-write** (`bucket_io.hpp`, `bucket_ingester.hpp`)
+**Phase 1 — bucket-write** (`include/phase1_bucket_write/`)
 
 - *Reads:* the `N` input gzip-FASTA files (one **color** per file).
 - *Produces:* `tmp/bucket_<b>.bin`, `b ∈ [0, B)` — one LZ4-framed file per
@@ -86,7 +86,7 @@ artifact contract, the rest of the pipeline is unaffected.
   **independent dBG sub-problem** — phase 2 can process buckets in any
   order, in parallel, with no cross-bucket coordination.
 
-**Phase 2 — bucket-process** (`bucket_walker.hpp`)
+**Phase 2 — bucket-process** (`include/phase2_bucket_process/`)
 
 - *Reads:* the `B` `tmp/bucket_<b>.bin` files (one bucket per worker).
 - *Produces three artifacts:*
@@ -107,7 +107,7 @@ artifact contract, the rest of the pipeline is unaffected.
   phase 3 only has to match boundary k-mers — and global cids decouple the
   (large) color storage from the (small) topology that still needs joining.
 
-**Phase 3 — stitch** (`compact_extmem.hpp`)
+**Phase 3 — stitch** (`include/phase3_stitch/`)
 
 - *Reads:* `tmp/frag_unitigs.bin.links` (to seed) and `tmp/frag_unitigs.bin`
   (streamed once, to attach bases+colors during assembly).
@@ -124,7 +124,7 @@ artifact contract, the rest of the pipeline is unaffected.
   emit in strict cid order by walking buckets `0..K-1` (sorting only within
   a bucket), with no global sort over all unitigs.
 
-**Phase 4 — emit** (`builder.hpp`, `unitig_spill.hpp`)
+**Phase 4 — emit** (`include/phase4_emit/emit.hpp`, driven by `builder.hpp`)
 
 - *Reads:* `tmp/unitig_bucket_<k>.bin` (cid order) **and** `<out>.color_sets`
   (to finalize it).
@@ -138,7 +138,7 @@ end of `build()`; only the three `<out>.*` files persist.
 
 ---
 
-## 3. Phase 1: bucket-write (`include/bucket_io.hpp`, `bucket_ingester.hpp`)
+## 3. Phase 1: bucket-write (`include/phase1_bucket_write/`)
 
 ### 3.1 Goal
 
@@ -392,7 +392,7 @@ bases). See `super_kmer.hpp`.
 
 ---
 
-## 4. Phase 2: bucket-process (`include/bucket_walker.hpp`)
+## 4. Phase 2: bucket-process (`include/phase2_bucket_process/`)
 
 ### 4.1 Goal
 
@@ -629,7 +629,7 @@ bucket-write (§3.8) previews how many buckets will fit at once.
 
 ---
 
-## 5. Phase 3: stitch (`include/compact_extmem.hpp`)
+## 5. Phase 3: stitch (`include/phase3_stitch/`)
 
 External-memory, GGCAT-faithful hash-bucketed iterative join
 (`extend_unitigs.rs`), in an **id-only compaction** form: the doubling
@@ -736,7 +736,7 @@ production path against — both must produce the identical unitig multiset.
 
 ---
 
-## 6. Phase 4: emit (`include/builder.hpp`, `include/unitig_spill.hpp`)
+## 6. Phase 4: emit (`include/phase4_emit/emit.hpp`)
 
 ### 6.1 Cid-range unitig spill (already done by stitch)
 
@@ -810,7 +810,7 @@ fixed-size header at the front is updated via `fseek`.
 
 ---
 
-## 7. Hybrid color-set encoding (`include/hybrid_color_sets.hpp`)
+## 7. Hybrid color-set encoding (`include/phase2_bucket_process/hybrid_color_sets.hpp`)
 
 This is the bit-level encoder used by both
 `compact_color_set_dict` (in-memory, per bucket) and
@@ -981,19 +981,31 @@ running concurrently with bucketing).
 | file | role |
 |---|---|
 | `src/main.cpp`                              | CLI entry point |
-| `include/builder.hpp`                       | top-level `build()` orchestrator + auto-tune |
-| `include/bucket_io.hpp`                     | per-bucket compactor, LZ4 framing, RSS watcher |
-| `include/bucket_ingester.hpp`               | parse + minimizer + bucketing per input file |
-| `include/bucket_walker.hpp`                 | per-bucket dBG load + walk; multi-thread driver |
-| `include/compact_extmem.hpp`                | **production stitch**: id-only doubling join + base/color assembly (RAM-first, spill-to-disk) |
-| `include/stitch_extmem.hpp`                 | base-carrying external-memory stitch; retired from the build, kept as `test_stitch`'s reference oracle |
-| `include/stitch.hpp`                        | shared stitch helpers (side tags, junction, frag source) |
-| `include/unitig_spill.hpp`                  | disk-backed frag/unitig sinks (batched write + companion links spill) + mmap reader |
-| `include/super_kmer.hpp`                    | super-k-mer record format (varint + 2-bit) |
-| `include/streaming_color_set_dict.hpp`      | global color-set dict; writes `.color_sets` |
-| `include/compact_color_set_dict.hpp`        | per-bucket color-set dict (hybrid in-memory) |
-| `include/hybrid_color_sets.hpp`             | static `encode_one` (sparse/dense/complementary) |
-| `include/kmer.hpp`                          | 2-bit canonical k-mer encoding |
-| `include/minimizer.hpp`                     | canonical ntHash + sliding-window minimum |
-| `include/seq_reader.hpp`                    | mmap + libdeflate FASTA/FASTQ iterator (kseq over mem_stream) |
-| `include/util.hpp`                          | timers, RSS, profiling counters, build_config |
+`include/` is organized into one subfolder per pipeline phase (each with its
+own `README.md`); the orchestrator sits at the root. Cross-phase files live in
+the phase that primarily owns them.
+
+| file | role |
+|---|---|
+| `src/main.cpp`                                       | CLI entry point |
+| `include/builder.hpp`                                | top-level `build()` orchestrator + auto-tune (drives all 4 phases) |
+| **Phase 1 — `include/phase1_bucket_write/`** | |
+| `bucket_ingester.hpp`                                | parse + minimizer + bucketing per input file |
+| `bucket_io.hpp`                                      | per-bucket compactor, LZ4 framing, RSS watcher |
+| `minimizer.hpp`                                      | canonical ntHash + sliding-window minimum |
+| `seq_reader.hpp`                                     | mmap + libdeflate FASTA/FASTQ iterator (kseq over mem_stream) |
+| `super_kmer.hpp`                                     | super-k-mer record format (varint + 2-bit) |
+| `kmer.hpp`                                           | 2-bit canonical k-mer encoding (foundational; used by all phases) |
+| `util.hpp`                                           | timers, RSS, profiling counters, `build_config` (infra; used by all phases) |
+| **Phase 2 — `include/phase2_bucket_process/`** | |
+| `bucket_walker.hpp`                                  | per-bucket dBG load + walk; multi-thread driver + admission gate |
+| `compact_color_set_dict.hpp`                         | per-bucket color-set dict (hybrid in-memory) |
+| `streaming_color_set_dict.hpp`                       | global color-set dict; writes `.color_sets` |
+| `hybrid_color_sets.hpp`                              | static `encode_one` (sparse/dense/complementary) |
+| `unitig_spill.hpp`                                   | disk-backed frag/unitig sinks (batched write + companion links spill) + mmap reader |
+| **Phase 3 — `include/phase3_stitch/`** | |
+| `compact_extmem.hpp`                                 | **production stitch**: id-only doubling join + base/color assembly (RAM-first, spill-to-disk) |
+| `stitch.hpp`                                         | shared stitch helpers (side tags, junction, frag source) |
+| `stitch_extmem.hpp`                                  | base-carrying external-memory stitch; retired from the build, kept as `test_stitch`'s reference oracle |
+| **Phase 4 — `include/phase4_emit/`** | |
+| `emit.hpp`                                           | `emit_fasta` (FASTA + u2c) + `emit_colors` (finalize `.color_sets`) |

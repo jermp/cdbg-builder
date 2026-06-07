@@ -49,7 +49,7 @@
 #include <system_error>
 #include <vector>
 
-#include "bucket_walker.hpp"  // stitchable_unitig
+#include "phase2_bucket_process/bucket_walker.hpp"  // stitchable_unitig
 
 namespace cdbg {
 
