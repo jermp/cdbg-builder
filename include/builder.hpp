@@ -106,7 +106,6 @@ struct builder {
         }
         std::cout << "\n";
 
-        // Seconds (as double) directly, so elapsed() needs no unit conversion.
         essentials::timer<essentials::clock_type, std::chrono::duration<double>> build_timer;
         build_timer.start();
 
