@@ -77,7 +77,7 @@ inline uint32_t compute_best_m(uint32_t k) {
 }
 
 // Sliding-window minimum over a stream of (uint64_t hash, int32_t pos) pairs,
-// returning the current minimum's hash. Implemented as a fixed-size ring
+// returning the current minimum's hash. Rescan-on-expiry over a fixed-size ring
 // buffer of the last W m-mer hashes plus a cached (cur_min, cur_min_pos):
 //
 //   - Common path (~all pushes): O(1) — store h at pos % W in the ring,
@@ -86,13 +86,12 @@ inline uint32_t compute_best_m(uint32_t k) {
 //     W ring slots for the new min: O(W).
 //
 // For random DNA the expected expiration rate is ~1/W per push, so the
-// amortised cost stays O(1) but the constant is much smaller than a
-// std::deque-based monotonic queue: no allocations, dense linear scan,
-// branch-predictable common path.
+// amortised cost stays O(1) with a small constant: no allocations, a dense
+// linear rescan, and a branch-predictable common path.
 //
 // W = k - m + 1, bounded by MAX_K + 1 = 64 for the supported k range.
 // The 64-slot static array fits in a single cache line.
-struct min_queue {
+struct windowed_min {
     static constexpr int32_t MAX_W = 64;
     uint64_t hashes[MAX_W];
     int32_t window_size = 0;
@@ -116,9 +115,7 @@ struct min_queue {
             int32_t best_pos = start;
             for (int32_t p = start + 1; p <= pos; ++p) {
                 uint64_t hp = hashes[(uint32_t)p % (uint32_t)window_size];
-                // <= keeps the rightmost (newest) position on ties, matching
-                // the previous monotonic-queue tie-breaking.
-                if (hp <= best) {
+                if (hp <= best) {  // <= keeps the rightmost (newest) position on ties
                     best = hp;
                     best_pos = p;
                 }
@@ -131,9 +128,7 @@ struct min_queue {
         }
     }
 
-    bool empty() const { return cur_min_pos < 0; }
     uint64_t min_hash() const { return cur_min; }
-    int32_t min_pos() const { return cur_min_pos; }
 };
 
 }  // namespace cdbg

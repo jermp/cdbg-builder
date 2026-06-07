@@ -459,12 +459,6 @@ public:
     uint64_t bucket_unc_bytes(uint32_t b) const {
         return b < m_bucket_unc_sizes.size() ? m_bucket_unc_sizes[b] : 0;
     }
-    // Largest single bucket's uncompressed bytes (one bucket's worst case).
-    uint64_t max_bucket_unc_bytes() const {
-        uint64_t m = 0;
-        for (uint64_t s : m_bucket_unc_sizes) m = std::max(m, s);
-        return m;
-    }
 
     // ---- RSS pressure watcher --------------------------------------------
     //
@@ -509,8 +503,6 @@ public:
         if (!m_watcher_running.exchange(false)) return;
         if (m_watcher_thread.joinable()) m_watcher_thread.join();
     }
-
-    bool under_pressure() const { return m_under_pressure.load(std::memory_order_relaxed); }
 
     // Highest live RSS observed by the watcher during bucket-write.
     // Useful for verifying that the cap actually held (vs the lifetime
@@ -568,11 +560,10 @@ private:
     std::atomic<uint64_t> m_total_uncompressed{0};
     std::vector<uint64_t> m_bucket_unc_sizes;  // per-bucket uncompressed bytes (set in close())
     bool m_closed = false;
-    // Pressure flag set by the RSS watcher; informational only
-    // (surfaced via under_pressure() / pressure_was_engaged() for the
-    // post-phase log line). Backpressure is implemented by the watcher
-    // sweeping all compactors with try_spill(), not by ingest threads
-    // consulting this flag.
+    // Pressure flag set by the RSS watcher; informational only (surfaced via
+    // pressure_was_engaged() for the post-phase log line). Backpressure is
+    // implemented by the watcher sweeping all compactors with try_spill(), not
+    // by ingest threads consulting this flag.
     std::atomic<bool> m_under_pressure{false};
     std::atomic<bool> m_pressure_was_engaged{false};
     std::atomic<uint64_t> m_observed_rss_high{0};
@@ -685,8 +676,6 @@ public:
         m_pos += consumed;
         return true;
     }
-
-    size_t size_bytes() const { return m_buf.size(); }
 
 private:
     std::vector<uint8_t> m_buf;
