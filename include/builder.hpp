@@ -63,7 +63,6 @@
 #include "minimizer.hpp"
 #include "compact_extmem.hpp"
 #include "stitch.hpp"
-#include "stitch_extmem.hpp"
 #include "streaming_color_set_dict.hpp"
 #include "unitig_spill.hpp"
 #include "util.hpp"
@@ -226,13 +225,10 @@ struct builder {
         // never sits in RAM. EF offsets are appended to the file at
         // finalize().
         // Emit the companion links spill (boundary k-mers per fragment, in
-        // frag_id order) during bucket-process when compact stitch is on, so the
-        // scalable stitch can seed from ~1.6 GB of links instead of re-reading
-        // the whole frag spill. Only the scalable compact path consumes it; the
-        // in-RAM path seeds from the arena and ignores it (the links file is a
-        // small disk-only cost that never counts against -g).
-        frag_unitig_writer frag_sink(tmp_dir + "/frag_unitigs.bin",
-                                     m_cfg.compact_stitch ? m_cfg.k : 0);
+        // frag_id order) during bucket-process, so the scalable stitch can seed
+        // from ~1.6 GB of links instead of re-reading the whole frag spill. The
+        // links file is a small disk-only cost that never counts against -g.
+        frag_unitig_writer frag_sink(tmp_dir + "/frag_unitigs.bin", m_cfg.k);
         streaming_color_set_dict global_dict(m_num_colors, m_cfg.out_basename + ".color_sets");
         std::mutex global_mu;
         {
@@ -332,57 +328,48 @@ struct builder {
                 // RNG), so this fans out cleanly. Output is unchanged --
                 // emit_fasta sorts each cid-bucket, so .fa is identical
                 // regardless of which thread emitted which unitig.
-                if (m_cfg.compact_stitch) {
-                    // GGCAT-style id-only compaction on a single, always-on-disk
-                    // path: the doubling carries only fragment-id chains; bases +
-                    // colors are assembled at the end through an on-disk re-bucket.
-                    // The stores are RAM-FIRST: round store, member, and base
-                    // records stay in RAM up to a -g-derived cap and spill only the
-                    // overflow to disk. So when the working set fits, the whole
-                    // stitch runs in RAM (no disk round-trip); when it does not, it
-                    // degrades to disk and the -g bound is honored at all costs.
-                    // Round 0 seeds from the precomputed links spill (boundary
-                    // k-mers, ~17 B/fragment), not a second full frag-spill read.
-                    //
-                    // cap = -g minus the cross-phase carry (the color dict that
-                    // stays resident through stitch) minus a working-set reserve
-                    // for the per-bucket decode set. 0 means no -g => use all RAM.
-                    size_t stitch_ram_cap = 0;
-                    if (m_cfg.max_ram_gb > 0) {
-                        const uint64_t total =
-                            (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0);
-                        const uint64_t carry =
-                            global_dict.resident_bytes() + (uint64_t)(2.0 * 1024 * 1024 * 1024);
-                        stitch_ram_cap = total > carry ? (size_t)(total - carry)
-                                                       : (size_t)(256ull * 1024 * 1024);
-                    }
-                    std::cout << "  compact stitch: scalable, RAM-first cap "
-                              << (stitch_ram_cap ? format_bytes(stitch_ram_cap)
-                                                 : std::string("unlimited"))
-                              << "\n";
-                    auto for_each_frag = [&, first_pass = true](auto&& fn) mutable {
-                        frag_unitig_stream_reader rd(frag_sink.path());
-                        uint8_t of;
-                        std::vector<color_run> runs;
-                        std::string seq;
-                        const bool count = first_pass;
-                        while (rd.next(of, runs, seq)) {
-                            fn(of, runs, seq);
-                            if (count) done.fetch_add(1, std::memory_order_relaxed);
-                        }
-                        first_pass = false;
-                    };
-                    compact_stitch_scalable(for_each_frag, n_frags, m_cfg.k, tmp_dir,
-                                            std::ref(*uwriter_ptr), stitch_buckets,
-                                            /*frag_ranges=*/0, /*chain_buckets=*/0,
-                                            m_cfg.num_threads, frag_sink.links_path(),
-                                            stitch_ram_cap);
-                } else {
-                    frag_unitig_stream_reader frag_reader(frag_sink.path());
-                    stitch_unitigs_extmem_file_stream(frag_reader, m_cfg.k, tmp_dir,
-                                                      std::ref(*uwriter_ptr), stitch_buckets, &done,
-                                                      m_cfg.num_threads);
+                // GGCAT-style id-only compaction on a single, always-on-disk
+                // path: the doubling carries only fragment-id chains; bases +
+                // colors are assembled at the end through an on-disk re-bucket.
+                // The stores are RAM-FIRST: round store, member, and base
+                // records stay in RAM up to a -g-derived cap and spill only the
+                // overflow to disk. So when the working set fits, the whole
+                // stitch runs in RAM (no disk round-trip); when it does not, it
+                // degrades to disk and the -g bound is honored at all costs.
+                // Round 0 seeds from the precomputed links spill (boundary
+                // k-mers, ~17 B/fragment), not a second full frag-spill read.
+                //
+                // cap = -g minus the cross-phase carry (the color dict that
+                // stays resident through stitch) minus a working-set reserve
+                // for the per-bucket decode set. 0 means no -g => use all RAM.
+                size_t stitch_ram_cap = 0;
+                if (m_cfg.max_ram_gb > 0) {
+                    const uint64_t total = (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0);
+                    const uint64_t carry =
+                        global_dict.resident_bytes() + (uint64_t)(2.0 * 1024 * 1024 * 1024);
+                    stitch_ram_cap =
+                        total > carry ? (size_t)(total - carry) : (size_t)(256ull * 1024 * 1024);
                 }
+                std::cout << "  compact stitch: scalable, RAM-first cap "
+                          << (stitch_ram_cap ? format_bytes(stitch_ram_cap)
+                                             : std::string("unlimited"))
+                          << "\n";
+                auto for_each_frag = [&, first_pass = true](auto&& fn) mutable {
+                    frag_unitig_stream_reader rd(frag_sink.path());
+                    uint8_t of;
+                    std::vector<color_run> runs;
+                    std::string seq;
+                    const bool count = first_pass;
+                    while (rd.next(of, runs, seq)) {
+                        fn(of, runs, seq);
+                        if (count) done.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    first_pass = false;
+                };
+                compact_stitch_scalable(for_each_frag, n_frags, m_cfg.k, tmp_dir,
+                                        std::ref(*uwriter_ptr), stitch_buckets,
+                                        /*frag_ranges=*/0, /*chain_buckets=*/0, m_cfg.num_threads,
+                                        frag_sink.links_path(), stitch_ram_cap);
                 prog.stop();
                 std::cout << "  unitigs after stitching: " << uwriter_ptr->total_unitigs() << "\n";
             }
@@ -392,11 +379,11 @@ struct builder {
         frag_sink.unlink();
         m_num_unitigs = uwriter_ptr->total_unitigs();
 
-        // The compact in-RAM stitch builds a multi-GiB fragment arena that is
-        // destroyed when stitch returns, but glibc keeps the freed pages in its
-        // per-thread arenas (RSS stays high), starving emit's bucket I/O of page
-        // cache. Hand them back to the OS before emit.
-        if (m_cfg.compact_stitch) release_free_heap_to_os_();
+        // Stitch allocates large transient buffers that are freed when it
+        // returns, but glibc keeps the freed pages in its per-thread arenas
+        // (RSS stays high), starving emit's bucket I/O of page cache. Hand them
+        // back to the OS before emit.
+        release_free_heap_to_os_();
 
         {
             phase_rss_marker rss("emit-fasta");

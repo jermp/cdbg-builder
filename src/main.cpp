@@ -49,10 +49,6 @@ bool parse_args(int argc, char** argv, cdbg::build_config& cfg) {
                " Smaller -> larger B but weaker dedup / bigger bucket files.",
                "--spill", false);
     parser.add("verbose", "Verbose output.", "--verbose", false, true);
-    parser.add("compact_stitch",
-               "Experimental: GGCAT-style id-only compaction stitch (doubling carries only"
-               " fragment-id chains, bases/colors assembled once at the end). Same output.",
-               "--compact-stitch", false, true);
 
     if (!parser.parse()) return false;
 
@@ -69,7 +65,6 @@ bool parse_args(int argc, char** argv, cdbg::build_config& cfg) {
     if (parser.parsed("flush_bases")) cfg.flush_bases = parser.get<size_t>("flush_bases");
     if (parser.parsed("spill_bytes")) cfg.spill_bytes = parser.get<size_t>("spill_bytes");
     if (parser.parsed("verbose")) cfg.verbose = parser.get<bool>("verbose");
-    if (parser.parsed("compact_stitch")) cfg.compact_stitch = parser.get<bool>("compact_stitch");
     return true;
 }
 
