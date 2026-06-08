@@ -227,7 +227,8 @@ private:
             // push_back, so duplicates are common when the same color
             // recurs across batches.
             std::sort(e.colors.begin(), e.colors.end());
-            e.colors.erase(std::unique(e.colors.begin(), e.colors.end()), e.colors.end());
+            uint32_t num_colors =
+                std::distance(e.colors.begin(), std::unique(e.colors.begin(), e.colors.end()));
             // Append the serialized record directly into m_batch_buf.
             // We compress the whole batch with one LZ4 call below;
             // amortising the per-block framing overhead across all of
@@ -238,7 +239,7 @@ private:
             // (no unpack/re-pack round-trip).
             size_t p = 0;
             uint64_t base_len = varint_read((uint8_t const*)key.data(), key.size(), p);
-            write_super_kmer_packed(e.flags, e.colors.data(), (uint32_t)e.colors.size(),
+            write_super_kmer_packed(e.flags, e.colors.data(), num_colors,
                                     (uint8_t const*)key.data() + p, (uint32_t)base_len,
                                     m_batch_buf);
         }
