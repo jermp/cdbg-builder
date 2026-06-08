@@ -97,25 +97,11 @@ inline constexpr uint8_t SK_FLAG_OWNS_FIRST = 1u << 2;
 inline constexpr uint8_t SK_FLAG_OWNS_LAST = 1u << 3;
 
 // Serialize a compacted super-k-mer record (one or more colors) into `out`.
-// `colors` must be sorted ascending and contain no duplicates.
-inline void write_super_kmer(uint8_t flags, uint32_t const* colors, uint32_t num_colors,
-                             uint8_t const* bases, uint32_t len, std::vector<uint8_t>& out) {
-    varint_write(num_colors, out);
-    uint32_t prev = 0;
-    for (uint32_t i = 0; i < num_colors; ++i) {
-        uint32_t c = colors[i];
-        varint_write((uint64_t)(c - prev), out);
-        prev = c;
-    }
-    // 4 low bits carry flags (BEGIN, END, OWNS_FIRST, OWNS_LAST); len is shifted
-    // up by 4. (Was 2 bits / 0x3 -- the OWNS ownership bits were being dropped.)
-    varint_write(((uint64_t)len << 4) | (flags & 0xfu), out);
-    pack_2bit(bases, len, out);
-}
-
-// Same on-disk record as write_super_kmer(), but the bases are ALREADY 2-bit
-// packed (ceil(base_len/4) bytes) -- used by the compactor, whose dedup keys are
-// kept packed in RAM, so spill appends them directly with no re-packing.
+// The bases are ALREADY 2-bit packed (ceil(base_len/4) bytes) -- the compactor
+// keeps its dedup keys packed in RAM, so spill appends them directly with no
+// re-packing. `colors` must be sorted ascending and contain no duplicates;
+// the 4 low bits of length_with_flags carry flags (BEGIN, END, OWNS_FIRST,
+// OWNS_LAST) and len is shifted up by 4.
 inline void write_super_kmer_packed(uint8_t flags, uint32_t const* colors, uint32_t num_colors,
                                     uint8_t const* packed, uint32_t base_len,
                                     std::vector<uint8_t>& out) {
