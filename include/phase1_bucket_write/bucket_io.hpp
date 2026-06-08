@@ -70,8 +70,8 @@ namespace cdbg {
 // at this budget the global ingest peak from the compactors is ~256 MiB.
 inline constexpr size_t DEFAULT_COMPACTOR_SPILL_BYTES = 256 * 1024;
 
-class bucket_compactor {
-public:
+struct bucket_compactor  //
+{
     // try_spill() is the writer's RSS-watcher entry point: when the
     // process is over the -g budget the watcher walks every
     // compactor and force-spills any with pending data. Per-batch
@@ -336,8 +336,8 @@ private:
 
 // ---- bucket_writer: owns one bucket_compactor per bucket ----------------------
 
-class bucket_writer {
-public:
+struct bucket_writer  //
+{
     bucket_writer(std::string const& dir, uint32_t num_buckets, size_t flush_bases = 64 * 1024,
                   size_t spill_bytes = DEFAULT_COMPACTOR_SPILL_BYTES)
         : m_dir(dir), m_num_buckets(num_buckets), m_flush_bases(flush_bases) {
@@ -603,7 +603,8 @@ struct per_thread_bucket_buffers {
     // `sk_bases` is the super-k-mer's bases as 0-3 values, one per byte; `len` is
     // the base count. We build the dedup key here -- [varint len][2-bit packed
     // bases] -- so the bases live 4x smaller in RAM all the way to the spill.
-    void append(uint32_t b, uint8_t flags, uint32_t color, uint8_t const* sk_bases, uint32_t len) {
+    void append(uint32_t b,  // bucket_index
+                uint8_t flags, uint32_t color, uint8_t const* sk_bases, uint32_t len) {
         auto& kbuf = keys[b];
         uint32_t off = (uint32_t)kbuf.size();
         varint_write(len, kbuf);         // length prefix (disambiguates packings)
@@ -626,8 +627,8 @@ struct per_thread_bucket_buffers {
 
 // ---- bucket_reader: streams compacted records from disk ----------------------
 
-class bucket_reader {
-public:
+struct bucket_reader  //
+{
     // Slurps the whole bucket file (decompressed) into m_buf so that
     // bucket_walker can iterate records via a simple byte cursor.
     //

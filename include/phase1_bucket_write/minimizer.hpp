@@ -1,8 +1,7 @@
 #pragma once
 
 // Canonical ntHash over m-mers + sliding-window minimum, used for super-k-mer
-// minimizer-bucketing ingest (mirrors GGCAT's approach in
-// crates/hashes/src/cn_nthash.rs and crates/hashes/src/rolling/batch_minqueue.rs).
+// minimizer-bucketing ingest.
 //
 // We hash an m-mer and its reverse complement simultaneously and take the
 // minimum, so the hash is symmetric under RC. That makes the minimizer of a
@@ -63,8 +62,7 @@ inline void nthash_roll(uint8_t out_b, uint8_t in_b, uint32_t m, uint64_t& fwd, 
 
 inline uint64_t canonical_mhash(uint64_t fwd, uint64_t rc) { return fwd <= rc ? fwd : rc; }
 
-// GGCAT's compute_best_m for picking a minimizer length given k.
-// (crates/utils/src/lib.rs:29)
+// Pick "best" minimizer length given k (taken from GGCAT).
 inline uint32_t compute_best_m(uint32_t k) {
     if (k <= 13) return (k / 2 > k - 4) ? (k / 2) : (k > 4 ? (k - 4) : 1);
     if (k <= 15) return 9;
