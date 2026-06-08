@@ -373,8 +373,9 @@ inline void process_bucket(std::string const& path, uint32_t k, uint64_t num_col
 
         auto cid_for_single_rsid = [&](uint32_t rsid) -> uint32_t {
             if (rsid_to_cid[rsid] == UINT32_MAX) {
-                record_sets.at(rsid, at_scratch);
-                rsid_to_cid[rsid] = out_local_dict.intern(std::move(at_scratch));
+                // The class IS record_sets[rsid] -- copy its encoded bits and
+                // reuse its hashes instead of decode -> re-hash -> re-encode.
+                rsid_to_cid[rsid] = out_local_dict.intern_encoded(record_sets, rsid);
             }
             return rsid_to_cid[rsid];
         };
