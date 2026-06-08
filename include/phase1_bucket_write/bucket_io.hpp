@@ -86,11 +86,14 @@ struct bucket_compactor  //
     // and are reused across spills. They're already counted as part
     // of the compactor's structural cost in the auto-tune model.
     bucket_compactor(std::string path, size_t spill_bytes)
-        : m_path(std::move(path)), m_spill_bytes(spill_bytes) {
+        : m_path(std::move(path))
+        , m_spill_bytes(spill_bytes)  //
+    {
         m_file = std::fopen(m_path.c_str(), "wb");
-        if (!m_file)
+        if (!m_file) {
             throw std::runtime_error("cannot open bucket file: " + m_path + ": " +
                                      std::strerror(errno));
+        }
     }
 
     ~bucket_compactor() { close(); }
@@ -98,7 +101,6 @@ struct bucket_compactor  //
     bucket_compactor(bucket_compactor const&) = delete;
     bucket_compactor& operator=(bucket_compactor const&) = delete;
 
-    std::string const& path() const { return m_path; }
     uint64_t total_uncompressed_bytes() const {
         return m_total_uncompressed.load(std::memory_order_relaxed);
     }
@@ -123,7 +125,8 @@ struct bucket_compactor  //
     };
 
     void insert_batch(std::vector<pending_record> const& recs,
-                      std::vector<uint8_t> const& key_storage) {
+                      std::vector<uint8_t> const& key_storage)  //
+    {
         if (recs.empty()) return;
         auto& prof = bucket_prof();
         auto t_lock = bucket_write_prof::clock::now();
@@ -248,8 +251,9 @@ private:
         // function expects int parameters, so we cap each frame at
         // ~1 GiB; in practice spills are kilobytes to a few MiB so
         // this never trips.
-        if (m_batch_buf.size() > (size_t)LZ4_MAX_INPUT_SIZE)
+        if (m_batch_buf.size() > (size_t)LZ4_MAX_INPUT_SIZE) {
             throw std::runtime_error("spill batch exceeds LZ4_MAX_INPUT_SIZE on " + m_path);
+        }
         int src_size = (int)m_batch_buf.size();
         int bound = LZ4_compressBound(src_size);
         if (bound <= 0) throw std::runtime_error("LZ4_compressBound failed on " + m_path);
@@ -340,7 +344,10 @@ struct bucket_writer  //
 {
     bucket_writer(std::string const& dir, uint32_t num_buckets, size_t flush_bases = 64 * 1024,
                   size_t spill_bytes = DEFAULT_COMPACTOR_SPILL_BYTES)
-        : m_dir(dir), m_num_buckets(num_buckets), m_flush_bases(flush_bases) {
+        : m_dir(dir)
+        , m_num_buckets(num_buckets)
+        , m_flush_bases(flush_bases)  //
+    {
         std::filesystem::create_directories(m_dir);
         m_compactors.reserve(num_buckets);
         for (uint32_t b = 0; b < num_buckets; ++b) {
@@ -366,7 +373,8 @@ struct bucket_writer  //
     }
 
     void flush(uint32_t b, std::vector<bucket_compactor::pending_record>& recs,
-               std::vector<uint8_t>& key_buf) {
+               std::vector<uint8_t>& key_buf)  //
+    {
         if (recs.empty()) return;
         auto& prof = bucket_prof();
         auto t = bucket_write_prof::clock::now();
@@ -441,8 +449,9 @@ struct bucket_writer  //
         uint64_t top_sum = 0;
         for (size_t i = (n > concurrency ? n - concurrency : 0); i < n; ++i) top_sum += v[i];
         uint32_t nonempty = 0;
-        for (uint64_t x : v)
+        for (uint64_t x : v) {
             if (x) ++nonempty;
+        }
         std::fprintf(stderr,
                      "[bucket size dist] buckets=%zu nonempty=%u  uncompressed bytes:\n"
                      "  mean=%.2f MiB  p50=%.2f  p90=%.2f  p99=%.2f  p999=%.2f  max=%.2f MiB\n"
@@ -587,7 +596,7 @@ private:
 // ---- Per-thread batching sidecar -------------------------------------------
 //
 // Each ingest worker owns one of these. For each bucket it accumulates a
-// flat list of pending records plus a parallel 2-bit-value buffer for the
+// flat list of `pending_records` plus a parallel 2-bit-value buffer for the
 // bases. When a bucket's bases-buffer crosses `flush_bases`, the thread
 // flushes that bucket's batch into the writer (which delegates to the
 // per-bucket compactor under that bucket's mutex).
