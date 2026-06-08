@@ -51,16 +51,19 @@ inline void emit_super_kmers(uint8_t const* bases, uint32_t L, uint32_t k, uint3
 
     auto bucket_of = [&](uint64_t h) -> uint32_t {
         // Skip the bottom bit to match GGCAT's "uniqueness-flag" reservation,
-        // then map the (uniform) minimizer hash into [0, num_buckets) by a
-        // multiply-shift RANGE REDUCTION: floor(h * num_buckets / 2^64), i.e. a
-        // widening 64x64 multiply keeping the high 64 bits. This is NOT a modulo
-        // -- it yields a different value than h % num_buckets -- it's a remap
-        // that scales h into the range, which is all we need for a balanced,
-        // deterministic bucket assignment, and it avoids the ~20-40 cycle divide
-        // a modulo costs per super-k-mer. num_buckets need not be a power of two,
-        // and nothing recomputes a bucket id from the hash later, so the exact
-        // mapping is free to change.
-        return (uint32_t)(((__uint128_t)(h >> 1) * num_buckets) >> 64);
+        // then map the minimizer hash into [0, num_buckets) with a modulo.
+        // num_buckets need not be a power of two (it's sized from the RAM model),
+        // and the divide is negligible here: once per super-k-mer, dwarfed by the
+        // per-base ntHash/minimizer scan.
+        //
+        // A multiply-shift range reduction (h * B >> 64) was tried and REVERTED:
+        // it maps proportionally to the hash VALUE, so it needs h uniform over
+        // [0, 2^64). But canonical_mhash = min(fwd, rc) is biased toward small
+        // values (the min of two uniforms), and the >>1 caps it at 2^63 -- so the
+        // reduction piled almost everything into a few low buckets (2353/11915
+        // nonempty, max bucket 243 MiB), collapsing dedup. The modulo keys on the
+        // LOW bits, which stay uniform even when the magnitude is skewed.
+        return (uint32_t)((h >> 1) % num_buckets);
     };
 
     uint64_t fwd = 0, rc = 0;
