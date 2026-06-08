@@ -50,12 +50,17 @@ inline void emit_super_kmers(uint8_t const* bases, uint32_t L, uint32_t k, uint3
     const uint32_t W = k - m;  // window size, in m-mer indices (a (k-1)-mer)
 
     auto bucket_of = [&](uint64_t h) -> uint32_t {
-        // Skip the bottom bit to match GGCAT's "uniqueness-flag" reservation.
-        // num_buckets need not be a power of two -- it's sized from the RAM
-        // model (B = frac*g / (alpha*T*flush + beta*spill)), so map with a
-        // modulo. This runs once per super-k-mer boundary (not per base), so
-        // the divide is negligible against the per-base ntHash/minimizer scan.
-        return (uint32_t)((h >> 1) % num_buckets);
+        // Skip the bottom bit to match GGCAT's "uniqueness-flag" reservation,
+        // then map the (uniform) minimizer hash into [0, num_buckets) by a
+        // multiply-shift RANGE REDUCTION: floor(h * num_buckets / 2^64), i.e. a
+        // widening 64x64 multiply keeping the high 64 bits. This is NOT a modulo
+        // -- it yields a different value than h % num_buckets -- it's a remap
+        // that scales h into the range, which is all we need for a balanced,
+        // deterministic bucket assignment, and it avoids the ~20-40 cycle divide
+        // a modulo costs per super-k-mer. num_buckets need not be a power of two,
+        // and nothing recomputes a bucket id from the hash later, so the exact
+        // mapping is free to change.
+        return (uint32_t)(((__uint128_t)(h >> 1) * num_buckets) >> 64);
     };
 
     uint64_t fwd = 0, rc = 0;
