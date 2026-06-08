@@ -61,6 +61,33 @@ struct compact_color_set_dict {
     uint32_t intern(std::vector<uint32_t> const& colors) { return intern_impl_(colors); }
     uint32_t intern(std::vector<uint32_t>&& colors) { return intern_impl_(colors); }
 
+    // Intern the class with id `src_id` from another dict WITHOUT decoding it:
+    // reuse src's precomputed (primary, secondary) hashes for dedup and copy its
+    // already-encoded bit range straight into this dict. Equivalent in result to
+    // intern(decoded(src, src_id)) -- same hash, and encode_one is deterministic
+    // so the copied bits match a fresh encode of the same colors -- but skips the
+    // decode + re-hash + re-encode, which dominates resolve when most k-mers are
+    // single-record (their color class IS a record_sets entry). `src` MUST share
+    // this dict's encoding params (it does: both built with the same num_colors).
+    uint32_t intern_encoded(compact_color_set_dict const& src, uint32_t src_id) {
+        assert(src_id < src.m_classes.size());
+        const class_meta& sm = src.m_classes[src_id];
+        auto it = m_index.find(hash_pair{sm.primary, sm.secondary});
+        if (it != m_index.end()) return *it;
+
+        const uint64_t start = sm.bit_offset;
+        const uint64_t end = (src_id + 1 < src.m_classes.size())
+                                 ? src.m_classes[src_id + 1].bit_offset
+                                 : src.m_bvb.num_bits();
+        const uint64_t bit_offset = m_bvb.num_bits();
+        copy_bits_(src.m_bvb, start, end - start, m_bvb);
+
+        const uint32_t id = (uint32_t)m_classes.size();
+        m_classes.push_back({sm.primary, sm.secondary, bit_offset});
+        m_index.insert(id);
+        return id;
+    }
+
     uint32_t size() const { return (uint32_t)m_classes.size(); }
     uint32_t num_colors() const { return m_num_colors; }
 
@@ -109,6 +136,24 @@ private:
         }
         bool operator()(hash_pair const& h, uint32_t a) const noexcept { return (*this)(a, h); }
     };
+
+    // Append `len` bits starting at bit `start` of `src` to `dst`, in <=64-bit
+    // chunks. take==64 only when >=64 bits remain in the range (so get_word64
+    // never reads past the source class), and partial chunks are masked so no
+    // out-of-range bits are appended.
+    static void copy_bits_(bits::bit_vector::builder const& src, uint64_t start, uint64_t len,
+                           bits::bit_vector::builder& dst) {
+        uint64_t pos = start;
+        uint64_t remaining = len;
+        while (remaining) {
+            const uint64_t take = remaining < 64 ? remaining : 64;
+            uint64_t w = src.get_word64(pos);
+            if (take < 64) w &= (uint64_t(1) << take) - 1;
+            dst.append_bits(w, take);
+            pos += take;
+            remaining -= take;
+        }
+    }
 
     uint32_t intern_impl_(std::vector<uint32_t> const& colors) {
         const uint64_t primary = wyhash_(colors);
