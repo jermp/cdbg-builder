@@ -95,8 +95,9 @@ inline void emit_fasta(unitig_bucket_writer& uwriter, std::string const& out_bas
     flush_buf();
     std::fclose(fa);
 
-    std::cout << "  [emit-fasta] " << uwriter.num_buckets() << " buckets, cid-sort RAM cap "
-              << format_bytes(emit_mem_cap) << " (external merge-sort if a bucket exceeds it)\n";
+    std::cout << "  [emit-fasta] " << uwriter.num_buckets() << " buckets ("
+              << uwriter.spilled_buckets() << " spilled to disk, rest read from RAM), cid-sort RAM cap "
+              << format_bytes(emit_mem_cap) << "\n";
 
     // Close out the very last run.
     if (emitted > 0) u2c_bvb.set(emitted - 1, 1);
