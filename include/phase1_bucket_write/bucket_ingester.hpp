@@ -37,7 +37,7 @@ inline void emit_super_kmers(uint8_t const* bases, uint32_t L, uint32_t k, uint3
                              uint32_t color, uint32_t num_buckets,
                              per_thread_bucket_buffers& sink)  //
 {
-    assert(L >= k);  // caller only emits runs with run_len >= k
+    assert(L >= k);                // caller only emits runs with run_len >= k
     const uint32_t K = L - k + 1;  // number of k-mers; (k-1)-mers indexed by 0..K
 
     // Minimize over (k-1)-mers, NOT k-mers. A (k-1)-mer has (k-1)-m+1 = k-m m-mers, so the
