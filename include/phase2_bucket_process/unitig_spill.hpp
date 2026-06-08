@@ -5,19 +5,25 @@
 // boundaries. Three classes live here:
 //
 // 1) unitig_bucket_writer  -- stitch -> emit
-//    Sink for stitch_unitigs_streaming. Partitions finished merged
-//    unitigs into K cid-range bucket files: bucket b holds every
-//    unitig with cid in [b * S, (b+1) * S) where
-//    S = ceil(num_color_classes / num_buckets). emit_fasta iterates
-//    buckets in ascending order and sorts each bucket's records by
-//    cid in memory before writing FASTA, so the .fa output is
-//    strictly cid-ascending (which the u2c bit_vector consumer
-//    requires). Per-bucket peak at emit is one bucket's seq payload
-//    plus its record-vector overhead.
+//    Sink for the stitch. Partitions finished merged unitigs into K
+//    cid-range buckets: bucket b holds every unitig with cid in
+//    [b * S, (b+1) * S) where S = ceil(num_color_classes / num_buckets).
+//    emit_fasta iterates buckets in ascending order and sorts each
+//    bucket's records by cid before writing FASTA, so the .fa output is
+//    strictly cid-ascending (which the u2c bit_vector consumer requires).
 //
-//    Per-bucket file format: a sequence of records, one per finished
-//    unitig, until EOF:
-//      [u32 cid][u32 seq_len][seq_len bytes raw ACGT]
+//    RAM-first: buckets are held in MEMORY up to a ram_budget; emit then
+//    reads them straight from RAM, so the unitig sequences never round-
+//    trip through disk (no temp-bucket write here, no read-back in emit).
+//    When the budget is exceeded the largest buckets are spilled to disk
+//    (one-way) and emit external-merge-sorts those -- so a bucket is
+//    EITHER fully in RAM OR fully on disk, and the -g bound is honored at
+//    all costs regardless of unitig volume. With no -g everything stays in
+//    RAM.
+//
+//    Per-bucket on-disk format (spilled buckets only), a sequence of
+//    records until EOF:
+//      [u64 cid][u32 seq_len][seq_len bytes raw ACGT]
 //
 // 2) frag_unitig_writer  -- bucket-process -> stitch
 //    Sink for process_buckets. Streams every finished fragment
@@ -58,22 +64,29 @@ public:
     // num_color_classes is the final cid space (size of global_dict).
     // num_buckets controls how the cid range is partitioned. Picked
     // so per-bucket peak fits comfortably in the budget remainder.
-    unitig_bucket_writer(std::string dir, uint64_t num_color_classes, uint32_t num_buckets)
+    //
+    // ram_budget bounds how many bytes of stitched unitigs we keep in MEMORY
+    // (across all buckets) before spilling the largest buckets to disk. When the
+    // whole unitig set fits, nothing is written here and emit reads it straight
+    // from RAM -- skipping the temp-bucket write (here) AND the read-back (emit),
+    // i.e. the unitig sequences never round-trip through disk. SIZE_MAX = keep
+    // everything in RAM (the no-`-g` default); a finite budget spills the
+    // overflow so the `-g` bound is honored regardless of unitig volume.
+    unitig_bucket_writer(std::string dir, uint64_t num_color_classes, uint32_t num_buckets,
+                         size_t ram_budget = SIZE_MAX)
         : m_dir(std::move(dir))
         , m_num_color_classes(num_color_classes)
-        , m_num_buckets(num_buckets == 0 ? 1 : num_buckets) {
+        , m_num_buckets(num_buckets == 0 ? 1 : num_buckets)
+        , m_ram_budget(ram_budget) {
         if (num_color_classes == 0) {
             // No unitigs ever produced -> a single empty bucket.
             m_num_buckets = 1;
         }
+        // Files are opened lazily, only when a bucket is spilled (see operator()
+        // / spill_bucket_). A run whose unitigs fit ram_budget creates none.
         m_files.assign(m_num_buckets, nullptr);
-        for (uint32_t b = 0; b < m_num_buckets; ++b) {
-            std::string path = bucket_path(b);
-            m_files[b] = std::fopen(path.c_str(), "wb+");
-            if (!m_files[b])
-                throw std::runtime_error("cannot open unitig bucket file: " + path + ": " +
-                                         std::strerror(errno));
-        }
+        m_ram.resize(m_num_buckets);
+        m_ram_bytes.assign(m_num_buckets, 0);
     }
 
     ~unitig_bucket_writer() {
@@ -88,23 +101,28 @@ public:
     unitig_bucket_writer(unitig_bucket_writer const&) = delete;
     unitig_bucket_writer& operator=(unitig_bucket_writer const&) = delete;
 
-    // The sink callable used by stitch_unitigs_streaming.
+    // The sink callable used by the stitch. NOT thread-safe: the stitch calls
+    // it serially under its own sink mutex (compact_extmem.hpp).
     void operator()(stitchable_unitig&& u) {
         const uint64_t cid = u.mono_cid();  // post-split: monochromatic
         const uint32_t b = bucket_for_cid(cid);
-        std::FILE* f = m_files[b];
-        const uint32_t seq_len = (uint32_t)u.seq.size();
-        if (std::fwrite(&cid, sizeof(cid), 1, f) != 1)
-            throw std::runtime_error("short write of unitig cid to bucket " + std::to_string(b));
-        if (std::fwrite(&seq_len, sizeof(seq_len), 1, f) != 1)
-            throw std::runtime_error("short write of unitig len to bucket " + std::to_string(b));
-        if (seq_len > 0 and std::fwrite(u.seq.data(), 1, seq_len, f) != (size_t)seq_len) {
-            throw std::runtime_error("short write of unitig seq to bucket " + std::to_string(b));
-        }
         ++m_total_unitigs;
-        // Free the seq buffer eagerly: stitch already moved-from frag,
-        // and the merged seq's backing storage isn't needed any more.
-        std::string().swap(u.seq);
+        if (m_files[b]) {
+            // Bucket already spilled (one-way): write this record straight
+            // through to disk and drop its bytes. A bucket is therefore EITHER
+            // fully in RAM (m_files[b] == nullptr, records in m_ram[b]) OR fully
+            // on disk -- never split -- so emit needs no RAM+disk merge.
+            write_record_(m_files[b], cid, u.seq);
+            std::string().swap(u.seq);
+            return;
+        }
+        // RAM-resident bucket: keep the record in memory (this is the byte we are
+        // trying NOT to round-trip through disk). est approximates its heap cost.
+        const size_t est = sizeof(record) + u.seq.size();
+        m_ram[b].push_back(record{cid, std::move(u.seq)});
+        m_ram_bytes[b] += est;
+        m_buffered_bytes += est;
+        if (m_buffered_bytes > m_ram_budget) evict_until_under_budget_();
     }
 
     uint64_t total_unitigs() const { return m_total_unitigs; }
@@ -115,55 +133,39 @@ public:
         return m_dir + "/unitig_bucket_" + std::to_string(b) + ".bin";
     }
 
-    // Read all records from bucket `b`. Caller-owned `out` is cleared
-    // and refilled. Records arrive in *write order* (which is stitch
-    // order, NOT cid order) -- caller sorts.
+    // One stitched unitig: its color-set id and its raw ACGT bases. Held in
+    // m_ram[b] for RAM-resident buckets; serialized as [u64 cid][u32 len][bytes]
+    // for spilled ones.
     struct record {
         uint64_t cid;
         std::string seq;
     };
 
-    void read_bucket(uint32_t b, std::vector<record>& out) {
-        out.clear();
-        std::FILE* f = m_files[b];
-        if (!f) throw std::runtime_error("read_bucket: file already closed");
-        std::fflush(f);
-        std::rewind(f);
-        for (;;) {
-            uint64_t cid = 0;
-            uint32_t seq_len = 0;
-            size_t got = std::fread(&cid, sizeof(cid), 1, f);
-            if (got != 1) {
-                if (std::feof(f)) break;
-                throw std::runtime_error("short read of unitig cid in bucket " + std::to_string(b));
-            }
-            if (std::fread(&seq_len, sizeof(seq_len), 1, f) != 1)
-                throw std::runtime_error("short read of unitig len in bucket " + std::to_string(b));
-            std::string seq;
-            seq.resize(seq_len);
-            if (seq_len > 0 and std::fread(seq.data(), 1, seq_len, f) != (size_t)seq_len) {
-                throw std::runtime_error("short read of unitig seq in bucket " + std::to_string(b));
-            }
-            out.push_back({cid, std::move(seq)});
-        }
-    }
-
     // Stream bucket b's records in cid-ASCENDING order, calling
-    // emit(cid, seq_view) for each, using at most ~mem_cap bytes of RAM
-    // regardless of bucket size. This replaces "load whole bucket + in-RAM
-    // sort", whose peak was the FATTEST bucket -- and cid skew (unitigs
-    // cluster in low cids; cid ranges are equal-width) made one bucket
-    // dominate (661k emit-fasta: +36 GiB).
+    // emit(cid, seq_view) for each.
     //
-    // Common case (bucket <= mem_cap): one in-RAM chunk, sort, emit -- no
-    // spill, same speed as before. Large bucket: read in <=mem_cap chunks,
-    // sort each, spill as a sorted run file, then k-way merge the runs to the
-    // sink. Order WITHIN a cid is irrelevant (verify compares unitig sets; u2c
-    // only needs each cid's unitigs contiguous, which cid-order guarantees).
+    // RAM-resident bucket (the common case when the unitigs fit ram_budget):
+    // sort m_ram[b] in place and emit -- ZERO disk I/O, no temp round-trip.
+    //
+    // Spilled bucket: external cid-sort from its disk file, using at most
+    // ~mem_cap bytes regardless of bucket size (read in <=mem_cap chunks, sort
+    // each, spill as a sorted run file, k-way merge the runs to the sink). This
+    // bounds the emit peak even under cid skew (unitigs cluster in low cids;
+    // 661k emit-fasta saw one equal-width range hit +36 GiB). Order WITHIN a cid
+    // is irrelevant (verify compares unitig sets; u2c only needs each cid's
+    // unitigs contiguous, which cid-order guarantees).
     template <typename Emit>
     void read_bucket_sorted(uint32_t b, uint64_t mem_cap, Emit&& emit) {
+        if (!m_files[b]) {
+            // RAM-resident: sort + emit directly, then free the bucket's memory.
+            auto& recs = m_ram[b];
+            std::sort(recs.begin(), recs.end(),
+                      [](record const& x, record const& y) { return x.cid < y.cid; });
+            for (auto& r : recs) emit(r.cid, std::string_view(r.seq));
+            std::vector<record>().swap(recs);
+            return;
+        }
         std::FILE* f = m_files[b];
-        if (!f) throw std::runtime_error("read_bucket_sorted: file already closed");
         std::fflush(f);
         std::rewind(f);
         if (mem_cap < (1u << 20)) mem_cap = 1u << 20;  // sane floor
@@ -274,13 +276,63 @@ public:
             if (m_files[b]) {
                 std::fclose(m_files[b]);
                 m_files[b] = nullptr;
+                std::error_code ec;
+                std::filesystem::remove(bucket_path(b), ec);  // only spilled buckets exist
             }
-            std::error_code ec;
-            std::filesystem::remove(bucket_path(b), ec);
+            std::vector<record>().swap(m_ram[b]);  // free any RAM-resident records
+        }
+        m_buffered_bytes = 0;
+    }
+
+    // How many buckets had to spill to disk (0 == the whole unitig set stayed in
+    // RAM and the temp round-trip was skipped entirely). For the emit log line.
+    uint32_t spilled_buckets() const { return m_spilled_buckets; }
+
+private:
+    // Write one record to an already-open spilled bucket file.
+    void write_record_(std::FILE* f, uint64_t cid, std::string const& seq) {
+        const uint32_t seq_len = (uint32_t)seq.size();
+        if (std::fwrite(&cid, sizeof(cid), 1, f) != 1 or
+            std::fwrite(&seq_len, sizeof(seq_len), 1, f) != 1 or
+            (seq_len > 0 and std::fwrite(seq.data(), 1, seq_len, f) != (size_t)seq_len))
+            throw std::runtime_error("short write of unitig record to a bucket file");
+    }
+
+    // Spill bucket b's RAM-resident records to its (lazily-opened) disk file and
+    // free the memory. One-way: after this, operator() routes b straight to disk.
+    void spill_bucket_(uint32_t b) {
+        if (!m_files[b]) {
+            std::string path = bucket_path(b);
+            m_files[b] = std::fopen(path.c_str(), "wb+");
+            if (!m_files[b])
+                throw std::runtime_error("cannot open unitig bucket file: " + path + ": " +
+                                         std::strerror(errno));
+            ++m_spilled_buckets;
+        }
+        for (auto const& r : m_ram[b]) write_record_(m_files[b], r.cid, r.seq);
+        m_buffered_bytes -= m_ram_bytes[b];
+        m_ram_bytes[b] = 0;
+        std::vector<record>().swap(m_ram[b]);
+    }
+
+    // Evict largest-first until back under budget: the fattest in-RAM buckets
+    // (cid-skew hot spots) go to disk, leaving the small ones resident. Bucket
+    // granularity, but correct and bounded; degrades to all-disk if nothing fits.
+    void evict_until_under_budget_() {
+        while (m_buffered_bytes > m_ram_budget) {
+            uint32_t big = UINT32_MAX;
+            size_t best = 0;
+            for (uint32_t b = 0; b < m_num_buckets; ++b) {
+                if (!m_files[b] and m_ram_bytes[b] > best) {
+                    best = m_ram_bytes[b];
+                    big = b;
+                }
+            }
+            if (big == UINT32_MAX) break;  // nothing left in RAM to evict
+            spill_bucket_(big);
         }
     }
 
-private:
     uint32_t bucket_for_cid(uint64_t cid) const {
         if (m_num_color_classes == 0 or m_num_buckets <= 1) return 0;
         // Cids in [b * S, (b+1) * S) live in bucket b, where
@@ -295,8 +347,15 @@ private:
     std::string m_dir;
     uint64_t m_num_color_classes;
     uint32_t m_num_buckets;
-    std::vector<std::FILE*> m_files;
+    std::vector<std::FILE*> m_files;  // null until the bucket spills
     uint64_t m_total_unitigs = 0;
+
+    // In-RAM unitig buffer (skips the temp round-trip when it fits the budget).
+    std::vector<std::vector<record>> m_ram;  // RAM-resident records, per bucket
+    std::vector<size_t> m_ram_bytes;         // approx heap bytes held per bucket
+    size_t m_ram_budget = SIZE_MAX;          // cap on total m_buffered_bytes
+    size_t m_buffered_bytes = 0;             // sum of m_ram_bytes over RAM buckets
+    uint32_t m_spilled_buckets = 0;          // count of buckets evicted to disk
 };
 
 // ----------------------------------------------------------------------------

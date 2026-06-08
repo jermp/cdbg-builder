@@ -8,10 +8,17 @@ color-set run). Finally finalize `<out>.color_sets`, whose bit_vector was
 already streamed out word-by-word during Phase 2 — finalize appends the
 Elias–Fano of per-class bit-offsets and writes the header totals.
 
+The unitig buckets are **RAM-first**: `unitig_bucket_writer` keeps them in
+memory up to a `-g`-derived budget, so emit reads the unitigs straight from
+RAM and the sequences never round-trip through disk (no temp-bucket write in
+stitch, no read-back here). Only buckets that exceed the budget spill to
+`tmp/unitig_bucket_<k>.bin` and are external-merge-sorted at emit.
+
 See `algorithm.md` §6 for the full description.
 
 ## Input
-- `tmp/unitig_bucket_<k>.bin`, `k ∈ [0, K)` (cid-range order).
+- the in-RAM cid-range unitig buckets (the `unitig_bucket_writer` carried over
+  from stitch), plus any `tmp/unitig_bucket_<k>.bin` that spilled under `-g`.
 - the in-progress `<out>.color_sets` (to finalize) and the running
   `streaming_color_set_dict`.
 
