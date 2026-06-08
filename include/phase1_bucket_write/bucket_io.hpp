@@ -147,16 +147,7 @@ public:
                 // across batches/colors AND-shrink the begin/end bits.
                 e.flags = r.flags;
                 e.colors.push_back(r.color);
-                // Charge the spill budget by the UNPACKED base length (the key's
-                // varint prefix), not the packed key size. The keys are 4x
-                // smaller now, but the per-entry cost that actually drives RAM is
-                // the colors vector + map node, not the key bytes. Counting
-                // unpacked keeps the spill cadence -- hence the resident entry
-                // count and peak RAM -- the same as before the 2-bit packing,
-                // independent of -g.
-                size_t vp = 0;
-                uint64_t base_len = varint_read((uint8_t const*)key.data(), key.size(), vp);
-                m_bytes += (size_t)base_len + sizeof(uint32_t);
+                m_bytes += key.size() + sizeof(uint32_t);
                 m_dedup.emplace(std::string(key), std::move(e));
                 ++inserts;
             } else {
