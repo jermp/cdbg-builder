@@ -440,7 +440,7 @@ struct bucket_write_prof {
     std::atomic<uint64_t> ns_lock_wait{0};
     // Hashmap find/insert/update inside insert_batch (excludes spill).
     std::atomic<uint64_t> ns_hashmap{0};
-    // sort+unique colors + write_super_kmer + gzwrite for each entry.
+    // sort+unique colors + write_super_kmer_packed + gzwrite for each entry.
     std::atomic<uint64_t> ns_spill{0};
 
     // ---- counters ----
@@ -474,7 +474,7 @@ struct bucket_write_prof {
             "  flush        %6.2fs   (writer.flush total = lock + hashmap + spill)\n"
             "    lock_wait  %6.2fs\n"
             "    hashmap    %6.2fs\n"
-            "    spill      %6.2fs   (sort+unique + write_super_kmer + gzwrite)\n"
+            "    spill      %6.2fs   (sort+unique + write_super_kmer_packed + gzwrite)\n"
             "  counts: files=%llu records=%llu flushes=%llu spills=%llu inserts=%llu\n",
             s(ns_seq_read), s_compute, s(ns_scan2bit), s(ns_flush), s(ns_lock_wait), s(ns_hashmap),
             s(ns_spill), (unsigned long long)load(n_files), (unsigned long long)load(n_records),

@@ -14,6 +14,7 @@
 // files is one mutex per bucket.
 
 #include <atomic>
+#include <cassert>
 #include <cstdint>
 #include <iostream>
 #include <thread>
@@ -36,7 +37,7 @@ inline void emit_super_kmers(uint8_t const* bases, uint32_t L, uint32_t k, uint3
                              uint32_t color, uint32_t num_buckets,
                              per_thread_bucket_buffers& sink)  //
 {
-    if (L < k) return;
+    assert(L >= k);  // caller only emits runs with run_len >= k
     const uint32_t K = L - k + 1;  // number of k-mers; (k-1)-mers indexed by 0..K
 
     // Minimize over (k-1)-mers, NOT k-mers. A (k-1)-mer has (k-1)-m+1 = k-m m-mers, so the
@@ -148,36 +149,45 @@ inline void ingest_file_bucketed(std::string const& path, uint32_t k, uint32_t m
     char const* s = nullptr;
     size_t l = 0;
     std::vector<uint8_t> bases_buf;
+    // Accumulate the scan/decode timer in a local and flush it to the shared
+    // atomic once per file (below), instead of fetch_add-ing the contended
+    // global counter once per ACGT run in the hot loop.
+    uint64_t scan_ns = 0;
     for (;;) {
         auto t_read = bucket_write_prof::clock::now();
         bool ok = r.next(s, l);
         prof.ns_seq_read.fetch_add(bucket_write_prof::since(t_read), std::memory_order_relaxed);
         if (!ok) break;
         auto t_body = bucket_write_prof::clock::now();
+        // One scratch buffer per sequence, grown (never per-run resized) to the
+        // sequence length; runs are written into its front [0, run_len).
+        if (bases_buf.size() < l) bases_buf.resize(l);
+        uint8_t* buf = bases_buf.data();
         size_t pos = 0;
         while (pos < l) {
-            // Find an ACGT-only run starting at pos, converting to 2-bit. This
-            // scan + conversion is exactly what a SIMD FASTX parser replaces;
-            // time it separately from emit_super_kmers.
+            // Single pass: scan an ACGT-only run starting at pos, decoding each
+            // base to 2-bit straight into `buf` and stopping at the first
+            // non-ACGT char. (Previously a scan-for-end loop and a separate
+            // decode loop each called nuc_to_2bit over the run -- two passes;
+            // this is one.) This scan + decode is what a SIMD FASTX parser
+            // replaces; time it separately from emit_super_kmers.
             auto t_scan = bucket_write_prof::clock::now();
-            size_t end = pos;
-            while (end < l and nuc_to_2bit(s[end]) != 0xff) ++end;
-            size_t run_len = end - pos;
-            bool have_run = run_len >= k;
-            if (have_run) {
-                bases_buf.resize(run_len);
-                for (size_t i = 0; i < run_len; ++i) { bases_buf[i] = nuc_to_2bit(s[pos + i]); }
+            size_t run_len = 0;
+            while (pos < l) {
+                uint8_t b = nuc_to_2bit(s[pos]);
+                if (b == 0xff) break;
+                buf[run_len++] = b;
+                ++pos;
             }
-            prof.ns_scan2bit.fetch_add(bucket_write_prof::since(t_scan), std::memory_order_relaxed);
-            if (have_run) {
-                emit_super_kmers(bases_buf.data(), (uint32_t)run_len, k, m, color, num_buckets,
-                                 sink);
+            scan_ns += bucket_write_prof::since(t_scan);
+            if (run_len >= k) {
+                emit_super_kmers(buf, (uint32_t)run_len, k, m, color, num_buckets, sink);
             }
-            pos = end;
             while (pos < l and nuc_to_2bit(s[pos]) == 0xff) ++pos;
         }
         prof.ns_loop_body.fetch_add(bucket_write_prof::since(t_body), std::memory_order_relaxed);
     }
+    prof.ns_scan2bit.fetch_add(scan_ns, std::memory_order_relaxed);
     prof.n_files.fetch_add(1, std::memory_order_relaxed);
 }
 
