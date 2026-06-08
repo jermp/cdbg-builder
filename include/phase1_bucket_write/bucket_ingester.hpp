@@ -149,6 +149,10 @@ inline void ingest_file_bucketed(std::string const& path, uint32_t k, uint32_t m
     char const* s = nullptr;
     size_t l = 0;
     std::vector<uint8_t> bases_buf;
+    // Accumulate the scan/decode timer in a local and flush it to the shared
+    // atomic once per file (below), instead of fetch_add-ing the contended
+    // global counter once per ACGT run in the hot loop.
+    uint64_t scan_ns = 0;
     for (;;) {
         auto t_read = bucket_write_prof::clock::now();
         bool ok = r.next(s, l);
@@ -175,7 +179,7 @@ inline void ingest_file_bucketed(std::string const& path, uint32_t k, uint32_t m
                 buf[run_len++] = b;
                 ++pos;
             }
-            prof.ns_scan2bit.fetch_add(bucket_write_prof::since(t_scan), std::memory_order_relaxed);
+            scan_ns += bucket_write_prof::since(t_scan);
             if (run_len >= k) {
                 emit_super_kmers(buf, (uint32_t)run_len, k, m, color, num_buckets, sink);
             }
@@ -183,6 +187,7 @@ inline void ingest_file_bucketed(std::string const& path, uint32_t k, uint32_t m
         }
         prof.ns_loop_body.fetch_add(bucket_write_prof::since(t_body), std::memory_order_relaxed);
     }
+    prof.ns_scan2bit.fetch_add(scan_ns, std::memory_order_relaxed);
     prof.n_files.fetch_add(1, std::memory_order_relaxed);
 }
 
