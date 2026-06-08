@@ -1,45 +1,8 @@
-- file kmer.hpp:
-
-are these functions
-
-`reverse_complement`
-`canonical`
-`is_canonical`
-`string_to_kmer`
-
-used in hot loops?
-
-Beware that they might be costly and reverse complements can be computed inplace and in O(1); see here:
-https://github.com/jermp/sshash/blob/master/include/kmer.hpp#L159.
-
-- file super_kmer.hpp:
-
-is this function `inline void write_super_kmer(uint8_t flags, uint32_t const* colors, uint32_t num_colors, uint8_t const* bases, uint32_t len, std::vector<uint8_t>& out)` used anymore?
-
 - file seq_reader.hpp:
 
 why mmap is used here? careful that mmap can silently make the RSS grow if RAM is available. it would be good to remove it entirely from the codebase. Is it used somewhere else?
 
 - file bucket_ingester.hpp:
-
-in the function `ingest_file_bucketed`, we have these two hot loops:
-
-```
-....
-while (end < l and nuc_to_2bit(s[end]) != 0xff) ++end;
-size_t run_len = end - pos;
-bool have_run = run_len >= k;
-if (have_run) {
-    bases_buf.resize(run_len);
-    for (size_t i = 0; i < run_len; ++i) { bases_buf[i] = nuc_to_2bit(s[pos + i]); }
-}
-...
-```
-
-but clearly they can be merged into one, we can write directly to `bases_buf` the transformed values and stop when we hit a non-ACGT char.
-If then the run is >= k, we go ahead, otherwise we reset the buffer. that is, we avoid having the while+for.
-
-Also, we can avoid this call `bases_buf.resize(run_len);` but just keep track of the current begin into bases_buf and current run_len.
 
 WELL, reading ahead the function `emit_super_kmers`: since super-kmers are computed over bytes, not a 2-bit encoded stream, why do we need to first copy the bytes into the local buffer bases_buf??? we can use directly the buffer held inside the seq_reader object, no?
 So this buffer is directly passed to the `emit_super_kmers` function that directly produces super-kmers, having care to stop when a non-ACGT char is met. Otherwise we keep copying bytes twice and transforming ACGT into 0123 which is not necessary, we can use these maps
@@ -75,10 +38,8 @@ So this buffer is directly passed to the `emit_super_kmers` function that direct
     static uint64_t char_to_uint(char c) { return (c >> 1) & 3; }
 #endif
 
-in the function `emit_super_kmers`, we have this test `if (L < k) return;` but we already enforced this, so we should actually put an assert
-like assert(L >= k).
 
-file bucket_io.hpp:
+- file bucket_io.hpp:
 
 struct pending_record {
     uint64_t hash;
@@ -114,3 +75,10 @@ struct pending_record {
 #pragma pack(pop)
 
 or can this layout be optimized?
+
+- in file bucket_io.hpp:
+
+in struct `bucket_writer`: why `std::vector<std::unique_ptr<bucket_compactor>> m_compactors;` and not `std::vector<bucket_compactor> m_compactors;`?
+
+in struct `bucket_compactor`:
+here `e.colors.erase(std::unique(e.colors.begin(), e.colors.end()), e.colors.end());` we can avoid the call to `erase` and just write the unique colors from e.colors.begin() to end, where end = std::unique(...).
