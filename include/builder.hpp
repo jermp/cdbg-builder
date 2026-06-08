@@ -290,8 +290,30 @@ struct builder {
 
                 const uint64_t unitig_bucket_count = pick_unitig_bucket_count_(
                     m_num_color_classes, total_frag_seq_bytes, m_cfg.max_ram_gb);
-                uwriter_ptr = std::make_unique<unitig_bucket_writer>(tmp_dir, m_num_color_classes,
-                                                                     unitig_bucket_count);
+
+                // In-RAM unitig output budget. Keeping stitched unitigs in memory
+                // skips the temp-bucket write here AND the read-back in emit -- the
+                // unitig sequences never round-trip through disk (~half of emit on a
+                // spinning disk). Carved from the SAME post-carry budget the stitch
+                // uses (stitch_post_carry below), so their sum still respects -g.
+                // Stitching only merges fragments, so total unitig bases <=
+                // total_frag_seq_bytes; budget at ~1.5x for std::string/vector
+                // overhead, but never take more than 40% from stitch. No -g =>
+                // SIZE_MAX: keep every unitig in RAM. The writer spills its largest
+                // buckets to the disk path when the budget is exceeded.
+                size_t unitig_ram_budget = SIZE_MAX;
+                uint64_t stitch_post_carry = 0;
+                if (m_cfg.max_ram_gb > 0) {
+                    const uint64_t total = m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0;
+                    const uint64_t carry =
+                        global_dict.resident_bytes() + 2ull * 1024 * 1024 * 1024;
+                    stitch_post_carry = total > carry ? total - carry : 256ull * 1024 * 1024;
+                    const uint64_t est = (uint64_t)(total_frag_seq_bytes * 1.5);
+                    unitig_ram_budget =
+                        std::min<uint64_t>(est, (uint64_t)(stitch_post_carry * 0.4));
+                }
+                uwriter_ptr = std::make_unique<unitig_bucket_writer>(
+                    tmp_dir, m_num_color_classes, unitig_bucket_count, unitig_ram_budget);
 
                 std::atomic<uint64_t> done{0};
                 progress prog("stitch", done, n_frags);
@@ -324,11 +346,13 @@ struct builder {
                 // cap = -g minus the cross-phase carry (the color dict that
                 // stays resident through stitch) minus a working-set reserve
                 // for the per-bucket decode set. 0 means no -g => use all RAM.
+                // The unitig buffer's budget was carved from stitch_post_carry
+                // above; give stitch what remains so the two don't double-spend -g.
                 uint64_t stitch_ram_cap = 0;
                 if (m_cfg.max_ram_gb > 0) {
-                    const uint64_t total = m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0;
-                    const uint64_t carry = global_dict.resident_bytes() + 2ull * 1024 * 1024 * 1024;
-                    stitch_ram_cap = total > carry ? total - carry : 256ull * 1024 * 1024;
+                    stitch_ram_cap = stitch_post_carry > unitig_ram_budget
+                                         ? stitch_post_carry - unitig_ram_budget
+                                         : 256ull * 1024 * 1024;
                 }
                 std::cout << "  compact stitch: scalable, RAM-first cap "
                           << (stitch_ram_cap ? format_bytes(stitch_ram_cap)
