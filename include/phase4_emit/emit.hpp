@@ -54,7 +54,7 @@ inline void emit_fasta(unitig_bucket_writer& uwriter, std::string const& out_bas
         if (pos + n > BUF_BYTES) flush_buf();
     };
 
-    bits::bit_vector::builder u2c_bvb((uint64_t)num_unitigs, /*init=*/false);
+    bits::bit_vector::builder u2c_bvb(num_unitigs, /*init=*/false);
     size_t emitted = 0;
     uint64_t prev_cid = 0;
 

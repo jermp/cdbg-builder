@@ -34,11 +34,12 @@ namespace detail {
 // appropriate bucket files.
 inline void emit_super_kmers(uint8_t const* bases, uint32_t L, uint32_t k, uint32_t m,
                              uint32_t color, uint32_t num_buckets,
-                             per_thread_bucket_buffers& sink) {
+                             per_thread_bucket_buffers& sink)  //
+{
     if (L < k) return;
-    const uint32_t K = L - k + 1;  // number of k-mers; (k-1)-mers indexed 0..K
-    // Minimize over (k-1)-mers, NOT k-mers (GGCAT/BCALM2: lib.rs:94
-    // BatchMinQueue::new(k - m)). A (k-1)-mer has (k-1)-m+1 = k-m m-mers, so the
+    const uint32_t K = L - k + 1;  // number of k-mers; (k-1)-mers indexed by 0..K
+
+    // Minimize over (k-1)-mers, NOT k-mers. A (k-1)-mer has (k-1)-m+1 = k-m m-mers, so the
     // window is W = k - m. This is what co-locates branches: every dBG edge
     // X->Y shares its junction (k-1)-mer S = suffix(X) = prefix(Y), and both
     // endpoints route to bucket(min(S)). A branch X->{Y1,Y2} shares one S, so
@@ -49,22 +50,20 @@ inline void emit_super_kmers(uint8_t const* bases, uint32_t L, uint32_t k, uint3
     // intrinsic: X is primary in bucket(min(prefix(X))), foreign elsewhere.
     const uint32_t W = k - m;  // window size, in m-mer indices (a (k-1)-mer)
 
-    auto bucket_of = [&](uint64_t h) -> uint32_t {
-        // Skip the bottom bit to match GGCAT's "uniqueness-flag" reservation,
-        // then map the minimizer hash into [0, num_buckets) with a modulo.
-        // num_buckets need not be a power of two (it's sized from the RAM model),
-        // and the divide is negligible here: once per super-k-mer, dwarfed by the
-        // per-base ntHash/minimizer scan.
-        //
-        // A multiply-shift range reduction (h * B >> 64) was tried and REVERTED:
-        // it maps proportionally to the hash VALUE, so it needs h uniform over
-        // [0, 2^64). But canonical_mhash = min(fwd, rc) is biased toward small
-        // values (the min of two uniforms), and the >>1 caps it at 2^63 -- so the
-        // reduction piled almost everything into a few low buckets (2353/11915
-        // nonempty, max bucket 243 MiB), collapsing dedup. The modulo keys on the
-        // LOW bits, which stay uniform even when the magnitude is skewed.
-        return (uint32_t)((h >> 1) % num_buckets);
-    };
+    // Skip the bottom bit to match GGCAT's "uniqueness-flag" reservation,
+    // then map the minimizer hash into [0, num_buckets) with a modulo.
+    // num_buckets need not be a power of two (it's sized from the RAM model),
+    // and the divide is negligible here: once per super-k-mer, dwarfed by the
+    // per-base ntHash/minimizer scan.
+    //
+    // A multiply-shift range reduction (h * B >> 64) was tried and REVERTED:
+    // it maps proportionally to the hash VALUE, so it needs h uniform over
+    // [0, 2^64). But canonical_mhash = min(fwd, rc) is biased toward small
+    // values (the min of two uniforms), and the >>1 caps it at 2^63 -- so the
+    // reduction piled almost everything into a few low buckets (2353/11915
+    // nonempty, max bucket 243 MiB), collapsing dedup. The modulo keys on the
+    // LOW bits, which stay uniform even when the magnitude is skewed.
+    auto bucket_of = [&](uint64_t h) -> uint32_t { return (uint32_t)((h >> 1) % num_buckets); };
 
     uint64_t fwd = 0, rc = 0;
     if (!nthash_init(bases, m, fwd, rc)) return;  // run is ACGT-only, shouldn't happen
