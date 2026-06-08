@@ -58,8 +58,13 @@ namespace cdbg {
 // record-color list per bucket.
 struct kmer_entry {
     static constexpr uint32_t NO_RSID = UINT32_MAX;
+    // During load/resolve this holds the k-mer's record-set id(s) (first_rsid +
+    // any rest). AFTER resolve it is REPURPOSED to hold the k-mer's resolved
+    // local color-set id (cid): the rsids are dead once resolve has interned
+    // them, so the cid lives here instead of in a separate kmer->cid map. The
+    // walk reads first_rsid as the cid for primary k-mers.
     uint32_t first_rsid = NO_RSID;
-    std::vector<uint32_t> rest;  // empty in the common case
+    std::vector<uint32_t> rest;  // empty in the common case; freed after resolve
 
     void add(uint32_t rsid) {
         if (first_rsid == NO_RSID)
@@ -333,13 +338,12 @@ inline void process_bucket(std::string const& path, uint32_t k, uint64_t num_col
                            compact_color_set_dict& out_local_dict) {
     auto& prof = process_prof();
     bucket_kmer_map kmer_info;
-    ankerl::unordered_dense::map<kmer_int_t, uint32_t, kmer_hasher> cid_of;
     {
-        // record_sets and the per-k-mer rsid storage are only needed
-        // while we're building cid_of. Scoping them here releases the
-        // record-set arena and the inner rsid vectors (via the
-        // kmer_entry{} reset below) before the walk phase, so the walk
-        // sees only kmer_info's phantom bits + cid_of.
+        // record_sets and the per-k-mer rsid storage are only needed while we
+        // resolve each k-mer's cid. We then stash the cid back INTO kmer_info
+        // (reusing kmer_entry.first_rsid, dead after resolve) and free the rest
+        // vectors, so the walk needs no separate kmer->cid map -- it reads the
+        // cid straight from the kmer_info entry it already looks up.
         //
         // record_sets is the compact (hybrid-encoded) variant -- on
         // dense pangenome inputs the live-vector dict grew to hundreds
@@ -362,7 +366,6 @@ inline void process_bucket(std::string const& path, uint32_t k, uint64_t num_col
         // otherwise we k-way-merge the referenced color lists into a
         // fresh sorted set and intern that.
         std::vector<uint32_t> rsid_to_cid(record_sets.size(), UINT32_MAX);
-        cid_of.reserve(kmer_info.size());
 
         // Scratch reused across all .at() calls so we don't allocate a
         // fresh decoded-colors buffer per access.
@@ -382,7 +385,8 @@ inline void process_bucket(std::string const& path, uint32_t k, uint64_t num_col
             // Only PRIMARY k-mers carry color (an rsid); foreign overlap copies
             // have no rsid and get no cid -- their colored copy lives in the
             // adjacent bucket. Skipping them also avoids indexing rsid_to_cid
-            // with NO_RSID. The walk never reads cid_of for a foreign k-mer.
+            // with NO_RSID. The walk reads a cid only for primary k-mers, so a
+            // foreign entry's first_rsid stays NO_RSID and is never used as a cid.
             if (!kv.second.primary) continue;
             kmer_entry& e = kv.second.colors;
             uint32_t cid;
@@ -411,9 +415,12 @@ inline void process_bucket(std::string const& path, uint32_t k, uint64_t num_col
                     cid = out_local_dict.intern(merged_scratch);
                 }
             }
-            cid_of.emplace(kv.first, cid);
-            // Drop per-k-mer rsid storage immediately; phantom bits stay.
-            e = kmer_entry{};
+            // Stash the resolved cid back into the entry (first_rsid is dead now)
+            // and free the rsid overflow -- the walk reads the cid straight from
+            // here, so there is no separate kmer->cid map. The phantom/flags bits
+            // on bucket_kmer_info stay.
+            std::vector<uint32_t>().swap(e.rest);
+            e.first_rsid = cid;
         }
         prof.ns_resolve.fetch_add(bucket_process_prof::since(t_resolve), std::memory_order_relaxed);
     }
@@ -517,8 +524,10 @@ inline void process_bucket(std::string const& path, uint32_t k, uint64_t num_col
             // A foreign boundary k-mer (open end, colored by the adjacent
             // bucket) gets a COLOR_RUN_FOREIGN placeholder; the stitch replaces
             // it with the real color from the primary-side partner at the join.
-            bool prim = kmer_info.find(p.first)->second.primary;
-            push_cid(u.runs, prim ? cid_of[p.first] : COLOR_RUN_FOREIGN);
+            // One lookup: .primary and the resolved cid both live on the entry
+            // (cid was stashed into colors.first_rsid by the resolve pass).
+            auto const& info = kmer_info.find(p.first)->second;
+            push_cid(u.runs, info.primary ? info.colors.first_rsid : COLOR_RUN_FOREIGN);
         };
         for (auto it = bw.rbegin(); it != bw.rend(); ++it) append_kmer(*it);
         append_kmer({seed, false});
@@ -609,8 +618,8 @@ inline void process_buckets(bucket_writer const& writer, uint32_t k, uint64_t nu
 
     // Per-bucket resident WORKING SET as a multiple of the bucket's uncompressed
     // on-disk bytes. This must cover everything an in-flight bucket holds at its
-    // walk-phase peak, not just kmer_info: kmer_info + cid_of + visited +
-    // bucket_unitigs (emitted fragments) + local_dict. Measured on 100K -g16:
+    // walk-phase peak, not just kmer_info: kmer_info (cid now stored inline) +
+    // visited + bucket_unitigs (emitted fragments) + local_dict. Measured on 100K -g16:
     // peak/reserved was 1.20x at small buckets and 1.37x at large ones with a
     // 16x kmer_info-only estimate -> the full working set is ~24x. Under-
     // reserving here over-admits and busts -g; the live-RSS ceiling below is the
