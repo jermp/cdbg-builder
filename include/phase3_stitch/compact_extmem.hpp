@@ -290,10 +290,18 @@ struct ram_budget {
 // release. Mirrors the bucket-write RSS watcher. RAII: stops + joins on destroy.
 struct rss_watcher {
     rss_watcher(ram_budget& b, uint64_t high, uint64_t low,
-                std::chrono::milliseconds interval = std::chrono::milliseconds(100)) {
+                std::chrono::milliseconds interval = std::chrono::milliseconds(25)) {
         if (high == 0) return;  // no -g: disabled
         m_run.store(true, std::memory_order_relaxed);
         m_thread = std::thread([this, &b, high, low, interval] {
+            // Poll FAST (small interval) so rss_over trips early -- the residual
+            // overshoot above `high` is allocation_rate * (poll lag + spill lag),
+            // and a tight poll keeps that spike small (it was ~1.6 GiB at 100 ms).
+            // malloc_trim is the opposite: it's the costly part (a full heap
+            // walk), and the spill already freed the pages, so trimming only
+            // hands them back to the OS -- throttle it so frequent polling
+            // doesn't pay the trim cost every tick.
+            auto last_trim = std::chrono::steady_clock::now();
             while (m_run.load(std::memory_order_relaxed)) {
                 std::this_thread::sleep_for(interval);
                 if (!m_run.load(std::memory_order_relaxed)) break;
@@ -303,7 +311,11 @@ struct rss_watcher {
                 if (rss >= high) {
                     b.rss_over.store(true, std::memory_order_relaxed);
 #if defined(__GLIBC__)
-                    ::malloc_trim(0);  // return the spilled stores' freed pages
+                    auto now = std::chrono::steady_clock::now();
+                    if (now - last_trim >= std::chrono::milliseconds(250)) {
+                        ::malloc_trim(0);  // return the spilled stores' freed pages
+                        last_trim = now;
+                    }
 #endif
                 } else if (rss <= low) {
                     b.rss_over.store(false, std::memory_order_relaxed);
@@ -1262,10 +1274,12 @@ inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frag
 
     // Measured-RSS backstop: the payload model (cap) undercounts real RSS at
     // scale, so a watcher polls live RSS and force-spills the stores when the
-    // process crosses the -g target. Trip at 0.85, release at 0.70 (hysteresis +
-    // poll/spill lag headroom). rss_target_bytes == 0 (no -g) disables it.
-    rss_watcher watcher(budget, (uint64_t)(rss_target_bytes * 0.85),
-                        (uint64_t)(rss_target_bytes * 0.70));
+    // process crosses the -g target. Trip at 0.70, release at 0.55: the trip
+    // must sit a residual-spike below -g (the stitch allocates fast in phase 2,
+    // so RSS overshoots the trip by ~allocation_rate * react-lag before the
+    // spill catches up). rss_target_bytes == 0 (no -g) disables it.
+    rss_watcher watcher(budget, (uint64_t)(rss_target_bytes * 0.70),
+                        (uint64_t)(rss_target_bytes * 0.55));
 
     // --- seed + doubling: emit member records bucketed by frag_id range ------
     id_round_store_hybrid store(dir, num_buckets, &budget);
