@@ -35,10 +35,6 @@
 #include <lz4.h>
 #include <unordered_dense/unordered_dense.h>
 
-#if defined(__GLIBC__)
-#include <malloc.h>  // malloc_trim under the RSS backstop
-#endif
-
 #include "kmer.hpp"                  // kmer_int_t, reverse_complement, kmer_hasher, nuc_to_2bit
 #include "util.hpp"                  // current_rss_bytes / process_peak_rss_bytes (RSS backstop)
 #include "phase3_stitch/stitch.hpp"  // SIDE_*, UNITIG_OPEN_*, revcomp_string
@@ -284,10 +280,8 @@ struct ram_budget {
 
 // Background live-RSS backstop for the stitch's ram_budget. Polls real RSS and,
 // with hysteresis, trips budget.rss_over when RSS crosses `high` (so the next
-// store emit force-spills) and releases at `low`. malloc_trim()s under pressure
-// so the spilled stores' freed pages actually return to the OS -- otherwise RSS
-// would stay high (freed pages parked in glibc arenas) and pressure would never
-// release. Mirrors the bucket-write RSS watcher. RAII: stops + joins on destroy.
+// store emit force-spills) and releases at `low`. Mirrors the bucket-write RSS
+// watcher. RAII: stops + joins on destroy.
 struct rss_watcher {
     rss_watcher(ram_budget& b, uint64_t high, uint64_t low,
                 std::chrono::milliseconds interval = std::chrono::milliseconds(25)) {
@@ -296,12 +290,11 @@ struct rss_watcher {
         m_thread = std::thread([this, &b, high, low, interval] {
             // Poll FAST (small interval) so rss_over trips early -- the residual
             // overshoot above `high` is allocation_rate * (poll lag + spill lag),
-            // and a tight poll keeps that spike small (it was ~1.6 GiB at 100 ms).
-            // malloc_trim is the opposite: it's the costly part (a full heap
-            // walk), and the spill already freed the pages, so trimming only
-            // hands them back to the OS -- throttle it so frequent polling
-            // doesn't pay the trim cost every tick.
-            auto last_trim = std::chrono::steady_clock::now();
+            // and a tight poll keeps that spike small. We deliberately do NOT
+            // malloc_trim here: spilling a store bucket frees a large (mmap-backed)
+            // buffer, which free() returns to the OS on its own, and a periodic
+            // full-heap trim is overkill (it was also letting freed pages pile up
+            // between trims, inflating the spike).
             while (m_run.load(std::memory_order_relaxed)) {
                 std::this_thread::sleep_for(interval);
                 if (!m_run.load(std::memory_order_relaxed)) break;
@@ -310,13 +303,6 @@ struct rss_watcher {
                 if (rss == 0) continue;
                 if (rss >= high) {
                     b.rss_over.store(true, std::memory_order_relaxed);
-#if defined(__GLIBC__)
-                    auto now = std::chrono::steady_clock::now();
-                    if (now - last_trim >= std::chrono::milliseconds(250)) {
-                        ::malloc_trim(0);  // return the spilled stores' freed pages
-                        last_trim = now;
-                    }
-#endif
                 } else if (rss <= low) {
                     b.rss_over.store(false, std::memory_order_relaxed);
                 }
