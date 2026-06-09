@@ -734,6 +734,57 @@ sequences + color runs) is retired from the build but **kept as the
 independent reference oracle** that `test_stitch` cross-checks this
 production path against — both must produce the identical unitig multiset.
 
+### 5.6 Bounding the non-spillable per-range member array
+
+The one structure in the stitch that is **not** spillable is phase-2's
+decoded per-range array (§5.3): `arr[fid − lo]`, a random-access
+`frag_id → {chain_id, pos, pack}` lookup that the base-attach pass indexes
+directly, so it must be fully resident. Its footprint is one `frag_id`
+range:
+
+```
+member_set = range_size · PER_FRAG
+range_size = ⌈ n_frags / frag_ranges ⌉
+PER_FRAG   = 37 B          (16 B Slot + 21 B encoded member record)
+```
+
+(The full member-record corpus is still RAM-first / spill-overflow like
+every other store in §5.5; only the *one* decoded range is pinned in RAM.)
+
+To keep this within `-g`, the builder **scales `frag_ranges`** so the
+per-range set fits a budget share, rather than holding it at the fixed
+default of 64:
+
+```
+member_budget = min( avail, 0.25 · g ),    avail = g − stitch_ram_cap
+frag_ranges   = clamp( ⌈ n_frags · PER_FRAG / member_budget ⌉, 64, 2¹⁶ )
+```
+
+More ranges just means more, smaller on-disk member buckets — the output is
+identical. The clamp ceiling (2¹⁶ ranges) caps the spill-bucket fan-out.
+Only if even that ceiling cannot bound the set does the build **abort**
+rather than silently exceed `-g`. Inverting the trip condition
+`range_size · PER_FRAG > member_budget` at the ceiling
+`frag_ranges = 2¹⁶` gives the fragment count at which that happens:
+
+```
+n_frags_trip = member_budget · 2¹⁶ / PER_FRAG = 0.25 · g · 2¹⁶ / 37
+```
+
+— **linear in `-g`**. At `-g 4 GiB` (so `member_budget ≤ 1 GiB = 2³⁰`):
+
+```
+n_frags_trip = 2³⁰ · 2¹⁶ / 37 = 2⁴⁶ / 37 ≈ 1.9 × 10¹² fragments.
+```
+
+Real inputs sit orders of magnitude below this — 661k genomes produce on
+the order of 10⁸–10⁹ fragments — so the scaling always absorbs the load and
+the abort is purely the hard-contract backstop. Two caveats on the number:
+the trip point scales linearly, so doubling `-g` doubles it; and `0.25 · g`
+is the *optimistic* ceiling on `member_budget` — when `stitch_ram_cap` eats
+most of `-g`, `avail` becomes the binding term and the trip point drops
+proportionally.
+
 ---
 
 ## 6. Phase 4: emit (`include/phase4_emit/emit.hpp`)
@@ -754,15 +805,20 @@ budget). Per-bucket file format:
 1. Read all records (one bucket's worth fits in memory by design).
 2. Sort by `cid`.
 3. For each record: write `>cid\n<seq>\n` to `<out>.fa`.
-4. Track the running `cid` and a `bits::bit_vector::builder u2c_bvb`
-   constructed pre-sized to `num_unitigs` with `init=false` (one
-   `n_unitigs / 8`-byte allocation up front, no growth, no
-   zero-fill). On each cid-group boundary, set
-   `u2c_bvb.set(emitted - 1, 1)` (the previous unitig was the last
-   of its run).
+4. Track the running `cid` and **stream** the u2c bit_vector straight to
+   `<out>.u2c` through a `streaming_bit_vector_writer`. On each cid-group
+   boundary, `u2c_writer.set(emitted - 1)` (the previous unitig closed its
+   run). The set bits are produced in ascending unitig order, so the writer
+   holds only the current 64-bit partial word: a set whose position lands in
+   a later word flushes the intervening words first. Both totals are known up
+   front — `num_bits = num_unitigs`, `num_words = ⌈num_unitigs / 64⌉` — so the
+   header is written immediately, no seek-back.
 
-After all buckets: set the very last bit (closes the final run),
-build the bit_vector, `essentials::save` to `<out>.u2c`.
+After all buckets: set the very last bit (closes the final run) and
+`finish()` flushes the trailing/zero words. The on-disk bytes are
+byte-identical to `essentials::save(bits::bit_vector)`
+(`[u64 num_bits][u64 num_words][num_words · u64]`), so the u2c never sits in
+RAM as an `n_unitigs / 8`-byte bitmap — one more non-spillable floor removed.
 
 `u2c` invariants:
 
@@ -875,8 +931,11 @@ appear consecutively.
 
 ### 8.2 `<out>.u2c`
 
-One `bits::bit_vector` serialized with `essentials::save`. See §6.2
-for invariants and rank semantics.
+One `bits::bit_vector`, in the exact `essentials::save` layout
+(`[u64 num_bits][u64 num_words][num_words · u64]`) but written
+incrementally by the `streaming_bit_vector_writer` (§6.2), so it loads
+back with a plain `essentials::load`. See §6.2 for invariants and rank
+semantics.
 
 ### 8.3 `<out>.color_sets`
 
@@ -950,10 +1009,15 @@ working set is small to begin with; the bases are re-read from the frag
 spill once during assembly (§5.3) and held only one chain bucket at a
 time per worker. This hard spill cap replaced the old base-carrying
 stitch, which was sized by model only (no enforcement) and was the
-pipeline RAM peak — 41 GiB on the 661K run.
+pipeline RAM peak — 41 GiB on the 661K run. The one stitch structure that
+cannot spill — phase-2's decoded per-range member array — is instead kept
+in budget by scaling `frag_ranges` (§5.6); the abort it falls back to is
+unreachable below ~10¹² fragments at `-g 4 GiB`.
 
 Emit peak: one cid-range bucket of records loaded for sorting (~3 MB
-on salmonella-25K), plus the u2c bit_vector builder.
+on salmonella-25K). The u2c bit_vector is streamed straight to disk
+(§6.2), holding only its current 64-bit word, so it no longer figures in
+the peak.
 
 The streaming color_set_dict's RAM cost is bounded by per-class
 metadata (16 B + ~12 B index entry per class), independent of
