@@ -359,21 +359,46 @@ struct builder {
                                              : std::string("unlimited"))
                           << "\n";
                 // Stitch phase-2 holds one frag-range's member array (Slot =
-                // 16 B) resident -- NON-spillable. Its size is n_frags /
-                // frag_ranges, and frag_ranges is fixed at STITCH_FRAG_RANGES in
-                // compact_stitch_scalable. It coexists with the RAM-first stores
-                // (stitch_ram_cap), so it must fit in what's left of -g; abort if
-                // not. (TODO: scale frag_ranges instead of aborting.)
+                // 16 B) plus that range's encoded records (~21 B) resident --
+                // NON-spillable. Its size is range_size = ceil(n_frags /
+                // frag_ranges), so we SCALE frag_ranges up until this per-range
+                // working set fits a modest share of -g (it coexists with the
+                // spillable RAM-first stores under the watcher trip). More ranges
+                // just means more, smaller on-disk member buckets -- no output
+                // change. Only if even the max range count can't bound it is -g
+                // genuinely too small to honor, and then we abort rather than
+                // exceed it.
+                uint32_t stitch_frag_ranges = 0;  // 0 => compact_stitch_scalable default (64)
                 if (m_cfg.max_ram_gb > 0) {
-                    constexpr uint64_t STITCH_FRAG_RANGES = 64;  // compact_stitch_scalable default
-                    constexpr uint64_t SLOT_BYTES = 16;          // phase-2 member Slot
-                    const uint64_t member_array = (n_frags / STITCH_FRAG_RANGES + 1) * SLOT_BYTES;
+                    constexpr uint64_t PER_FRAG = 16 + 21;          // resident Slot + encoded record
+                    constexpr uint32_t MIN_FRAG_RANGES = 64;        // compact_stitch_scalable default
+                    constexpr uint32_t MAX_FRAG_RANGES = 1u << 16;  // cap the spill-bucket fan-out
                     const uint64_t g = (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0);
                     const uint64_t avail = g > stitch_ram_cap ? g - stitch_ram_cap : 0;
-                    if (member_array > avail)
-                        fail_ram_budget_("stitch phase-2 member array (" + std::to_string(n_frags) +
-                                             " fragments)",
-                                         member_array, avail, "Raise -g.");
+                    // Target: bound the per-range working set to <= the smaller of
+                    // what's left after the stores' cap and 25% of -g.
+                    const uint64_t member_budget = std::min<uint64_t>(avail, (uint64_t)(g * 0.25));
+                    uint64_t ranges = MIN_FRAG_RANGES;
+                    if (member_budget > 0) {
+                        const uint64_t by_budget =
+                            (uint64_t)((double)n_frags * PER_FRAG / (double)member_budget) + 1;
+                        if (by_budget > ranges) ranges = by_budget;
+                    }
+                    if (ranges > MAX_FRAG_RANGES) ranges = MAX_FRAG_RANGES;
+                    stitch_frag_ranges = (uint32_t)ranges;
+                    // Verify the cap actually bounds it; else -g is unservable.
+                    const uint64_t range_size = (n_frags + stitch_frag_ranges - 1) / stitch_frag_ranges;
+                    const uint64_t member_set = range_size * PER_FRAG;
+                    if (member_budget == 0 or member_set > member_budget)
+                        fail_ram_budget_("stitch phase-2 per-range member set (" +
+                                             std::to_string(n_frags) + " fragments, " +
+                                             std::to_string(stitch_frag_ranges) + " ranges)",
+                                         member_set, member_budget ? member_budget : avail,
+                                         "Raise -g (or lower -t to free spillable budget).");
+                    if (stitch_frag_ranges > MIN_FRAG_RANGES)
+                        std::cout << "  stitch: frag_ranges scaled to " << stitch_frag_ranges
+                                  << " to bound the per-range member set to "
+                                  << format_bytes(member_set) << "\n";
                 }
                 auto for_each_frag = [&, first_pass = true](auto&& fn) mutable {
                     frag_unitig_stream_reader rd(frag_sink.path());
@@ -397,8 +422,9 @@ struct builder {
                         : 0;
                 compact_stitch_scalable(for_each_frag, n_frags, m_cfg.k, tmp_dir,
                                         std::ref(*uwriter_ptr), stitch_buckets,
-                                        /*frag_ranges=*/0, /*chain_buckets=*/0, m_cfg.num_threads,
-                                        frag_sink.links_path(), stitch_ram_cap, stitch_rss_target);
+                                        /*frag_ranges=*/stitch_frag_ranges, /*chain_buckets=*/0,
+                                        m_cfg.num_threads, frag_sink.links_path(), stitch_ram_cap,
+                                        stitch_rss_target);
                 prog.stop();
                 std::cout << "  unitigs after stitching: " << uwriter_ptr->total_unitigs() << "\n";
             }
@@ -414,16 +440,9 @@ struct builder {
         // back to the OS before emit.
         release_free_heap_to_os_();
 
-        // emit builds the u2c bit_vector of num_unitigs bits in RAM (non-
-        // spillable). Abort if that alone would exceed -g. (TODO: stream it.)
-        if (m_cfg.max_ram_gb > 0) {
-            const uint64_t u2c_bytes = (m_num_unitigs + 7) / 8;
-            const uint64_t g = (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0);
-            if (u2c_bytes > g)
-                fail_ram_budget_("emit u2c bit_vector (" + std::to_string(m_num_unitigs) +
-                                     " unitigs)",
-                                 u2c_bytes, g, "Raise -g.");
-        }
+        // emit streams the u2c bit_vector straight to <out>.u2c (its run-end
+        // bits are produced in ascending unitig order), so it never holds the
+        // num_unitigs-bit bitmap in RAM -- no -g floor here.
         {
             phase_rss_marker rss("emit-fasta");
             emit_fasta(*uwriter_ptr, m_cfg.out_basename, m_num_unitigs, m_cfg.max_ram_gb);
@@ -475,13 +494,14 @@ struct builder {
 
 private:
     // ---- RAM budget (-g) enforcement: honored AT ALL COSTS ------------------
-    // -g is a HARD limit. Most structures spill to disk to stay under it, but a
-    // few are NON-SPILLABLE (the spill machinery cannot reduce them): the
-    // bucket-write per-thread buffers, a single bucket's kmer_info, the stitch's
-    // per-range member array, emit's u2c bit_vector. For those, when the floor
-    // would exceed its budget share we ABORT with a precise message rather than
-    // silently exceed -g. And -g below MIN_RAM_GB is rejected outright, since
-    // below that the fixed per-thread/working floors cannot be honored.
+    // -g is a HARD limit. Most structures spill to disk to stay under it, and a
+    // few that don't spill are instead SCALED to fit: the stitch's per-range
+    // member array shrinks by raising frag_ranges, and emit's u2c bit_vector is
+    // streamed straight to disk. The genuinely NON-SPILLABLE floors that remain
+    // (bucket-write per-thread buffers, a single bucket's kmer_info) ABORT with a
+    // precise message when their budget share is exceeded rather than silently
+    // blow -g. And -g below MIN_RAM_GB is rejected outright, since below that the
+    // fixed per-thread/working floors cannot be honored.
     static constexpr double MIN_RAM_GB = 4.0;
 
     // Uniform "cannot honor -g" abort. `need`/`avail` are bytes.
