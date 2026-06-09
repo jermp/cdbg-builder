@@ -24,6 +24,63 @@
 
 namespace cdbg {
 
+// Streams a bits::bit_vector straight to disk, set bit-by-bit in ASCENDING
+// position order, holding only the current 64-bit partial word in RAM instead
+// of the whole num_bits/8-byte bitmap. The on-disk layout is byte-identical to
+// essentials::save(bits::bit_vector): [u64 num_bits][u64 num_words][num_words *
+// u64] (bit_vector::visit emits m_num_bits then the m_data word vector, which
+// essentials serializes as an 8-byte length + the raw words). Both totals are
+// known up front (num_bits is the unitig count), so the header is written
+// immediately -- no seek-back. Used for the u2c run-end bitmap, whose set bits
+// are produced strictly in .fa emission order, so it never needs to sit in RAM.
+struct streaming_bit_vector_writer {
+    streaming_bit_vector_writer(std::string const& path, uint64_t num_bits)
+        : m_num_words((num_bits + 63) / 64) {
+        m_file = std::fopen(path.c_str(), "wb");
+        if (!m_file) throw std::runtime_error("cannot open " + path);
+        write_pod_(num_bits);               // bit_vector::m_num_bits
+        write_pod_((uint64_t)m_num_words);  // m_data vector length (8 B on LP64)
+    }
+    ~streaming_bit_vector_writer() {
+        if (m_file) std::fclose(m_file);
+    }
+    streaming_bit_vector_writer(streaming_bit_vector_writer const&) = delete;
+    streaming_bit_vector_writer& operator=(streaming_bit_vector_writer const&) = delete;
+
+    // Set bit `pos`. Positions must arrive non-decreasing (ascending across the
+    // whole stream); a position in a later word flushes the words before it.
+    void set(uint64_t pos) {
+        uint64_t word_idx = pos >> 6;
+        while (m_flushed_words < word_idx) flush_cur_();
+        m_cur_word |= uint64_t(1) << (pos & 63);
+    }
+
+    // Flush the trailing word + any remaining (zero) words and close.
+    void finish() {
+        while (m_flushed_words < m_num_words) flush_cur_();
+        std::fflush(m_file);
+        std::fclose(m_file);
+        m_file = nullptr;
+    }
+
+private:
+    void flush_cur_() {
+        if (std::fwrite(&m_cur_word, sizeof(m_cur_word), 1, m_file) != 1)
+            throw std::runtime_error("short write of u2c word");
+        m_cur_word = 0;
+        ++m_flushed_words;
+    }
+    template <typename T>
+    void write_pod_(T v) {
+        if (std::fwrite(&v, sizeof(T), 1, m_file) != 1)
+            throw std::runtime_error("short header write of u2c");
+    }
+    std::FILE* m_file = nullptr;
+    uint64_t m_num_words;
+    uint64_t m_flushed_words = 0;
+    uint64_t m_cur_word = 0;
+};
+
 // Walk the K cid-range unitig buckets in ascending order; within each, sort by
 // cid (so the .fa is strictly cid-ascending) and write `>cid\n<seq>\n` with a
 // hand-rolled 1 MiB buffer + std::to_chars (far faster than std::ofstream on
@@ -54,7 +111,10 @@ inline void emit_fasta(unitig_bucket_writer& uwriter, std::string const& out_bas
         if (pos + n > BUF_BYTES) flush_buf();
     };
 
-    bits::bit_vector::builder u2c_bvb(num_unitigs, /*init=*/false);
+    // u2c is streamed straight to <out>.u2c word-by-word: its set bits (run
+    // ends) are produced in ascending unitig order, so it never needs to sit in
+    // RAM as a num_unitigs-bit bitmap (a non-spillable -g violator at scale).
+    streaming_bit_vector_writer u2c_writer(out_basename + ".u2c", num_unitigs);
     size_t emitted = 0;
     uint64_t prev_cid = 0;
 
@@ -68,7 +128,7 @@ inline void emit_fasta(unitig_bucket_writer& uwriter, std::string const& out_bas
     auto emit_record = [&](uint64_t cid, std::string_view seq) {
         // cid is globally non-decreasing (buckets ascending by cid range, sorted
         // within), so cid != prev_cid is exactly a color-set group boundary.
-        if (emitted > 0 and cid != prev_cid) u2c_bvb.set(emitted - 1, 1);
+        if (emitted > 0 and cid != prev_cid) u2c_writer.set(emitted - 1);
         prev_cid = cid;
         ++emitted;
 
@@ -99,11 +159,9 @@ inline void emit_fasta(unitig_bucket_writer& uwriter, std::string const& out_bas
               << uwriter.spilled_buckets() << " spilled to disk, rest read from RAM), cid-sort RAM cap "
               << format_bytes(emit_mem_cap) << "\n";
 
-    // Close out the very last run.
-    if (emitted > 0) u2c_bvb.set(emitted - 1, 1);
-    bits::bit_vector u2c;
-    u2c_bvb.build(u2c);
-    essentials::save(u2c, (out_basename + ".u2c").c_str());
+    // Close out the very last run, then flush the trailing/zero words.
+    if (emitted > 0) u2c_writer.set(emitted - 1);
+    u2c_writer.finish();
 
     uwriter.close_and_unlink();
 }
