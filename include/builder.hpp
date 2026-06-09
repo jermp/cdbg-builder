@@ -370,10 +370,18 @@ struct builder {
                     }
                     first_pass = false;
                 };
+                // Hard -g target for the stitch's measured-RSS backstop (0 = no
+                // -g): the payload-model cap (stitch_ram_cap) undercounts real
+                // RSS, so the watcher force-spills the stores when live RSS
+                // crosses the budget, keeping the whole process within -g.
+                const uint64_t stitch_rss_target =
+                    m_cfg.max_ram_gb > 0
+                        ? (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0)
+                        : 0;
                 compact_stitch_scalable(for_each_frag, n_frags, m_cfg.k, tmp_dir,
                                         std::ref(*uwriter_ptr), stitch_buckets,
                                         /*frag_ranges=*/0, /*chain_buckets=*/0, m_cfg.num_threads,
-                                        frag_sink.links_path(), stitch_ram_cap);
+                                        frag_sink.links_path(), stitch_ram_cap, stitch_rss_target);
                 prog.stop();
                 std::cout << "  unitigs after stitching: " << uwriter_ptr->total_unitigs() << "\n";
             }
