@@ -605,10 +605,11 @@ private:
 struct per_thread_bucket_buffers {
     std::vector<std::vector<bucket_compactor::pending_record>> recs;
     std::vector<std::vector<uint8_t>> keys;  // per-bucket packed dedup keys (see append)
+    std::vector<uint64_t> bases;             // per-bucket UNPACKED base count since last flush
     bucket_writer* sink = nullptr;
 
     explicit per_thread_bucket_buffers(bucket_writer& w)
-        : recs(w.num_buckets()), keys(w.num_buckets()), sink(&w) {}
+        : recs(w.num_buckets()), keys(w.num_buckets()), bases(w.num_buckets(), 0), sink(&w) {}
 
     // `sk_bases` is the super-k-mer's bases as 0-3 values, one per byte; `len` is
     // the base count. We build the dedup key here -- [varint len][2-bit packed
@@ -625,12 +626,22 @@ struct per_thread_bucket_buffers {
         // bytes from the writer's key_storage.
         uint64_t h = bucket_compactor::hash_bases(kbuf.data() + off, key_len);
         recs[b].push_back({h, color, off, key_len, (uint8_t)(flags & 0xfu)});
-        if (kbuf.size() >= sink->flush_bases()) sink->flush(b, recs[b], kbuf);
+        // Flush by UNPACKED base count, not kbuf.size(): the keys are 2-bit
+        // packed, so a fixed packed-byte threshold would buffer ~4x more
+        // super-k-mers (hence ~4x more pending_records, 24 B each) than the RAM
+        // model budgets for -- which doubled bucket-write peak RSS at scale.
+        // flush_bases is a base count, matching the model and the name.
+        bases[b] += len;
+        if (bases[b] >= sink->flush_bases()) {
+            sink->flush(b, recs[b], kbuf);
+            bases[b] = 0;
+        }
     }
 
     void flush_all() {
         for (uint32_t b = 0; b < (uint32_t)recs.size(); ++b) {
             if (!recs[b].empty()) sink->flush(b, recs[b], keys[b]);
+            bases[b] = 0;
         }
     }
 };
