@@ -358,6 +358,23 @@ struct builder {
                           << (stitch_ram_cap ? format_bytes(stitch_ram_cap)
                                              : std::string("unlimited"))
                           << "\n";
+                // Stitch phase-2 holds one frag-range's member array (Slot =
+                // 16 B) resident -- NON-spillable. Its size is n_frags /
+                // frag_ranges, and frag_ranges is fixed at STITCH_FRAG_RANGES in
+                // compact_stitch_scalable. It coexists with the RAM-first stores
+                // (stitch_ram_cap), so it must fit in what's left of -g; abort if
+                // not. (TODO: scale frag_ranges instead of aborting.)
+                if (m_cfg.max_ram_gb > 0) {
+                    constexpr uint64_t STITCH_FRAG_RANGES = 64;  // compact_stitch_scalable default
+                    constexpr uint64_t SLOT_BYTES = 16;          // phase-2 member Slot
+                    const uint64_t member_array = (n_frags / STITCH_FRAG_RANGES + 1) * SLOT_BYTES;
+                    const uint64_t g = (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0);
+                    const uint64_t avail = g > stitch_ram_cap ? g - stitch_ram_cap : 0;
+                    if (member_array > avail)
+                        fail_ram_budget_("stitch phase-2 member array (" + std::to_string(n_frags) +
+                                             " fragments)",
+                                         member_array, avail, "Raise -g.");
+                }
                 auto for_each_frag = [&, first_pass = true](auto&& fn) mutable {
                     frag_unitig_stream_reader rd(frag_sink.path());
                     uint8_t of;
@@ -397,6 +414,16 @@ struct builder {
         // back to the OS before emit.
         release_free_heap_to_os_();
 
+        // emit builds the u2c bit_vector of num_unitigs bits in RAM (non-
+        // spillable). Abort if that alone would exceed -g. (TODO: stream it.)
+        if (m_cfg.max_ram_gb > 0) {
+            const uint64_t u2c_bytes = (m_num_unitigs + 7) / 8;
+            const uint64_t g = (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0);
+            if (u2c_bytes > g)
+                fail_ram_budget_("emit u2c bit_vector (" + std::to_string(m_num_unitigs) +
+                                     " unitigs)",
+                                 u2c_bytes, g, "Raise -g.");
+        }
         {
             phase_rss_marker rss("emit-fasta");
             emit_fasta(*uwriter_ptr, m_cfg.out_basename, m_num_unitigs, m_cfg.max_ram_gb);
