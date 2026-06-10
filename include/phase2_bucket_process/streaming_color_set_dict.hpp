@@ -78,6 +78,7 @@
 #include <util.hpp>
 #include <unordered_dense/unordered_dense.h>
 
+#include "phase2_bucket_process/colorset_dedup_index.hpp"
 #include "phase2_bucket_process/hybrid_color_sets.hpp"
 #include "util.hpp"
 
@@ -147,12 +148,12 @@ struct streaming_color_set_dict {
     // unchanged. Callers no longer need an external lock.
     uint64_t intern_with_hashes(std::vector<uint32_t>&& candidate, precomputed_hash h) {
         assert(!m_released and "intern() after release_index()");
-        const hash_pair key{h.primary, h.secondary};
-        shard_t& shard = m_shards[h.secondary & (NUM_SHARDS - 1)];
+        const colorset_dedup_index::key key{h.primary, h.secondary};
+        colorset_dedup_index::shard_t& shard = m_index.shard_for(h.secondary);
 
         std::lock_guard<std::mutex> slk(shard.mu);
-        auto it = shard.index.find(key);
-        if (it != shard.index.end()) return it->second;  // duplicate: distributed hot path
+        auto it = shard.map.find(key);
+        if (it != shard.map.end()) return it->second;  // duplicate: distributed hot path
 
         // New class. Encode into a reusable thread-local builder -- the
         // dominant cost (write_delta over the whole color list) runs here,
@@ -177,7 +178,7 @@ struct streaming_color_set_dict {
             m_total_integers += candidate.size();
             spill_complete_words_();
         }
-        shard.index.emplace(key, id);
+        shard.map.emplace(key, id);
         return id;
     }
 
@@ -198,19 +199,16 @@ struct streaming_color_set_dict {
     void release_index() {
         if (m_released) return;
         m_released_count = m_class_count.load(std::memory_order_relaxed);
-        for (auto& s : m_shards) { decltype(s.index){}.swap(s.index); }  // free the dedup shards
+        m_index.release();  // free the dedup shards
         m_released = true;
     }
 
-    // Approx RAM held by the dedup structures: the NUM_SHARDS maps, each
-    // entry being the 128-bit hash key (16 B) + the cid (8 B). This is what
-    // release_index() frees. Reported at phase boundaries to attribute budget.
+    // Approx RAM held by the dedup index. This is what release_index() frees;
+    // reported at phase boundaries to attribute budget.
     uint64_t resident_bytes() const {
         if (m_released) return 0;
-        const uint64_t n = m_class_count.load(std::memory_order_relaxed);
-        // Each shard entry holds the 128-bit hash key (16 B) + the cid (8 B);
-        // ankerl's flat backing adds ~0.6x slack at the default load factor.
-        return n * 24.0 * 1.6;
+        return colorset_dedup_index::resident_bytes(
+            m_class_count.load(std::memory_order_relaxed));
     }
 
     // Finalize the on-disk file: flush trailing partial word, build &
@@ -294,35 +292,6 @@ struct streaming_color_set_dict {
 
 private:
     static constexpr size_t HEADER_BYTES = 4 + 4 + 4 + 8 + 8 + 8;
-
-    struct hash_pair {
-        uint64_t primary;
-        uint64_t secondary;
-    };
-
-    // Dedup index sharded NUM_SHARDS ways to remove the single-lock
-    // serialization on the bucket-process merge. Each shard maps the
-    // 128-bit content hash directly to a cid (no shared per-class array,
-    // so shards are fully independent). The hasher returns the primary
-    // hash (already avalanched); equality compares both halves.
-    static constexpr size_t NUM_SHARDS = 256;  // power of two
-
-    struct hp_hasher {
-        using is_avalanching = void;
-        size_t operator()(hash_pair const& h) const noexcept { return h.primary; }
-    };
-    struct hp_eq {
-        bool operator()(hash_pair const& a, hash_pair const& b) const noexcept {
-            return a.primary == b.primary and a.secondary == b.secondary;
-        }
-    };
-
-    // alignas(64): keep each shard's mutex on its own cache line so locking
-    // one shard doesn't false-share with its neighbors.
-    struct alignas(64) shard_t {
-        std::mutex mu;
-        ankerl::unordered_dense::map<hash_pair, uint64_t, hp_hasher, hp_eq> index;
-    };
 
     // Forward-input iterator over a sequence of u64s on disk. Used at
     // finalize to feed bits::elias_fano::encode without ever
@@ -408,9 +377,8 @@ private:
     bool m_released = false;        // release_index() called (interning done)
     uint64_t m_released_count = 0;  // class count stashed before release
 
-    // Sharded dedup index (hash -> cid). No per-shard value cap concern: each
-    // shard holds < total/NUM_SHARDS entries, well under the standard 2^32.
-    std::array<shard_t, NUM_SHARDS> m_shards;
+    // Exact in-RAM dedup index (hash128 -> cid); the color-sets-dedup-map.
+    colorset_dedup_index m_index;
 
     std::FILE* m_file = nullptr;
     std::string m_output_path;
