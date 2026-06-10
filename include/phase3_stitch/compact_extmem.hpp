@@ -1220,6 +1220,98 @@ inline void compact_stitch_inram(Source& frag, uint32_t k, std::string const& tm
     t_a.stop();
     std::cout << "  [id-stitch] assemble " << t_a.elapsed() << "s\n";
 }
+
+// ---- stitch RAM-budget (-g) sizing ----------------------------------------
+// These pick the two fan-out knobs (frag_ranges, chain_buckets) from -g so the
+// stitch's NON-spillable per-worker working sets stay in budget. They live here,
+// next to the structures they size (the phase-2 member Slot and the phase-3
+// raw + groups decode), rather than in the orchestrator -- the constants below
+// describe THIS file's data layout. `g` and `stitch_ram_cap` are bytes; both
+// helpers no-op to the historical fixed defaults when -g is unset (g == 0).
+
+// Uniform "cannot honor -g" abort for a non-spillable stitch floor.
+[[noreturn]] inline void stitch_fail_budget_(std::string const& what, uint64_t need,
+                                             uint64_t avail) {
+    throw std::runtime_error(
+        "-g cannot be honored: " + what + " needs " + format_bytes(need) +
+        " of NON-SPILLABLE RAM but only " + format_bytes(avail) +
+        " is available for it. Raise -g (or lower -t to free spillable budget). "
+        "(-g is a hard limit; aborting rather than exceeding it.)");
+}
+
+// Phase-2 holds one frag-range's member array (Slot = 16 B) plus that range's
+// encoded records (~21 B) resident -- NON-spillable, size = ceil(n_frags /
+// frag_ranges). SCALE frag_ranges up until this per-range set fits a bounded
+// share of -g (more, smaller on-disk member buckets, identical output). Abort
+// only if even the max range count can't bound it (-g genuinely too small).
+inline uint32_t stitch_pick_frag_ranges(uint64_t n_frags, uint64_t g, uint64_t stitch_ram_cap) {
+    constexpr uint64_t PER_FRAG = 16 + 21;          // resident Slot + encoded member record
+    constexpr uint32_t MIN_FRAG_RANGES = 64;        // historical fixed default
+    constexpr uint32_t MAX_FRAG_RANGES = 1u << 16;  // cap the spill-bucket fan-out
+    const uint64_t avail = g > stitch_ram_cap ? g - stitch_ram_cap : 0;
+    // Bound to the smaller of what's left after the stores' cap and 25% of -g.
+    const uint64_t member_budget = std::min<uint64_t>(avail, (uint64_t)(g * 0.25));
+    uint64_t ranges = MIN_FRAG_RANGES;
+    if (member_budget > 0) {
+        const uint64_t by_budget =
+            (uint64_t)((double)n_frags * PER_FRAG / (double)member_budget) + 1;
+        if (by_budget > ranges) ranges = by_budget;
+    }
+    if (ranges > MAX_FRAG_RANGES) ranges = MAX_FRAG_RANGES;
+    const uint64_t range_size = (n_frags + ranges - 1) / ranges;
+    const uint64_t member_set = range_size * PER_FRAG;
+    if (member_budget == 0 or member_set > member_budget)
+        stitch_fail_budget_("stitch phase-2 per-range member set (" + std::to_string(n_frags) +
+                                " fragments, " + std::to_string(ranges) + " ranges)",
+                            member_set, member_budget ? member_budget : avail);
+    if (ranges > MIN_FRAG_RANGES)
+        std::cout << "  stitch: frag_ranges scaled to " << ranges
+                  << " to bound the per-range member set to " << format_bytes(member_set) << "\n";
+    return (uint32_t)ranges;
+}
+
+// Phase-3 assemble lifts one chain bucket OUT of the shared ram_budget
+// (take_bucket_decoded credits the budget) and decodes it into a private
+// raw + groups working set -- NON-spillable, held by EACH of num_threads
+// workers at once. Its co-resident size is
+//   num_threads * DECODE_OVERHEAD * (base_volume / chain_buckets),
+// independent of the historical default (num_threads*8), so a large input blows
+// -g. SCALE chain_buckets up so the set fits a bounded share of -g. base_volume
+// ~ total_frag_seq_bytes (seq dominates; the per-fragment cid/pos/run +
+// std::string/map overhead is folded into DECODE_OVERHEAD).
+inline uint32_t stitch_pick_chain_buckets(uint64_t total_frag_seq_bytes, uint64_t g,
+                                          uint32_t num_threads) {
+    constexpr double DECODE_OVERHEAD = 4.0;  // raw + decoded groups + map/string slack
+    constexpr uint32_t MAX_CHAIN_BUCKETS = 1u << 16;  // cap the spill-bucket fan-out
+    // Hold the set below the stitch model's fixed ~2 GiB reserve at any -g: a
+    // 0.15*g target, capped at 1.5 GiB so it stays under that reserve as -g grows.
+    constexpr uint64_t ASSEMBLE_BUDGET_CAP = 1536ull * 1024 * 1024;  // 1.5 GiB
+    const uint32_t floor_cb = std::max<uint32_t>(64, num_threads * 8);
+    const uint64_t assemble_budget =
+        std::min<uint64_t>((uint64_t)(g * 0.15), ASSEMBLE_BUDGET_CAP);
+    uint64_t cb = floor_cb;
+    if (assemble_budget > 0 and total_frag_seq_bytes > 0) {
+        const uint64_t by_budget =
+            (uint64_t)((double)num_threads * DECODE_OVERHEAD * (double)total_frag_seq_bytes /
+                       (double)assemble_budget) +
+            1;
+        if (by_budget > cb) cb = by_budget;
+    }
+    if (cb > MAX_CHAIN_BUCKETS) cb = MAX_CHAIN_BUCKETS;
+    const uint64_t assemble_set = (uint64_t)((double)num_threads * DECODE_OVERHEAD *
+                                             (double)total_frag_seq_bytes / (double)cb);
+    if (assemble_budget == 0 or assemble_set > assemble_budget)
+        stitch_fail_budget_("stitch phase-3 co-resident assemble set (" +
+                                std::to_string(num_threads) + " threads, " + std::to_string(cb) +
+                                " chain buckets)",
+                            assemble_set, assemble_budget);
+    if (cb > floor_cb)
+        std::cout << "  stitch: chain_buckets scaled to " << cb
+                  << " to bound the phase-3 assemble set to ~" << format_bytes(assemble_set)
+                  << "\n";
+    return (uint32_t)cb;
+}
+
 // RAM: the only resident structures are one round-store bucket, one frag-id
 // range's member array, and one chain bucket's bases -- so peak RAM is
 // independent of fragment/chain COUNT (the extmem invariant).
@@ -1242,14 +1334,26 @@ inline void compact_stitch_scalable(ForEachFrag&& for_each_frag, uint64_t n_frag
                                     std::string const& dir, Sink&& sink, uint32_t num_buckets = 0,
                                     uint32_t frag_ranges = 0, uint32_t chain_buckets = 0,
                                     uint32_t num_threads = 1, std::string const& links_path = "",
-                                    size_t ram_budget_bytes = 0, uint64_t rss_target_bytes = 0) {
+                                    size_t ram_budget_bytes = 0, uint64_t rss_target_bytes = 0,
+                                    uint64_t total_frag_seq_bytes = 0) {
     using namespace detail;
     if (num_buckets == 0) num_buckets = 1024;
-    if (frag_ranges == 0) frag_ranges = 64;
+    if (n_frags == 0) return;
+    // Size the two NON-spillable fan-out knobs from -g (rss_target_bytes is the
+    // -g budget; 0 = unbounded). When -g is set we scale them so the per-worker
+    // working sets stay in budget; otherwise fall back to the historical fixed
+    // defaults. (These honor an explicit caller-supplied value as-is.)
+    if (frag_ranges == 0)
+        frag_ranges = rss_target_bytes > 0
+                          ? stitch_pick_frag_ranges(n_frags, rss_target_bytes, ram_budget_bytes)
+                          : 64;
     // More chain buckets than threads so phase 3 load-balances and only a few
     // small buckets are co-resident per worker.
-    if (chain_buckets == 0) chain_buckets = std::max<uint32_t>(64, num_threads * 8);
-    if (n_frags == 0) return;
+    if (chain_buckets == 0)
+        chain_buckets =
+            rss_target_bytes > 0
+                ? stitch_pick_chain_buckets(total_frag_seq_bytes, rss_target_bytes, num_threads)
+                : std::max<uint32_t>(64, num_threads * 8);
     const uint64_t range_size = (n_frags + frag_ranges - 1) / frag_ranges;
 
     // Single RAM budget shared by every store in this stitch (round store +
