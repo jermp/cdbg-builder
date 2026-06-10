@@ -243,18 +243,40 @@ struct builder {
                 // kmer_info budget.
                 // All num_threads threads stay alive; -t is never reduced.
                 uint64_t bp_budget = 0;
+                uint64_t dedup_budget = 0;
                 if (m_cfg.max_ram_gb > 0) {
                     const uint64_t total = m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0;
                     bp_budget = BUCKET_PROCESS_BUDGET_FRAC * total;
+                    // Share of -g the color-sets-dedup-map may use before its
+                    // overflow path engages. MEASURE-ONLY today (reported below,
+                    // not yet enforced) -- see colorset-dedup-externalization.md.
+                    dedup_budget = COLORSET_DEDUP_BUDGET_FRAC * total;
                 }
+                global_dict.set_dedup_budget(dedup_budget);
                 process_buckets(*writer, m_cfg.k, m_num_colors, m_cfg.num_threads, frag_sink,
                                 global_dict, global_mu, &done, bp_budget);
                 prog.stop();
                 std::cout << "  bucket fragments: " << frag_sink.count() << "\n";
                 std::cout << "  distinct color classes: " << global_dict.size() << "\n";
-                std::cout << "  global color dict resident: ~"
-                          << format_bytes(global_dict.resident_bytes())
-                          << " (stays in RAM through stitch + emit)\n";
+                // color-sets-dedup-map occupancy vs its -g budget. Peak == final,
+                // since the index only grows until release_index(). MEASURE-ONLY:
+                // shows whether/by how much the externalization's overflow path
+                // would have engaged, before any spill machinery exists.
+                {
+                    const uint64_t resident = global_dict.resident_bytes();
+                    std::cout << "  color-sets-dedup-map: ~" << format_bytes(resident)
+                              << " resident";
+                    if (dedup_budget > 0) {
+                        std::cout << " / " << format_bytes(dedup_budget) << " budget";
+                        if (resident <= dedup_budget) {
+                            std::cout << " (within -> no spill)";
+                        } else {
+                            std::cout << " (OVER by " << format_bytes(resident - dedup_budget)
+                                      << " -> overflow path would spill)";
+                        }
+                    }
+                    std::cout << "\n";
+                }
             }
             rss.stop();
         }
@@ -514,6 +536,14 @@ private:
     // with a hard live-RSS ceiling as backstop; the remaining ~18% is headroom
     // for in-flight load lag, the frag sink, and glibc fragmentation.
     static constexpr double BUCKET_PROCESS_BUDGET_FRAC = 0.82;
+
+    // Share of -g the color-sets-dedup-map (the dominant non-spillable structure
+    // in bucket-process) may use before its overflow path engages. It coexists
+    // with the per-bucket walk sets under BUCKET_PROCESS_BUDGET_FRAC, so it gets
+    // a sub-share. MEASURE-ONLY today (reported, not enforced) -- a starting
+    // point to validate against real 100k/661k numbers before the overflow
+    // machinery lands. See colorset-dedup-externalization.md.
+    static constexpr double COLORSET_DEDUP_BUDGET_FRAC = 0.50;
 
     void validate_and_resolve_config() {
         if (m_cfg.filenames_list.empty()) {
