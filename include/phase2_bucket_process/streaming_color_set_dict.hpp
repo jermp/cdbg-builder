@@ -187,6 +187,12 @@ struct streaming_color_set_dict {
     }
     uint64_t total_bits() const { return m_flushed_words * 64 + m_bvb.num_bits(); }
 
+    // RAM budget the color-sets-dedup-map (m_index) is allowed before its
+    // overflow path must engage (colorset-dedup-externalization.md). 0 = no -g.
+    // MEASURE-ONLY today: set + reported, but not yet enforced (no spill).
+    void set_dedup_budget(uint64_t bytes) { m_dedup_budget = bytes; }
+    uint64_t dedup_budget() const { return m_dedup_budget; }
+
     // Free the dedup shards once interning is DONE (after bucket-process).
     // The shards are not read by finalize() -- it only needs the class COUNT
     // (stashed here) and the on-disk bits + sidecar offsets. This dict
@@ -379,6 +385,7 @@ private:
 
     // Exact in-RAM dedup index (hash128 -> cid); the color-sets-dedup-map.
     colorset_dedup_index m_index;
+    uint64_t m_dedup_budget = 0;  // -g share allowed for m_index (measure-only)
 
     std::FILE* m_file = nullptr;
     std::string m_output_path;
