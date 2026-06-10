@@ -1023,6 +1023,72 @@ The streaming color_set_dict's RAM cost is bounded by per-class
 metadata (16 B + ~12 B index entry per class), independent of
 compressed bit count.
 
+### 9.1 Honoring `-g` as a hard contract — what's bounded, what isn't
+
+`-g` is meant as a **hard cap**: the build must never exceed it, no matter how
+large the input. The test for every resident structure is: **is its size set by
+`-g`/`-t` (so it's intrinsically bounded), or by the *data* (so it grows with
+the dataset)?** A data-sized structure is safe only if it has a fallback —
+*spill* to disk, *stream* through RAM, or *scale* a fan-out knob so its share
+shrinks. The non-spillable structures and their fallbacks, per phase:
+
+| Phase | Non-spillable structure | Sized by | Fallback | Bounded at fixed `-g`/`-t`, any dataset? |
+|---|---|---|---|---|
+| bucket-write | per-thread `keys`/`recs` buffers | `B·(α·T·flush+β·spill)` — **U-independent** | abort if floor > `0.5·g` | **Yes** (independent of dataset size) |
+| bucket-write | compactor hashmaps | live data | RSS watcher spills (§3.6) | Yes |
+| **bucket-process** | **per-bucket walk set** (`kmer_info`+visited+frags+`local_dict`) | **bucket size = data / B** | **none** | **No** — see below |
+| **bucket-process** | **color-sets-dedup-map** (`streaming_color_set_dict::m_shards`) | **# distinct color sets** | **none** | **No** — see below |
+| stitch | RAM-first stores | live data | spill overflow + watcher (§5.5) | Yes |
+| stitch | member array / assemble set | data | **scaled** (`frag_ranges` / `chain_buckets`, §5.6) | Yes |
+| emit | one cid-range bucket | data / K | **external merge-sort** if over cap (§6.2) | Yes |
+| emit | u2c | data | **streamed** (§6.2) | Yes |
+
+Everything **outside bucket-process is bounded for any dataset size** — each has
+a spill, stream, or scale fallback that holds it to a `-g` share. Bucket-process
+has the **only two** data-sized structures with **no fallback at all**:
+
+1. **The per-bucket walk set.** `bucket_reader` slurps a whole bucket into RAM
+   and `load_bucket` builds the entire `kmer_info` hashmap resident; the walk
+   needs the whole sub-graph, so there is no within-bucket streaming or spill,
+   and the admission gate (§4.9) admits one bucket even if it alone exceeds the
+   budget (forward-progress). Since `B` is **U-independent** (fixed at a given
+   `-g`/`-t`), bucket size = data/B grows with the dataset. In a pangenome,
+   distinct k-mers per bucket *saturate* (genomes share k-mers), so this grows
+   **sub-linearly** and in practice stays well under the color-sets-dedup-map.
+
+2. **The color-sets-dedup-map** (`m_shards`: the 128-bit content-hash → cid
+   index used to dedup color sets, §4.6/`streaming_color_set_dict`). It grows
+   **~linearly with the number of distinct color sets** (≈0.5 GiB @ 20k genomes
+   → ≈14 GiB @ 661k), is non-spillable, and is the **dominant and fastest-growing**
+   offender — it is why the 661k build needed `-g 64`. It is freed
+   (`release_index`) right after bucket-process, so it never reaches stitch.
+
+So a *provable* hard `-g` at arbitrary scale needs **both** bounded. Their fixes
+are independent:
+
+- **color-sets-dedup-map → externalize the index (NEXT PRIORITY).** Replace the
+  in-RAM sharded hash with an on-disk dedup (sort+merge of content hashes, or an
+  external hash), so the index never sits in RAM as `~24 B × #color-sets`. This
+  is the one structure that binds first and hardest at real scale.
+
+- **per-bucket walk set → adaptive minimizer re-split (DEFERRED).** When a
+  bucket's estimated working set (`~24·bucket_unc_bytes`) exceeds a `-g` share,
+  re-bucket *that bucket's* records by a finer minimizer modulus
+  (`(h>>1) % (B·S)`) into sub-buckets and process each independently, recursing
+  if needed. Correctness is free: splitting **on minimizer boundaries** keeps
+  each minimizer's super-k-mers together (the within-bucket walk invariant), so
+  it only produces a few more open-ended fragments at the new boundaries — which
+  **stitch already rejoins** by boundary-k-mer match, with no new machinery.
+  This is adaptive/local, so bucket-write keeps `B` small (lean buffers) and only
+  the few oversized buckets pay an extra disk pass — it decouples the
+  `B`-pressure the two phases would otherwise contend over. *Caveat:* a single
+  ultra-abundant minimizer cannot be split this way (its super-k-mers all share
+  the minimizer); the near-uniform `(k−1)`-mer-minimizer distribution makes that
+  a non-issue in practice, and an arbitrary-cut + stitch-rejoin fallback would
+  cover the adversarial case. **Deferred** because it only bites at TB-scale
+  *with a tiny `-g`*; a TB-scale build in practice uses a larger `-g`, under
+  which the saturating per-bucket set stays in budget on its own.
+
 ---
 
 ## 10. Concurrency model
