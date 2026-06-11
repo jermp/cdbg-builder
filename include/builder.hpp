@@ -62,6 +62,7 @@
 #include "phase2_bucket_process/streaming_color_set_dict.hpp"
 #include "phase2_bucket_process/unitig_spill.hpp"
 #include "phase4_emit/emit.hpp"
+#include "ram_governor.hpp"
 #include "util.hpp"
 
 namespace cdbg {
