@@ -77,19 +77,20 @@ struct builder {
     void build() {
         validate_and_resolve_config();
 
-        // One always-on RAM governor for the whole build: the authoritative,
-        // measured-RSS backstop. It reclaims glibc-retained pages under pressure
-        // and spills any registered participant (today: the unitig writer during
-        // stitch -- the buffer the per-phase watcher couldn't reach). The per-phase
-        // size models keep RSS below its high-watermark in the common case; the
-        // governor only fires when real RSS approaches -g. budget 0 => disabled.
-        // Trip a touch below -g (0.80/0.62) so the spill+trim lag on a spinning
-        // disk has room before the hard cap. See ram-governor.md.
+        // RAM governor: the measured-RSS backstop that reclaims glibc-retained
+        // pages under pressure and spills registered participants (the unitig
+        // writer during stitch -- the buffer the per-phase watcher couldn't
+        // reach). It is constructed here but STARTED only at stitch (below):
+        // bucket-write and bucket-process have their own RAM controls and the
+        // governor never fires there (RSS stays well under its high-watermark),
+        // so polling during them is pure overhead for no benefit -- it must not
+        // slow the fast phases. budget 0 => disabled. Trip a touch below -g
+        // (0.80/0.62) so the spill+trim lag on a spinning disk has room before
+        // the hard cap. See ram-governor.md.
         ram_governor governor(m_cfg.max_ram_gb > 0
                                   ? (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0)
                                   : 0,
                               /*high_frac=*/0.80, /*low_frac=*/0.62);
-        governor.start();
 
         // Read the filenames list: one input path per line, blanks skipped.
         // File at line i is color i.
@@ -306,6 +307,11 @@ struct builder {
         frag_sink.close_for_writing();
         writer.reset();
         release_free_heap_to_os_();
+
+        // Start the governor now: stitch (and emit) is where it earns its keep
+        // (the unitig writer spill + glibc reclaim near -g). Bucket-write/process
+        // ran without it. It stops when `governor` goes out of scope at build end.
+        governor.start();
 
         // Stitch streams each finished unitig into a cid-range
         // unitig_bucket_writer. The K bucket count auto-scales so
