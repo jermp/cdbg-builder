@@ -75,6 +75,7 @@ struct builder {
     // and removes the scratch directory.
     void build() {
         validate_and_resolve_config();
+        cap_malloc_arenas_();
 
         // Read the filenames list: one input path per line, blanks skipped.
         // File at line i is color i.
@@ -313,26 +314,39 @@ struct builder {
                 const uint64_t unitig_bucket_count = pick_unitig_bucket_count_(
                     m_num_color_classes, total_frag_seq_bytes, m_cfg.max_ram_gb);
 
-                // In-RAM unitig output budget. Keeping stitched unitigs in memory
-                // skips the temp-bucket write here AND the read-back in emit -- the
-                // unitig sequences never round-trip through disk (~half of emit on a
-                // spinning disk). Carved from the SAME post-carry budget the stitch
-                // uses (stitch_post_carry below), so their sum still respects -g.
-                // Stitching only merges fragments, so total unitig bases <=
-                // total_frag_seq_bytes; budget at ~1.5x for std::string/vector
-                // overhead, but never take more than 40% from stitch. No -g =>
-                // SIZE_MAX: keep every unitig in RAM. The writer spills its largest
-                // buckets to the disk path when the budget is exceeded.
+                // Stitch's whole working-RAM share of -g is STITCH_BUDGET_FRAC*g;
+                // the remaining (1-frac)*g is HEADROOM for glibc arena retention +
+                // scratch (which scale with thread churn, not with -g). EVERYTHING
+                // the phase allocates is sized to sum within the working share:
+                //   work = unitig_ram_budget + stitch_ram_cap + assemble_transient
+                // so they cannot co-peak past -g. (This replaces the old fixed 2 GiB
+                // "carry" reserve, which didn't scale with -g and left the assemble
+                // transient + glibc to pile on TOP of the budget -- the 100k/-g16
+                // overshoot.) The color dict is freed before stitch (carry ~0), but
+                // we subtract it if still resident.
+                //
+                // In-RAM unitig output budget: keeping stitched unitigs in memory
+                // skips the temp-bucket write here AND the read-back in emit (~half
+                // of emit on a spinning disk). Stitching only merges fragments, so
+                // total unitig bases <= total_frag_seq_bytes; budget at ~1.5x for
+                // std::string/vector overhead, but never more than 40% of the
+                // splittable share. No -g => SIZE_MAX (keep every unitig in RAM); the
+                // writer spills its largest buckets when the budget is exceeded.
                 size_t unitig_ram_budget = SIZE_MAX;
-                uint64_t stitch_post_carry = 0;
+                uint64_t stitch_splittable = 0;  // work for unitig writer + stores
                 if (m_cfg.max_ram_gb > 0) {
                     const uint64_t total = m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0;
-                    const uint64_t carry =
-                        global_dict.resident_bytes() + 2ull * 1024 * 1024 * 1024;
-                    stitch_post_carry = total > carry ? total - carry : 256ull * 1024 * 1024;
+                    const uint64_t carry = global_dict.resident_bytes();  // ~0 post-release
+                    uint64_t work = (uint64_t)(STITCH_BUDGET_FRAC * total);
+                    work = work > carry ? work - carry : 256ull * 1024 * 1024;
+                    // Reserve the non-spillable phase-3 assemble transient FIRST, so
+                    // unitig + stores + transient all fit inside `work` (chain_buckets
+                    // bounds the real set to exactly stitch_assemble_budget).
+                    const uint64_t assemble = stitch_assemble_budget(total);
+                    stitch_splittable = work > assemble ? work - assemble : 256ull * 1024 * 1024;
                     const uint64_t est = (uint64_t)(total_frag_seq_bytes * 1.5);
                     unitig_ram_budget =
-                        std::min<uint64_t>(est, (uint64_t)(stitch_post_carry * 0.4));
+                        std::min<uint64_t>(est, (uint64_t)(stitch_splittable * 0.4));
                 }
                 uwriter_ptr = std::make_unique<unitig_bucket_writer>(
                     tmp_dir, m_num_color_classes, unitig_bucket_count, unitig_ram_budget);
@@ -365,15 +379,14 @@ struct builder {
                 // Round 0 seeds from the precomputed links spill (boundary
                 // k-mers, ~17 B/fragment), not a second full frag-spill read.
                 //
-                // cap = -g minus the cross-phase carry (the color dict that
-                // stays resident through stitch) minus a working-set reserve
-                // for the per-bucket decode set. 0 means no -g => use all RAM.
-                // The unitig buffer's budget was carved from stitch_post_carry
-                // above; give stitch what remains so the two don't double-spend -g.
+                // The stores get whatever of the splittable share the unitig writer
+                // didn't take, so unitig_writer + stores = stitch_splittable (and,
+                // with the assemble transient reserved out above, the three sum to
+                // STITCH_BUDGET_FRAC*g). 0 means no -g => use all RAM.
                 uint64_t stitch_ram_cap = 0;
                 if (m_cfg.max_ram_gb > 0) {
-                    stitch_ram_cap = stitch_post_carry > unitig_ram_budget
-                                         ? stitch_post_carry - unitig_ram_budget
+                    stitch_ram_cap = stitch_splittable > unitig_ram_budget
+                                         ? stitch_splittable - unitig_ram_budget
                                          : 256ull * 1024 * 1024;
                 }
                 std::cout << "  compact stitch: scalable, RAM-first cap "
@@ -544,6 +557,30 @@ private:
     // point to validate against real 100k/661k numbers before the overflow
     // machinery lands. See colorset-dedup-externalization.md.
     static constexpr double COLORSET_DEDUP_BUDGET_FRAC = 0.50;
+
+    // Stitch's whole working-RAM share of -g (unitig writer + RAM-first stores +
+    // phase-3 assemble transient all sized to sum within it). The remaining
+    // (1-frac)*g is headroom for glibc arena retention + scratch, which scale with
+    // thread churn rather than -g, so the fraction is deliberately conservative
+    // (measured: at -t32 on 100k the stitch glibc retention alone was ~0.29*g).
+    // The measured-RSS watcher (trip 0.70*g) is the backstop if the model still
+    // undercounts; this fraction is what keeps the watcher from having to fire.
+    static constexpr double STITCH_BUDGET_FRAC = 0.60;
+
+    // glibc spawns up to 8*ncpu malloc arenas; under heavy multi-threaded
+    // alloc/free churn (the stitch) freed pages strand in per-thread arenas and
+    // inflate RSS without being returned to the OS -- ~0.29*g of "glibc retention"
+    // at -t32 on the 100k run, which ate the -g headroom and busted the budget.
+    // Cap the arena count to ~one per thread so that retention is bounded (fewer
+    // arenas -> far less cross-arena stranding), trading a little malloc
+    // concurrency for RAM. Only when -g is set; no-op off glibc. Must run before
+    // the worker threads allocate.
+    void cap_malloc_arenas_() const {
+#if defined(__GLIBC__)
+        if (m_cfg.max_ram_gb <= 0) return;
+        mallopt(M_ARENA_MAX, (int)std::max<uint32_t>(1, m_cfg.num_threads));
+#endif
+    }
 
     void validate_and_resolve_config() {
         if (m_cfg.filenames_list.empty()) {
