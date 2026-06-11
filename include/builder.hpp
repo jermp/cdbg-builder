@@ -78,6 +78,18 @@ struct builder {
         validate_and_resolve_config();
         cap_malloc_arenas_();
 
+        // One always-on RAM governor for the whole build: the authoritative,
+        // measured-RSS backstop. It reclaims glibc-retained pages under pressure
+        // and spills any registered participant (today: the unitig writer during
+        // stitch -- the buffer the per-phase watcher couldn't reach). The per-phase
+        // size models keep RSS below its high-watermark in the common case; the
+        // governor only fires when real RSS approaches -g. budget 0 => disabled.
+        // See ram-governor.md.
+        ram_governor governor(m_cfg.max_ram_gb > 0
+                                  ? (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0)
+                                  : 0);
+        governor.start();
+
         // Read the filenames list: one input path per line, blanks skipped.
         // File at line i is color i.
         std::vector<std::string> files;
@@ -351,6 +363,11 @@ struct builder {
                 }
                 uwriter_ptr = std::make_unique<unitig_bucket_writer>(
                     tmp_dir, m_num_color_classes, unitig_bucket_count, unitig_ram_budget);
+                // Govern the unitig writer for the stitch's duration: under -g
+                // pressure the governor spills its largest in-RAM cid-buckets to
+                // disk. Unregistered when this block exits (before emit, which
+                // reads it single-threaded and so runs lock-free).
+                auto uwriter_reg = governor.add(uwriter_ptr.get());
 
                 std::atomic<uint64_t> done{0};
                 progress prog("stitch", done, n_frags);
