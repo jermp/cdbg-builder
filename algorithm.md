@@ -717,16 +717,37 @@ Every working store in the stitch — the id-tig round store, the member
 spill, and the per-chain bases spill — is a **RAM-first hybrid**: records
 are retained UNCOMPRESSED in RAM and read straight back from RAM, so when
 the working set fits the budget the whole stitch runs with no disk
-round-trip. All stores active in one stitch draw from a **single shared
-`ram_budget`** derived from `-g` (≈ `-g` minus the resident color dict and
-a working-set reserve); when the shared usage exceeds the cap, the store
-that pushed it over LZ4-spills one of its own buckets to disk and drops it
-from RAM (`take_*_decoded` later merges the RAM part with any spilled
-frames). So spare RAM up to the cap is exploited, and the `-g` bound is
-**honored at all costs** — overflow always spills. `ram_budget = 0`
-(no `-g`) means cap = ∞: everything stays in RAM. This hard spill cap is
-new relative to the older base-carrying stitch, which was sized by model
-only and was historically the pipeline RAM peak (§9).
+round-trip. When the shared usage exceeds the cap, the store that pushed it
+over LZ4-spills one of its own buckets to disk and drops it from RAM
+(`take_*_decoded` later merges the RAM part with any spilled frames). So
+spare RAM up to the cap is exploited, and the `-g` bound is **honored at all
+costs** — overflow always spills. `ram_budget = 0` (no `-g`) means cap = ∞.
+
+**The budget split (one fraction of `-g`).** The whole stitch working set is
+sized to `STITCH_BUDGET_FRAC · g` (0.60), and the rest of `-g` is headroom
+for glibc arena retention + scratch (which scale with thread churn, not with
+`-g`). That fraction is partitioned so the pieces that co-peak at the
+phase-2→phase-3 boundary all fit *inside* it:
+
+```
+0.60·g = assemble_transient   (phase-3 decoded chain bucket, §5.6; reserved first)
+       + unitig_ram_budget    (the cid-range unitig writer's in-RAM buffer)
+       + stitch_ram_cap        (the round/member/bases stores)
+```
+
+This replaced an earlier model that reserved a *fixed 2 GiB* for glibc +
+transients and let the assemble transient pile on **top** of the store/unitig
+budgets — which co-peaked and blew `-g 16` at 100k (19.6 GiB). Folding every
+stitch allocation into one fraction, with the transient reserved up front,
+keeps the model's peak `≈ 0.60·g + glibc ≤ g`.
+
+**The measured-RSS backstop (the governor).** The payload model still
+undercounts real RSS at scale, so a single `ram_governor` (§5.7) runs during
+stitch: it polls live RSS and, above `0.80·g`, force-spills the **unitig
+writer** (the one RAM-first buffer the per-store spill can't reach) and
+returns freed pages to the OS. So the fraction keeps the common case in RAM
+and the governor is the hard backstop near `-g` — on the 100k/`-g 16` run the
+stitch peak is **13.11 GiB**, held under 16.
 
 **Reference oracle.** The older base-carrying external-memory stitch in
 `stitch_extmem.hpp` (each round physically rewrites the growing
@@ -784,6 +805,40 @@ the trip point scales linearly, so doubling `-g` doubles it; and `0.25 · g`
 is the *optimistic* ceiling on `member_budget` — when `stitch_ram_cap` eats
 most of `-g`, `avail` becomes the binding term and the trip point drops
 proportionally.
+
+### 5.7 The RAM governor (measured-RSS backstop)
+
+`include/ram_governor.hpp` is one always-constructible controller that reads
+the process's **real RSS** and, when it crosses a high-watermark, asks every
+registered `ram_spillable` participant to spill and returns the freed pages
+to the OS (`malloc_trim`). It exists because the per-phase *size models*
+under-count real RSS at scale (glibc retention, co-peaks); the governor makes
+**correctness depend on a measurement, not a prediction** — the model only
+decides *how much* stays in RAM for speed.
+
+**Current scope: stitch only.** The governor is constructed at build start but
+`start()`ed only before stitch, and the **unitig writer** is its one
+registered participant. Bucket-write and bucket-process keep their own RAM
+controls (the bucket-write RSS watcher §3.6, the bucket-process admission gate
+§4.9), where the governor would be redundant *and* never fires (their RSS
+stays below its high-watermark). It trips at `0.80·g` / releases at `0.62·g`,
+a touch below `-g` so the spill+trim lag on a spinning disk has room.
+
+**What it does NOT do.** It cannot spill a *non-spillable* structure, so it
+does not remove the two §9.1 floors (the per-bucket walk set, the
+color-sets-dedup-map). It bounds the *spillable* surface; the non-spillable
+floors are handled separately (scaling / abort / the planned dedup
+externalization).
+
+**A note on `malloc_trim`.** The trim is the governor's mechanism for making a
+spill actually *lower* RSS (freed glibc-arena pages otherwise stay resident).
+But it is **expensive** — it takes the malloc lock and walks the heap — so it
+must fire only under genuine pressure. An earlier attempt to add the same trim
+to the bucket-write watcher (which is over its HIGH threshold for most of the
+phase) caused a ~40% slowdown and was reverted; likewise an `M_ARENA_MAX` cap
+was tried and dropped (it serialized allocation across threads). The lesson
+that shaped the current design: cheap *polling* everywhere is fine, but the
+*reclaim action* must be confined to where RSS truly approaches `-g`.
 
 ---
 
@@ -999,20 +1054,21 @@ given input. The dict (`streaming_color_set_dict`) carries forward into
 stitch + emit, so its index is freed (`release_index`) right after this
 phase.
 
-Stitch peak: bounded by a **single shared `ram_budget`** (§5.5) derived
-from `-g`, across all of the stitch's working stores (id-tig round store,
-member spill, per-chain bases spill). Records stay in RAM up to the cap
-and the overflow LZ4-spills to disk, so the phase honors `-g` **at all
-costs** — it cannot exceed the budget by holding more in RAM. Because the
-rounds carry only fragment **ids** (not bases/colors), the in-RAM
-working set is small to begin with; the bases are re-read from the frag
-spill once during assembly (§5.3) and held only one chain bucket at a
-time per worker. This hard spill cap replaced the old base-carrying
-stitch, which was sized by model only (no enforcement) and was the
-pipeline RAM peak — 41 GiB on the 661K run. The one stitch structure that
-cannot spill — phase-2's decoded per-range member array — is instead kept
-in budget by scaling `frag_ranges` (§5.6); the abort it falls back to is
-unreachable below ~10¹² fragments at `-g 4 GiB`.
+Stitch peak: the whole stitch working set is sized to one fraction of `-g`
+(`STITCH_BUDGET_FRAC = 0.60`, §5.5), partitioned so the pieces that co-peak —
+the per-chain bases/round/member **stores** (RAM-first, spill overflow), the
+**unitig writer** buffer, and the phase-3 **assemble transient** — all fit
+*inside* it, leaving ~0.40·g of headroom for glibc retention. The rounds
+carry only fragment **ids** (not bases/colors), so the in-RAM working set is
+small; the bases are re-read from the frag spill once during assembly (§5.3),
+held one chain bucket at a time per worker. The model's residual under-count
+is caught by the measured-RSS **governor** (§5.7), which force-spills the
+unitig writer above `0.80·g`. The two non-spillable stitch structures —
+phase-2's per-range member array and phase-3's decoded chain bucket — are kept
+in budget by scaling `frag_ranges` / `chain_buckets` (§5.6). Net on the
+100k/`-g 16` run: stitch peaks at **13.11 GiB** (was 19.6 with the old
+fixed-reserve model; was 41 GiB on 661k with the retired base-carrying
+stitch).
 
 Emit peak: one cid-range bucket of records loaded for sorting (~3 MB
 on salmonella-25K). The u2c bit_vector is streamed straight to disk
@@ -1037,8 +1093,8 @@ shrinks. The non-spillable structures and their fallbacks, per phase:
 | bucket-write | per-thread `keys`/`recs` buffers | `B·(α·T·flush+β·spill)` — **U-independent** | abort if floor > `0.5·g` | **Yes** (independent of dataset size) |
 | bucket-write | compactor hashmaps | live data | RSS watcher spills (§3.6) | Yes |
 | **bucket-process** | **per-bucket walk set** (`kmer_info`+visited+frags+`local_dict`) | **bucket size = data / B** | **none** | **No** — see below |
-| **bucket-process** | **color-sets-dedup-map** (`streaming_color_set_dict::m_shards`) | **# distinct color sets** | **none** | **No** — see below |
-| stitch | RAM-first stores | live data | spill overflow + watcher (§5.5) | Yes |
+| **bucket-process** | **color-sets-dedup-map** (`colorset_dedup_index`) | **# distinct color sets** | **none** | **No** — see below |
+| stitch | RAM-first stores + unitig writer | live data | spill overflow + measured-RSS **governor** (§5.5/§5.7) | Yes |
 | stitch | member array / assemble set | data | **scaled** (`frag_ranges` / `chain_buckets`, §5.6) | Yes |
 | emit | one cid-range bucket | data / K | **external merge-sort** if over cap (§6.2) | Yes |
 | emit | u2c | data | **streamed** (§6.2) | Yes |
@@ -1066,10 +1122,17 @@ has the **only two** data-sized structures with **no fallback at all**:
 So a *provable* hard `-g` at arbitrary scale needs **both** bounded. Their fixes
 are independent:
 
-- **color-sets-dedup-map → externalize the index (NEXT PRIORITY).** Replace the
-  in-RAM sharded hash with an on-disk dedup (sort+merge of content hashes, or an
-  external hash), so the index never sits in RAM as `~24 B × #color-sets`. This
-  is the one structure that binds first and hardest at real scale.
+- **color-sets-dedup-map → externalize the index (NEXT PRIORITY, IN PROGRESS).**
+  Replace the in-RAM sharded hash with a RAM-first / spill-overflow dedup so the
+  index never sits in RAM as `~24 B × #color-sets`. This is the one structure
+  that binds first and hardest at real scale (it is why 661k needed `-g 64`).
+  **Status:** stages 1–2 are done and merged — the index is encapsulated behind
+  `colorset_dedup_index`, and bucket-process prints a *measure-only* occupancy
+  line (`color-sets-dedup-map: ~X / Y budget`). The actual overflow path (freeze
+  the in-RAM index past the budget, spill new classes to hash-partitioned files,
+  reconcile + remap during the stitch frag-read) is stages 3–6, **not yet built**
+  — see `colorset-dedup-externalization.md`. Until then the index is still fully
+  in RAM and unbounded.
 
 - **per-bucket walk set → adaptive minimizer re-split (DEFERRED).** When a
   bucket's estimated working set (`~24·bucket_unc_bytes`) exceeds a `-g` share,
