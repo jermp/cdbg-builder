@@ -1,6 +1,8 @@
 # Externalizing the color-sets-dedup-map (design)
 
-Status: **design + staging** (branch `claude/externalize-colorset-dedup`).
+Status: **stages 1–2 merged to `main` (encapsulate + measure-only); stages 3–6
+NOT built.** The dedup index is still fully in RAM and can overflow `-g` at
+scale. See the Staging section for exactly what's done vs planned.
 
 ## Problem
 
@@ -124,19 +126,25 @@ that fits stays 100 % in RAM at full speed.
 
 ## Staging (each stage builds + passes `test_stitch` and the 86630/171 ground truth)
 
-1. **Encapsulate** the dedup index behind a small `colorset_dedup_index` type
-   (sharded `hash128→cid`, `lookup_or_insert`, `resident_bytes`, `set_budget`,
-   `over_budget`) — pure refactor, no behavior change. *(the clean seam)*
-2. **Budget plumbing:** carve `D` from `-g` in the builder, pass it down, log
-   resident-vs-budget; still no spill (verifies the trigger fires where expected
-   on 100k/661k without changing output).
-3. **Overflow spill + provisional ids** in the dict (partitioned append, frozen
-   index past `D`).
-4. **Reconciliation** (per-partition dedup → final cids + `.color_sets` append +
+**Status: stages 1–2 merged to `main`; stages 3–6 NOT built.** The dedup index is
+still fully in RAM and unbounded — it can still overflow `-g` (≈14 GiB @ 661k).
+Stages 1–2 only encapsulate and *measure*; nothing spills yet.
+
+1. ✅ **Encapsulate** the dedup index behind a small `colorset_dedup_index` type
+   (sharded `hash128→cid`) — pure refactor, no behavior change. *(the clean seam,
+   merged)*
+2. ✅ **Budget plumbing (MEASURE-ONLY):** carve `D` from `-g` in the builder
+   (`COLORSET_DEDUP_BUDGET_FRAC = 0.50`), pass it down, log resident-vs-budget
+   (the `color-sets-dedup-map: ~X / Y budget (within → no spill)` line). **No
+   spill** — it only reports whether the not-yet-built overflow path *would*
+   engage. (merged)
+3. ☐ **Overflow spill + provisional ids** in the dict (partitioned append, frozen
+   index past `D`). *(this is where actual externalization begins — not started)*
+4. ☐ **Reconciliation** (per-partition dedup → final cids + `.color_sets` append +
    `prov→final`).
-5. **Remap fold** into the stitch frag-spill read.
-6. Bench 100k / 661k at `-g 4` to confirm the dedup peak is bounded and spill is
-   rare under a comfortable `-g`.
+5. ☐ **Remap fold** into the stitch frag-spill read.
+6. ☐ Bench 100k / 661k at a tight `-g` to confirm the dedup peak is bounded and
+   spill is rare under a comfortable `-g`.
 
 ## Open questions / knobs
 

@@ -72,7 +72,7 @@ Options:
 | `-m INT`     | Minimizer length used for bucketing                               | auto    |
 | `-b INT`     | log2 of the bucket count (`2^N` bucket files on disk)             | auto (derived from `-g` if set, else 10) |
 | `-d PATH`    | Scratch directory for the bucket files (created if missing; if it already exists it must be empty; removed on success) | mkdtemp |
-| `-g FLOAT`   | Soft RAM budget in GiB. Tunes bucket count + spill thresholds and arms a runtime RSS watcher; peak is reported at the end (not a hard cap) | unset |
+| `-g FLOAT`   | RAM budget in GiB. Sizes bucket count + spill thresholds and drives the spill machinery so peak RSS is held to `-g` (reported at the end). Honored as a hard cap for all phases **except** two non-spillable structures in bucket-process (the per-bucket walk set and the color-sets-dedup-map) — see `algorithm.md` §9.1; at large scale (e.g. 661k) the dedup-map can still require a larger `-g`. | unset |
 | `--alpha FLOAT` | RAM-model per-thread buffer overhead multiplier (re-calibrates the bucket-count model) | 2.0 |
 | `--beta FLOAT`  | RAM-model per-bucket compactor overhead multiplier (re-calibrates the bucket-count model) | 7.0 |
 | `--flush INT`   | Per-thread→compactor handoff size in bytes (smaller → more, smaller buckets) | 4096 |
