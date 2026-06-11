@@ -76,7 +76,6 @@ struct builder {
     // and removes the scratch directory.
     void build() {
         validate_and_resolve_config();
-        cap_malloc_arenas_();
 
         // One always-on RAM governor for the whole build: the authoritative,
         // measured-RSS backstop. It reclaims glibc-retained pages under pressure
@@ -84,10 +83,12 @@ struct builder {
         // stitch -- the buffer the per-phase watcher couldn't reach). The per-phase
         // size models keep RSS below its high-watermark in the common case; the
         // governor only fires when real RSS approaches -g. budget 0 => disabled.
-        // See ram-governor.md.
+        // Trip a touch below -g (0.80/0.62) so the spill+trim lag on a spinning
+        // disk has room before the hard cap. See ram-governor.md.
         ram_governor governor(m_cfg.max_ram_gb > 0
                                   ? (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0)
-                                  : 0);
+                                  : 0,
+                              /*high_frac=*/0.80, /*low_frac=*/0.62);
         governor.start();
 
         // Read the filenames list: one input path per line, blanks skipped.
@@ -584,21 +585,6 @@ private:
     // The measured-RSS watcher (trip 0.70*g) is the backstop if the model still
     // undercounts; this fraction is what keeps the watcher from having to fire.
     static constexpr double STITCH_BUDGET_FRAC = 0.60;
-
-    // glibc spawns up to 8*ncpu malloc arenas; under heavy multi-threaded
-    // alloc/free churn (the stitch) freed pages strand in per-thread arenas and
-    // inflate RSS without being returned to the OS -- ~0.29*g of "glibc retention"
-    // at -t32 on the 100k run, which ate the -g headroom and busted the budget.
-    // Cap the arena count to ~one per thread so that retention is bounded (fewer
-    // arenas -> far less cross-arena stranding), trading a little malloc
-    // concurrency for RAM. Only when -g is set; no-op off glibc. Must run before
-    // the worker threads allocate.
-    void cap_malloc_arenas_() const {
-#if defined(__GLIBC__)
-        if (m_cfg.max_ram_gb <= 0) return;
-        mallopt(M_ARENA_MAX, (int)std::max<uint32_t>(1, m_cfg.num_threads));
-#endif
-    }
 
     void validate_and_resolve_config() {
         if (m_cfg.filenames_list.empty()) {
