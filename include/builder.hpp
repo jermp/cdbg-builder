@@ -188,7 +188,8 @@ struct builder {
         writer->stop_rss_watcher();
         if (writer->pressure_was_engaged()) {
             std::cout << "  bucket-write: RSS pressure engaged; observed live-RSS high "
-                      << format_bytes(writer->observed_rss_high()) << "\n";
+                      << format_bytes(writer->observed_rss_high()) << " ("
+                      << writer->watcher_sweeps() << " throttled sweeps)\n";
         }
         writer->close();
         std::cout << "  bucket bytes written: " << writer->total_bytes() << " (compressed; "
