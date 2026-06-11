@@ -358,6 +358,11 @@ struct builder {
                           << (stitch_ram_cap ? format_bytes(stitch_ram_cap)
                                              : std::string("unlimited"))
                           << "\n";
+                // The two NON-spillable stitch fan-out knobs -- frag_ranges
+                // (phase-2 member array) and chain_buckets (phase-3 assemble set)
+                // -- are sized from -g INSIDE compact_stitch_scalable, next to the
+                // structures they bound. The orchestrator only carves the budget
+                // (stitch_ram_cap, the -g target) and hands it down.
                 auto for_each_frag = [&, first_pass = true](auto&& fn) mutable {
                     frag_unitig_stream_reader rd(frag_sink.path());
                     uint8_t of;
@@ -381,7 +386,8 @@ struct builder {
                 compact_stitch_scalable(for_each_frag, n_frags, m_cfg.k, tmp_dir,
                                         std::ref(*uwriter_ptr), stitch_buckets,
                                         /*frag_ranges=*/0, /*chain_buckets=*/0, m_cfg.num_threads,
-                                        frag_sink.links_path(), stitch_ram_cap, stitch_rss_target);
+                                        frag_sink.links_path(), stitch_ram_cap, stitch_rss_target,
+                                        total_frag_seq_bytes);
                 prog.stop();
                 std::cout << "  unitigs after stitching: " << uwriter_ptr->total_unitigs() << "\n";
             }
@@ -397,6 +403,9 @@ struct builder {
         // back to the OS before emit.
         release_free_heap_to_os_();
 
+        // emit streams the u2c bit_vector straight to <out>.u2c (its run-end
+        // bits are produced in ascending unitig order), so it never holds the
+        // num_unitigs-bit bitmap in RAM -- no -g floor here.
         {
             phase_rss_marker rss("emit-fasta");
             emit_fasta(*uwriter_ptr, m_cfg.out_basename, m_num_unitigs, m_cfg.max_ram_gb);
@@ -447,7 +456,27 @@ struct builder {
     build_config const& config() const { return m_cfg; }
 
 private:
-    // Soft-cap policy. Reads m_cfg.max_ram_gb (0 = unset) and decides:
+    // ---- RAM budget (-g) enforcement: honored AT ALL COSTS ------------------
+    // -g is a HARD limit. Most structures spill to disk to stay under it, and a
+    // few that don't spill are instead SCALED to fit: the stitch's per-range
+    // member array shrinks by raising frag_ranges, and emit's u2c bit_vector is
+    // streamed straight to disk. The genuinely NON-SPILLABLE floors that remain
+    // (bucket-write per-thread buffers, a single bucket's kmer_info) ABORT with a
+    // precise message when their budget share is exceeded rather than silently
+    // blow -g. And -g below MIN_RAM_GB is rejected outright, since below that the
+    // fixed per-thread/working floors cannot be honored.
+    static constexpr double MIN_RAM_GB = 4.0;
+
+    // Uniform "cannot honor -g" abort. `need`/`avail` are bytes.
+    [[noreturn]] static void fail_ram_budget_(std::string const& what, uint64_t need,
+                                              uint64_t avail, std::string const& remedy) {
+        throw std::runtime_error("-g cannot be honored: " + what + " needs " + format_bytes(need) +
+                                 " of NON-SPILLABLE RAM but only " + format_bytes(avail) +
+                                 " is available for it. " + remedy +
+                                 " (-g is a hard limit; aborting rather than exceeding it.)");
+    }
+
+
     //   - bucket_log2 (more buckets -> smaller per-bucket data structures)
     //   - color-bvb spill threshold (in bytes; 0 = never spill)
     // Tighter budgets push bucket_log2 toward 16 and shrink the bvb spill threshold proportionally.
@@ -497,6 +526,14 @@ private:
             throw std::runtime_error("k must satisfy 1 <= k <= " + std::to_string(MAX_K));
         }
         if (m_cfg.num_threads == 0) m_cfg.num_threads = 1;
+        // -g floor: below MIN_RAM_GB the non-spillable working set can't be held.
+        if (m_cfg.max_ram_gb > 0 and m_cfg.max_ram_gb < MIN_RAM_GB) {
+            throw std::runtime_error(
+                "-g must be at least " + std::to_string((int)MIN_RAM_GB) + " GiB (got " +
+                format_bytes((uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0)) +
+                "): below that the non-spillable per-thread and per-phase working structures "
+                "cannot be honored. Raise -g, or omit it entirely for unbounded RAM.");
+        }
         if (m_cfg.m == 0) m_cfg.m = compute_best_m(m_cfg.k);
         if (m_cfg.m < 2 or m_cfg.m > m_cfg.k) {
             throw std::runtime_error("invalid m=" + std::to_string(m_cfg.m) +
@@ -507,6 +544,35 @@ private:
         // buckets (faster bucket-process) while bucket-write stays in budget.
         m_flush_bases = m_cfg.flush_bases ? m_cfg.flush_bases : DEFAULT_FLUSH_BASES;
         m_spill_bytes = m_cfg.spill_bytes ? m_cfg.spill_bytes : DEFAULT_SPILL_BYTES;
+
+        // bucket-write non-spillable floor (the "high thread count" case). The
+        // RSS watcher can spill the compactor hashmaps but NOT the per-thread
+        // keys/recs buffers, whose floor is num_buckets*(alpha*T*flush +
+        // beta*spill). The model sizes num_buckets to fit BUCKET_WRITE_BUDGET_FRAC
+        // *g but cannot go below MIN_AUTO_BUCKETS; if even that many buckets'
+        // buffers exceed the share -- which happens as -t (T) inflates the
+        // per-bucket term -- bucket-write would exceed -g unrecoverably. Abort,
+        // and report the largest -t that fits. (Skipped under -b, which the user
+        // fixes explicitly.)
+        if (m_cfg.max_ram_gb > 0 and m_cfg.bucket_log2 == 0) {
+            const double g = m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0;
+            const double M = BUCKET_WRITE_BUDGET_FRAC * g / PLATFORM_RAM_OVERHEAD;
+            const double per_bucket =
+                m_cfg.alpha * m_cfg.num_threads * m_flush_bases + m_cfg.beta * m_spill_bytes;
+            const double floor_min = (double)MIN_AUTO_BUCKETS * per_bucket;
+            if (floor_min > M) {
+                const double t_room = M / (double)MIN_AUTO_BUCKETS - m_cfg.beta * m_spill_bytes;
+                const long t_max =
+                    t_room > 0 ? (long)(t_room / (m_cfg.alpha * m_flush_bases)) : 0;
+                std::string remedy =
+                    t_max >= 1
+                        ? "Reduce -t to <= " + std::to_string(t_max) + ", or raise -g."
+                        : "Raise -g (even -t 1 does not fit; spill_bytes/flush_bases too large).";
+                fail_ram_budget_("bucket-write per-thread buffers at -t " +
+                                     std::to_string(m_cfg.num_threads),
+                                 (uint64_t)floor_min, (uint64_t)M, remedy);
+            }
+        }
 
         // Resolve the bucket COUNT (need not be a power of two).
         if (m_cfg.bucket_log2 != 0) {
