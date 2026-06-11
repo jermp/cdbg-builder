@@ -56,6 +56,9 @@
 #include <sys/stat.h>
 #include <vector>
 #include <lz4.h>
+#if defined(__GLIBC__)
+#include <malloc.h>  // malloc_trim: return freed pages to the OS after a sweep
+#endif
 
 #include <unordered_dense/unordered_dense.h>
 
@@ -532,6 +535,11 @@ struct bucket_writer  //
         return m_observed_rss_high.load(std::memory_order_relaxed);
     }
 
+    // Number of pressure sweeps the watcher performed (each force-spills the
+    // compactors with pending data + trims). A small number means pressure
+    // cleared quickly; a large one means RSS stayed pinned over HIGH.
+    uint64_t watcher_sweeps() const { return m_watcher_sweeps.load(std::memory_order_relaxed); }
+
     bool pressure_was_engaged() const {
         return m_pressure_was_engaged.load(std::memory_order_relaxed);
     }
@@ -563,9 +571,28 @@ private:
             if (rss >= m_high_threshold_bytes) {
                 m_under_pressure.store(true, std::memory_order_relaxed);
                 m_pressure_was_engaged.store(true, std::memory_order_relaxed);
-                for (auto& c : m_compactors) {
-                    if (!m_watcher_running.load(std::memory_order_relaxed)) break;
-                    c->try_spill();
+                // Sweeping EVERY poll (100 ms) is a spill FLOOD: try_spill frees
+                // the dedup maps to glibc's ARENA, not the OS, so RSS does not
+                // drop, pressure never clears, and the next poll re-spills the
+                // ~100 ms of data each bucket re-accumulated -- millions of tiny,
+                // poorly-deduped spills (the spill count then scales with how LONG
+                // RSS sits over HIGH, i.e. with timing/glibc/load -- the
+                // non-determinism). Two fixes: (1) THROTTLE the sweep, and (2)
+                // malloc_trim AFTER it so the freed pages return to the OS and RSS
+                // can fall below LOW, which CLEARS pressure -- so a sweep that
+                // actually frees memory stops the loop instead of perpetuating it.
+                constexpr auto SWEEP_THROTTLE = std::chrono::milliseconds(500);
+                auto now = std::chrono::steady_clock::now();
+                if (now - m_last_sweep >= SWEEP_THROTTLE) {
+                    m_last_sweep = now;
+                    for (auto& c : m_compactors) {
+                        if (!m_watcher_running.load(std::memory_order_relaxed)) break;
+                        c->try_spill();
+                    }
+                    m_watcher_sweeps.fetch_add(1, std::memory_order_relaxed);
+#if defined(__GLIBC__)
+                    ::malloc_trim(0);  // return the freed dedup-map pages to the OS
+#endif
                 }
             } else if (rss <= m_low_threshold_bytes) {
                 m_under_pressure.store(false, std::memory_order_relaxed);
@@ -592,6 +619,10 @@ private:
     std::thread m_watcher_thread;
     uint64_t m_high_threshold_bytes = 0;
     uint64_t m_low_threshold_bytes = 0;
+    // Throttle for the pressure sweep + count of sweeps performed (surfaced in
+    // the post-phase log). See watcher_run for why both are needed.
+    std::chrono::steady_clock::time_point m_last_sweep{};
+    std::atomic<uint64_t> m_watcher_sweeps{0};
 };
 
 // ---- Per-thread batching sidecar -------------------------------------------
