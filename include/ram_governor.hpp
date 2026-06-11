@@ -187,31 +187,35 @@ private:
 
     void apply_pressure_(uint64_t rss) {
         const uint64_t want = rss > m_low ? rss - m_low : 0;
-        if (want == 0) return;
-        std::vector<ram_spillable*> parts;
-        {
-            std::lock_guard<std::mutex> lk(m_mu);
-            parts = m_parts;
+        if (want > 0) {
+            std::vector<ram_spillable*> parts;
+            {
+                std::lock_guard<std::mutex> lk(m_mu);
+                parts = m_parts;
+            }
+            // Target the biggest spillable holders first (best-effort hint).
+            std::sort(parts.begin(), parts.end(), [](ram_spillable* a, ram_spillable* b) {
+                return a->spillable_bytes() > b->spillable_bytes();
+            });
+            uint64_t freed = 0;
+            for (auto* p : parts) {
+                if (freed >= want) break;
+                freed += p->spill_under_pressure(want - freed);
+            }
         }
-        // Target the biggest spillable holders first (best-effort hint).
-        std::sort(parts.begin(), parts.end(), [](ram_spillable* a, ram_spillable* b) {
-            return a->spillable_bytes() > b->spillable_bytes();
-        });
-        uint64_t freed = 0;
-        for (auto* p : parts) {
-            if (freed >= want) break;
-            freed += p->spill_under_pressure(want - freed);
-        }
-        // Return the freed pages to the OS so RSS actually drops. Done ONLY here,
-        // under real pressure after a spill -- not periodically (a per-interval
-        // full-heap trim was tried in the per-phase watchers and backfired: it let
-        // freed pages pile up between trims and inflated the spike). This is the
-        // piece that lets a spill reclaim glibc-retained arena memory.
-        if (freed > 0) release_heap_();
+        // Return freed pages to the OS so RSS actually drops -- this is what
+        // reclaims glibc-retained arena memory, INDEPENDENT of any participant
+        // spill (freed pages strand in per-thread arenas otherwise). Done ONLY
+        // under pressure and throttled, so it never degrades into the
+        // per-interval full-heap trim that backfired in the per-phase watchers.
+        maybe_trim_();
     }
 
-    static void release_heap_() {
+    void maybe_trim_() {
 #if defined(__GLIBC__)
+        auto now = std::chrono::steady_clock::now();
+        if (now - m_last_trim < std::chrono::milliseconds(250)) return;
+        m_last_trim = now;
         ::malloc_trim(0);
 #endif
     }
@@ -225,6 +229,7 @@ private:
     std::atomic<bool> m_pressure{false};
     std::atomic<uint64_t> m_events{0};
     std::atomic<uint64_t> m_rss_high{0};
+    std::chrono::steady_clock::time_point m_last_trim{};  // throttle the glibc trim
 
     std::thread m_thread;
     std::mutex m_mu;
