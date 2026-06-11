@@ -1,9 +1,12 @@
-# The RAM governor (design)
+# The RAM governor (design + status)
 
-Status: **design + foundation struct** (branch `claude/ram-governor`, off
-`claude/externalize-colorset-dedup`). The struct lives in `include/ram_governor.hpp`;
-the phases are retrofitted to use it in stages (below). Nothing is wired into the
-pipeline yet — this lands the seam first.
+Status: **MERGED, scoped to stitch.** `include/ram_governor.hpp` is in `main`,
+constructed every build and `start()`ed before the stitch phase, with the
+**unitig writer** as its one registered participant. The sections below
+describe the full *vision* (one always-on controller for every phase); the
+"Current status" and "Lessons" sections record how much of it is real today and
+why the rest was deliberately *not* turned on. Read those two first if you only
+want the truth on the ground.
 
 ## The problem it ends
 
@@ -35,6 +38,56 @@ longer decide whether `-g` holds. Four properties:
    actually *lowers* RSS. Without this, `free()` returns memory to glibc's arena
    and RSS doesn't move — exactly why the per-phase stitch watcher couldn't hold
    16 GiB.
+
+## Current status (what's real today, vs the vision above)
+
+The four properties above are the **goal**, not all delivered. As merged:
+
+- **Scoped to stitch, NOT always-on.** The governor is constructed at build
+  start but `start()`ed only before stitch. Bucket-write and bucket-process keep
+  their own RAM controls (the bucket-write RSS watcher, the bucket-process
+  admission gate) and run with the governor *off* — it never fires there
+  anyway (their RSS stays below its high-watermark), and an always-on poller
+  there is pure overhead. So "always-on / no unwatched windows" is **not** the
+  current behavior; it's the eventual target.
+- **One participant, not comprehensive.** Only the **unitig writer** implements
+  `ram_spillable` and registers (during stitch). The stitch stores still spill
+  via their own `ram_budget`; bucket-write/process/emit buffers are not yet
+  registered. So "every RAM-first buffer registers" is also aspirational.
+- **Watermarks** in use: `0.80·g` high / `0.62·g` low (a touch below `-g` for
+  spinning-disk lag), not the `0.85/0.70` defaults in the struct.
+- **Proven** at 100k/`-g 16`: stitch peaks at 13.11 GiB (held under 16), the
+  governor force-spilling the unitig writer near the cap. Not yet validated at
+  661k.
+
+The remaining "always-on + retire the per-phase watchers" unification is a
+deliberate **future** step (see Lessons), to be done as a *separately measured*
+change rather than bundled in.
+
+## Lessons from the integration (why it's only scoped to stitch)
+
+Getting here cost a real detour; the design above survived but several
+"obvious" pieces did **not**, and the reasons are load-bearing:
+
+- **`malloc_trim` is the only way a spill lowers RSS** (freed glibc-arena pages
+  stay resident otherwise) — but it is **expensive** (takes the malloc lock,
+  walks the heap). It is safe only when fired under *genuine* pressure. Adding
+  the same trim to the **bucket-write** watcher — which sits over its HIGH
+  threshold for most of the phase — produced a ~40% slowdown (`131 trims × ~3 s`)
+  and was reverted. So reclaim must be confined to where RSS truly approaches
+  `-g`; that is *why* the governor is scoped to stitch, not always-on.
+- **Global allocator knobs are dangerous.** An `M_ARENA_MAX` cap (one arena per
+  thread) was tried to shrink glibc retention; it serialized allocation and
+  ~halved bucket-write throughput. Dropped. The governor's *reactive* reclaim is
+  the right tool; static global caps are not.
+- **The governor's *polling* is free; its *action* is not.** A 25 ms
+  `/proc/self/status` read costs nothing and never slowed any phase — every
+  bucket-write/process slowdown traced to the trim or the arena cap, not to the
+  governor watching. This is what makes "always-on" *eventually* safe: cheap
+  polling everywhere, reclaim only near `-g`.
+- **Measure, don't theorize.** The spill-count blowups were chased with several
+  wrong stories (machine load, arena cap) before the data settled it. The fix
+  process now leans on counters (`spills=`, sweep counts), not narratives.
 
 ## Why this is "definitive"
 
@@ -84,23 +137,26 @@ non-spillable into a bounded/spillable one, shrinking the residual list.)
 
 ## Staged retrofit (each stage builds + passes `test_stitch` and 86630/171)
 
-1. **Foundation** (this commit): the `ram_governor` + `ram_spillable` struct in
-   `include/`, compiled but not wired.
-2. **Own it in `builder`**: construct one `ram_governor(g)` at build start,
-   `start()`/`stop()` around the run; replace the ad-hoc `cap_malloc_arenas_` /
-   per-phase `release_free_heap_to_os_` calls with the governor's reclaim.
-3. **Retrofit stitch**: the stores + the unitig writer implement `ram_spillable`
-   (or subscribe to `under_pressure()`), register for the stitch's duration. This
-   is the one that directly fixes the 100k overshoot at the *backstop* level
-   (the unitig writer becomes reclaimable), letting `STITCH_BUDGET_FRAC` rise
-   back toward speed.
-4. **Retrofit bucket-write** (compactor maps) and **bucket-process** (admission
+1. ✅ **Foundation** (merged): the `ram_governor` + `ram_spillable` struct in
+   `include/`.
+2. ~ **Own it in `builder`** (merged, but **scoped to stitch**, not the whole
+   build — see Current status). The `cap_malloc_arenas_` idea was tried here and
+   **dropped** (Lessons); `release_free_heap_to_os_` at phase boundaries stays.
+3. ✅ **Retrofit stitch** (merged): the **unitig writer** implements
+   `ram_spillable` and registers for stitch's duration — the one piece that fixes
+   the 100k overshoot at the backstop level (peak 13.11 GiB ≤ 16). The stitch
+   *stores* still use their own `ram_budget` (not yet folded in).
+4. ☐ **Retrofit bucket-write** (compactor maps) and **bucket-process** (admission
    gate reads the governor's pressure) onto the same controller, retiring their
    private watchers.
-5. **Retrofit emit** (cid-sort buffers) and the **dedup-map overflow** once it
+5. ☐ **Retrofit emit** (cid-sort buffers) and the **dedup-map overflow** once it
    exists.
-6. **Report** governor activity per phase (events, observed RSS high) so spill
+6. ☐ **Report** governor activity per phase (events, observed RSS high) so spill
    pressure is visible, and confirm on 100k/661k that real RSS tracks `-g`.
+
+Stages 4–6 are the "always-on + retire the per-phase watchers" unification, held
+as a separate measured change (Lessons). Stages 1–3 (scoped to stitch) are what
+honors `-g 16` at 100k today.
 
 ## Open questions / knobs
 
