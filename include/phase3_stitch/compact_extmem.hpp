@@ -1270,6 +1270,18 @@ inline uint32_t stitch_pick_frag_ranges(uint64_t n_frags, uint64_t g, uint64_t s
     return (uint32_t)ranges;
 }
 
+// RAM the phase-3 assemble's NON-spillable co-resident decoded set is allowed
+// (chain_buckets is sized to keep the set under this). It is a first-class line
+// in the stitch budget: the orchestrator reserves exactly this much before
+// splitting the rest into the unitig writer + stores, so the three don't
+// over-commit -g. 0.15*g, capped at 1.5 GiB so it stays a modest slice as -g
+// grows. Shared by the orchestrator (to reserve) and stitch_pick_chain_buckets
+// (to size the fan-out) so the two never disagree.
+inline uint64_t stitch_assemble_budget(uint64_t g) {
+    constexpr uint64_t ASSEMBLE_BUDGET_CAP = 1536ull * 1024 * 1024;  // 1.5 GiB
+    return std::min<uint64_t>((uint64_t)(g * 0.15), ASSEMBLE_BUDGET_CAP);
+}
+
 // Phase-3 assemble lifts one chain bucket OUT of the shared ram_budget
 // (take_bucket_decoded credits the budget) and decodes it into a private
 // raw + groups working set -- NON-spillable, held by EACH of num_threads
@@ -1283,12 +1295,8 @@ inline uint32_t stitch_pick_chain_buckets(uint64_t total_frag_seq_bytes, uint64_
                                           uint32_t num_threads) {
     constexpr double DECODE_OVERHEAD = 4.0;  // raw + decoded groups + map/string slack
     constexpr uint32_t MAX_CHAIN_BUCKETS = 1u << 16;  // cap the spill-bucket fan-out
-    // Hold the set below the stitch model's fixed ~2 GiB reserve at any -g: a
-    // 0.15*g target, capped at 1.5 GiB so it stays under that reserve as -g grows.
-    constexpr uint64_t ASSEMBLE_BUDGET_CAP = 1536ull * 1024 * 1024;  // 1.5 GiB
     const uint32_t floor_cb = std::max<uint32_t>(64, num_threads * 8);
-    const uint64_t assemble_budget =
-        std::min<uint64_t>((uint64_t)(g * 0.15), ASSEMBLE_BUDGET_CAP);
+    const uint64_t assemble_budget = stitch_assemble_budget(g);
     uint64_t cb = floor_cb;
     if (assemble_budget > 0 and total_frag_seq_bytes > 0) {
         const uint64_t by_budget =

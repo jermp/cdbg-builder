@@ -56,10 +56,17 @@
 #include <vector>
 
 #include "phase2_bucket_process/bucket_walker.hpp"  // stitchable_unitig
+#include "ram_governor.hpp"                          // ram_spillable
 
 namespace cdbg {
 
-class unitig_bucket_writer {
+// ram_spillable: the unitig writer is registered with the RAM governor during
+// stitch, so the global measured-RSS backstop can reclaim its in-RAM buckets
+// under pressure (this is the buffer the per-phase stitch watcher could not see,
+// which busted -g at scale). The spill paths take m_spill_mu so the governor's
+// poller thread can spill concurrently with the stitch's (externally-serialized)
+// operator() calls.
+class unitig_bucket_writer : public ram_spillable {
 public:
     // num_color_classes is the final cid space (size of global_dict).
     // num_buckets controls how the cid range is partitioned. Picked
@@ -101,9 +108,11 @@ public:
     unitig_bucket_writer(unitig_bucket_writer const&) = delete;
     unitig_bucket_writer& operator=(unitig_bucket_writer const&) = delete;
 
-    // The sink callable used by the stitch. NOT thread-safe: the stitch calls
-    // it serially under its own sink mutex (compact_extmem.hpp).
+    // The sink callable used by the stitch. The stitch calls it serially under
+    // its own sink mutex (compact_extmem.hpp); m_spill_mu additionally guards
+    // against the RAM governor's poller spilling buckets concurrently.
     void operator()(stitchable_unitig&& u) {
+        std::lock_guard<std::mutex> lk(m_spill_mu);
         const uint64_t cid = u.mono_cid();  // post-split: monochromatic
         const uint32_t b = bucket_for_cid(cid);
         ++m_total_unitigs;
@@ -122,7 +131,22 @@ public:
         m_ram[b].push_back(record{cid, std::move(u.seq)});
         m_ram_bytes[b] += est;
         m_buffered_bytes += est;
-        if (m_buffered_bytes > m_ram_budget) evict_until_under_budget_();
+        if (m_buffered_bytes > m_ram_budget) spill_largest_until_(m_ram_budget);
+    }
+
+    // ---- ram_spillable: governed during stitch (see builder) -----------------
+    // Free about target_bytes by spilling the largest in-RAM buckets to disk;
+    // returns the bytes actually freed. Thread-safe (m_spill_mu).
+    uint64_t spill_under_pressure(uint64_t target_bytes) override {
+        std::lock_guard<std::mutex> lk(m_spill_mu);
+        const size_t before = m_buffered_bytes;
+        const size_t floor = target_bytes >= before ? 0 : before - (size_t)target_bytes;
+        spill_largest_until_(floor);
+        return before - m_buffered_bytes;
+    }
+    uint64_t spillable_bytes() const override {
+        std::lock_guard<std::mutex> lk(m_spill_mu);
+        return m_buffered_bytes;
     }
 
     uint64_t total_unitigs() const { return m_total_unitigs; }
@@ -315,11 +339,13 @@ private:
         std::vector<record>().swap(m_ram[b]);
     }
 
-    // Evict largest-first until back under budget: the fattest in-RAM buckets
-    // (cid-skew hot spots) go to disk, leaving the small ones resident. Bucket
-    // granularity, but correct and bounded; degrades to all-disk if nothing fits.
-    void evict_until_under_budget_() {
-        while (m_buffered_bytes > m_ram_budget) {
+    // Spill largest-first until m_buffered_bytes <= floor: the fattest in-RAM
+    // buckets (cid-skew hot spots) go to disk, leaving the small ones resident.
+    // Bucket granularity, but correct and bounded; degrades to all-disk if
+    // nothing fits. Caller holds m_spill_mu. Used both for the model budget
+    // (floor = m_ram_budget) and the governor's pressure spill.
+    void spill_largest_until_(size_t floor) {
+        while (m_buffered_bytes > floor) {
             uint32_t big = UINT32_MAX;
             size_t best = 0;
             for (uint32_t b = 0; b < m_num_buckets; ++b) {
@@ -356,6 +382,11 @@ private:
     size_t m_ram_budget = SIZE_MAX;          // cap on total m_buffered_bytes
     size_t m_buffered_bytes = 0;             // sum of m_ram_bytes over RAM buckets
     uint32_t m_spilled_buckets = 0;          // count of buckets evicted to disk
+    // Guards the mutating spill paths (operator(), spill_under_pressure) so the
+    // RAM governor's poller can spill concurrently with the stitch's writes.
+    // mutable: spillable_bytes() is const. Registered only during stitch, so
+    // emit's single-threaded read_bucket_sorted runs lock-free.
+    mutable std::mutex m_spill_mu;
 };
 
 // ----------------------------------------------------------------------------

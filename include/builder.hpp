@@ -62,6 +62,7 @@
 #include "phase2_bucket_process/streaming_color_set_dict.hpp"
 #include "phase2_bucket_process/unitig_spill.hpp"
 #include "phase4_emit/emit.hpp"
+#include "ram_governor.hpp"
 #include "util.hpp"
 
 namespace cdbg {
@@ -75,6 +76,21 @@ struct builder {
     // and removes the scratch directory.
     void build() {
         validate_and_resolve_config();
+
+        // RAM governor: the measured-RSS backstop that reclaims glibc-retained
+        // pages under pressure and spills registered participants (the unitig
+        // writer during stitch -- the buffer the per-phase watcher couldn't
+        // reach). It is constructed here but STARTED only at stitch (below):
+        // bucket-write and bucket-process have their own RAM controls and the
+        // governor never fires there (RSS stays well under its high-watermark),
+        // so polling during them is pure overhead for no benefit -- it must not
+        // slow the fast phases. budget 0 => disabled. Trip a touch below -g
+        // (0.80/0.62) so the spill+trim lag on a spinning disk has room before
+        // the hard cap. See ram-governor.md.
+        ram_governor governor(m_cfg.max_ram_gb > 0
+                                  ? (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0)
+                                  : 0,
+                              /*high_frac=*/0.80, /*low_frac=*/0.62);
 
         // Read the filenames list: one input path per line, blanks skipped.
         // File at line i is color i.
@@ -243,18 +259,40 @@ struct builder {
                 // kmer_info budget.
                 // All num_threads threads stay alive; -t is never reduced.
                 uint64_t bp_budget = 0;
+                uint64_t dedup_budget = 0;
                 if (m_cfg.max_ram_gb > 0) {
                     const uint64_t total = m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0;
                     bp_budget = BUCKET_PROCESS_BUDGET_FRAC * total;
+                    // Share of -g the color-sets-dedup-map may use before its
+                    // overflow path engages. MEASURE-ONLY today (reported below,
+                    // not yet enforced) -- see colorset-dedup-externalization.md.
+                    dedup_budget = COLORSET_DEDUP_BUDGET_FRAC * total;
                 }
+                global_dict.set_dedup_budget(dedup_budget);
                 process_buckets(*writer, m_cfg.k, m_num_colors, m_cfg.num_threads, frag_sink,
                                 global_dict, global_mu, &done, bp_budget);
                 prog.stop();
                 std::cout << "  bucket fragments: " << frag_sink.count() << "\n";
                 std::cout << "  distinct color classes: " << global_dict.size() << "\n";
-                std::cout << "  global color dict resident: ~"
-                          << format_bytes(global_dict.resident_bytes())
-                          << " (stays in RAM through stitch + emit)\n";
+                // color-sets-dedup-map occupancy vs its -g budget. Peak == final,
+                // since the index only grows until release_index(). MEASURE-ONLY:
+                // shows whether/by how much the externalization's overflow path
+                // would have engaged, before any spill machinery exists.
+                {
+                    const uint64_t resident = global_dict.resident_bytes();
+                    std::cout << "  color-sets-dedup-map: ~" << format_bytes(resident)
+                              << " resident";
+                    if (dedup_budget > 0) {
+                        std::cout << " / " << format_bytes(dedup_budget) << " budget";
+                        if (resident <= dedup_budget) {
+                            std::cout << " (within -> no spill)";
+                        } else {
+                            std::cout << " (OVER by " << format_bytes(resident - dedup_budget)
+                                      << " -> overflow path would spill)";
+                        }
+                    }
+                    std::cout << "\n";
+                }
             }
             rss.stop();
         }
@@ -268,6 +306,11 @@ struct builder {
         frag_sink.close_for_writing();
         writer.reset();
         release_free_heap_to_os_();
+
+        // Start the governor now: stitch (and emit) is where it earns its keep
+        // (the unitig writer spill + glibc reclaim near -g). Bucket-write/process
+        // ran without it. It stops when `governor` goes out of scope at build end.
+        governor.start();
 
         // Stitch streams each finished unitig into a cid-range
         // unitig_bucket_writer. The K bucket count auto-scales so
@@ -291,29 +334,47 @@ struct builder {
                 const uint64_t unitig_bucket_count = pick_unitig_bucket_count_(
                     m_num_color_classes, total_frag_seq_bytes, m_cfg.max_ram_gb);
 
-                // In-RAM unitig output budget. Keeping stitched unitigs in memory
-                // skips the temp-bucket write here AND the read-back in emit -- the
-                // unitig sequences never round-trip through disk (~half of emit on a
-                // spinning disk). Carved from the SAME post-carry budget the stitch
-                // uses (stitch_post_carry below), so their sum still respects -g.
-                // Stitching only merges fragments, so total unitig bases <=
-                // total_frag_seq_bytes; budget at ~1.5x for std::string/vector
-                // overhead, but never take more than 40% from stitch. No -g =>
-                // SIZE_MAX: keep every unitig in RAM. The writer spills its largest
-                // buckets to the disk path when the budget is exceeded.
+                // Stitch's whole working-RAM share of -g is STITCH_BUDGET_FRAC*g;
+                // the remaining (1-frac)*g is HEADROOM for glibc arena retention +
+                // scratch (which scale with thread churn, not with -g). EVERYTHING
+                // the phase allocates is sized to sum within the working share:
+                //   work = unitig_ram_budget + stitch_ram_cap + assemble_transient
+                // so they cannot co-peak past -g. (This replaces the old fixed 2 GiB
+                // "carry" reserve, which didn't scale with -g and left the assemble
+                // transient + glibc to pile on TOP of the budget -- the 100k/-g16
+                // overshoot.) The color dict is freed before stitch (carry ~0), but
+                // we subtract it if still resident.
+                //
+                // In-RAM unitig output budget: keeping stitched unitigs in memory
+                // skips the temp-bucket write here AND the read-back in emit (~half
+                // of emit on a spinning disk). Stitching only merges fragments, so
+                // total unitig bases <= total_frag_seq_bytes; budget at ~1.5x for
+                // std::string/vector overhead, but never more than 40% of the
+                // splittable share. No -g => SIZE_MAX (keep every unitig in RAM); the
+                // writer spills its largest buckets when the budget is exceeded.
                 size_t unitig_ram_budget = SIZE_MAX;
-                uint64_t stitch_post_carry = 0;
+                uint64_t stitch_splittable = 0;  // work for unitig writer + stores
                 if (m_cfg.max_ram_gb > 0) {
                     const uint64_t total = m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0;
-                    const uint64_t carry =
-                        global_dict.resident_bytes() + 2ull * 1024 * 1024 * 1024;
-                    stitch_post_carry = total > carry ? total - carry : 256ull * 1024 * 1024;
+                    const uint64_t carry = global_dict.resident_bytes();  // ~0 post-release
+                    uint64_t work = (uint64_t)(STITCH_BUDGET_FRAC * total);
+                    work = work > carry ? work - carry : 256ull * 1024 * 1024;
+                    // Reserve the non-spillable phase-3 assemble transient FIRST, so
+                    // unitig + stores + transient all fit inside `work` (chain_buckets
+                    // bounds the real set to exactly stitch_assemble_budget).
+                    const uint64_t assemble = stitch_assemble_budget(total);
+                    stitch_splittable = work > assemble ? work - assemble : 256ull * 1024 * 1024;
                     const uint64_t est = (uint64_t)(total_frag_seq_bytes * 1.5);
                     unitig_ram_budget =
-                        std::min<uint64_t>(est, (uint64_t)(stitch_post_carry * 0.4));
+                        std::min<uint64_t>(est, (uint64_t)(stitch_splittable * 0.4));
                 }
                 uwriter_ptr = std::make_unique<unitig_bucket_writer>(
                     tmp_dir, m_num_color_classes, unitig_bucket_count, unitig_ram_budget);
+                // Govern the unitig writer for the stitch's duration: under -g
+                // pressure the governor spills its largest in-RAM cid-buckets to
+                // disk. Unregistered when this block exits (before emit, which
+                // reads it single-threaded and so runs lock-free).
+                auto uwriter_reg = governor.add(uwriter_ptr.get());
 
                 std::atomic<uint64_t> done{0};
                 progress prog("stitch", done, n_frags);
@@ -343,15 +404,14 @@ struct builder {
                 // Round 0 seeds from the precomputed links spill (boundary
                 // k-mers, ~17 B/fragment), not a second full frag-spill read.
                 //
-                // cap = -g minus the cross-phase carry (the color dict that
-                // stays resident through stitch) minus a working-set reserve
-                // for the per-bucket decode set. 0 means no -g => use all RAM.
-                // The unitig buffer's budget was carved from stitch_post_carry
-                // above; give stitch what remains so the two don't double-spend -g.
+                // The stores get whatever of the splittable share the unitig writer
+                // didn't take, so unitig_writer + stores = stitch_splittable (and,
+                // with the assemble transient reserved out above, the three sum to
+                // STITCH_BUDGET_FRAC*g). 0 means no -g => use all RAM.
                 uint64_t stitch_ram_cap = 0;
                 if (m_cfg.max_ram_gb > 0) {
-                    stitch_ram_cap = stitch_post_carry > unitig_ram_budget
-                                         ? stitch_post_carry - unitig_ram_budget
+                    stitch_ram_cap = stitch_splittable > unitig_ram_budget
+                                         ? stitch_splittable - unitig_ram_budget
                                          : 256ull * 1024 * 1024;
                 }
                 std::cout << "  compact stitch: scalable, RAM-first cap "
@@ -514,6 +574,23 @@ private:
     // with a hard live-RSS ceiling as backstop; the remaining ~18% is headroom
     // for in-flight load lag, the frag sink, and glibc fragmentation.
     static constexpr double BUCKET_PROCESS_BUDGET_FRAC = 0.82;
+
+    // Share of -g the color-sets-dedup-map (the dominant non-spillable structure
+    // in bucket-process) may use before its overflow path engages. It coexists
+    // with the per-bucket walk sets under BUCKET_PROCESS_BUDGET_FRAC, so it gets
+    // a sub-share. MEASURE-ONLY today (reported, not enforced) -- a starting
+    // point to validate against real 100k/661k numbers before the overflow
+    // machinery lands. See colorset-dedup-externalization.md.
+    static constexpr double COLORSET_DEDUP_BUDGET_FRAC = 0.50;
+
+    // Stitch's whole working-RAM share of -g (unitig writer + RAM-first stores +
+    // phase-3 assemble transient all sized to sum within it). The remaining
+    // (1-frac)*g is headroom for glibc arena retention + scratch, which scale with
+    // thread churn rather than -g, so the fraction is deliberately conservative
+    // (measured: at -t32 on 100k the stitch glibc retention alone was ~0.29*g).
+    // The measured-RSS watcher (trip 0.70*g) is the backstop if the model still
+    // undercounts; this fraction is what keeps the watcher from having to fire.
+    static constexpr double STITCH_BUDGET_FRAC = 0.60;
 
     void validate_and_resolve_config() {
         if (m_cfg.filenames_list.empty()) {
