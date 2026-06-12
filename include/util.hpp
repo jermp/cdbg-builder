@@ -57,6 +57,14 @@ struct build_config {
     // budget is a soft target, not a hard cap).
     double max_ram_gb = 0.0;
     bool verbose = false;
+    // Benchmark/recovery: skip bucket-write + bucket-process and run stitch
+    // (+ emit_fasta) from an existing `tmp_dir/frag_unitigs.bin` left by a
+    // killed run. Times the stitch; does NOT finalize <out>.color_sets (its
+    // streaming state died with the original process). Requires -d.
+    bool resume_stitch = false;
+    // Do not remove tmp_dir on success (keeps the frag spill so a later
+    // --resume-stitch can reuse it; also for debugging).
+    bool keep_tmp = false;
 };
 
 // ---- timer ------------------------------------------------------------------
