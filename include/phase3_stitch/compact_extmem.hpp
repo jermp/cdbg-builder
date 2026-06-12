@@ -1274,12 +1274,14 @@ inline uint32_t stitch_pick_frag_ranges(uint64_t n_frags, uint64_t g, uint64_t s
 // (chain_buckets is sized to keep the set under this). It is a first-class line
 // in the stitch budget: the orchestrator reserves exactly this much before
 // splitting the rest into the unitig writer + stores, so the three don't
-// over-commit -g. 0.15*g, capped at 1.5 GiB so it stays a modest slice as -g
-// grows. Shared by the orchestrator (to reserve) and stitch_pick_chain_buckets
-// (to size the fan-out) so the two never disagree.
+// over-commit -g. A fraction of -g, so it SCALES with the budget: at large -g
+// the assemble set gets more RAM, which means FEWER chain-bucket spill files and
+// far less random disk I/O in phase-2 attach / phase-3 (the 661k/-g64 run hit
+// 27597 chain buckets under an earlier fixed 1.5 GiB cap -- catastrophic on an
+// HDD; uncapped, that drops ~6x). Shared by the orchestrator (to reserve) and
+// stitch_pick_chain_buckets (to size the fan-out) so the two never disagree.
 inline uint64_t stitch_assemble_budget(uint64_t g) {
-    constexpr uint64_t ASSEMBLE_BUDGET_CAP = 1536ull * 1024 * 1024;  // 1.5 GiB
-    return std::min<uint64_t>((uint64_t)(g * 0.15), ASSEMBLE_BUDGET_CAP);
+    return (uint64_t)(g * 0.15);
 }
 
 // Phase-3 assemble lifts one chain bucket OUT of the shared ram_budget
