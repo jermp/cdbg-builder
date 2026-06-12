@@ -77,6 +77,13 @@ struct builder {
     void build() {
         validate_and_resolve_config();
 
+        // Benchmark/recovery: resume from an existing frag spill, skipping
+        // bucket-write + bucket-process (see resume_stitch_benchmark_).
+        if (m_cfg.resume_stitch) {
+            resume_stitch_benchmark_();
+            return;
+        }
+
         // RAM governor: the measured-RSS backstop that reclaims glibc-retained
         // pages under pressure and spills registered participants (the unitig
         // writer during stitch -- the buffer the per-phase watcher couldn't
@@ -270,7 +277,8 @@ struct builder {
                 }
                 global_dict.set_dedup_budget(dedup_budget);
                 process_buckets(*writer, m_cfg.k, m_num_colors, m_cfg.num_threads, frag_sink,
-                                global_dict, global_mu, &done, bp_budget);
+                                global_dict, global_mu, &done, bp_budget,
+                                /*delete_consumed_buckets=*/!m_cfg.keep_tmp);
                 prog.stop();
                 std::cout << "  bucket fragments: " << frag_sink.count() << "\n";
                 std::cout << "  distinct color classes: " << global_dict.size() << "\n";
@@ -453,8 +461,9 @@ struct builder {
             }
             rss.stop();
         }
-        // Spill file no longer needed; safe to unlink.
-        frag_sink.unlink();
+        // Spill file no longer needed; safe to unlink (kept under --keep-tmp so a
+        // later --resume-stitch can reuse it).
+        if (!m_cfg.keep_tmp) frag_sink.unlink();
         m_num_unitigs = uwriter_ptr->total_unitigs();
 
         // Stitch allocates large transient buffers that are freed when it
@@ -477,11 +486,14 @@ struct builder {
             rss.stop();
         }
 
-        // Remove the scratch dir and everything under it.
-        {
+        // Remove the scratch dir and everything under it (unless --keep-tmp,
+        // which preserves the frag spill for a later --resume-stitch).
+        if (!m_cfg.keep_tmp) {
             timer _("removing tmp files");
             std::error_code ec;
             std::filesystem::remove_all(tmp_dir, ec);
+        } else {
+            std::cout << "  --keep-tmp: leaving scratch dir " << tmp_dir << " in place\n";
         }
 
         // Peak resident set size across the whole build, as tracked by
@@ -591,6 +603,151 @@ private:
     // The measured-RSS watcher (trip 0.70*g) is the backstop if the model still
     // undercounts; this fraction is what keeps the watcher from having to fire.
     static constexpr double STITCH_BUDGET_FRAC = 0.60;
+
+    // Recover num_color_classes for a --resume-stitch run from the on-disk
+    // color-set state the killed run left behind: the offsets sidecar (8 B per
+    // class, present iff the run died before finalize), else the finalized
+    // <out>.color_sets header (num_color_sets is a u64 at byte offset 12).
+    uint64_t recover_num_color_classes_() const {
+        std::error_code ec;
+        const std::string off = m_cfg.out_basename + ".color_sets.tmp_offsets";
+        if (std::filesystem::exists(off, ec)) {
+            auto sz = std::filesystem::file_size(off, ec);
+            if (!ec && sz >= 8) return (uint64_t)sz / 8;
+        }
+        const std::string cs = m_cfg.out_basename + ".color_sets";
+        if (std::filesystem::exists(cs, ec)) {
+            std::FILE* f = std::fopen(cs.c_str(), "rb");
+            if (f) {
+                uint64_t n = 0;
+                bool ok = std::fseek(f, 12, SEEK_SET) == 0 && std::fread(&n, sizeof(n), 1, f) == 1;
+                std::fclose(f);
+                if (ok) return n;
+            }
+        }
+        return 0;
+    }
+
+    // BENCHMARK/RECOVERY path for --resume-stitch: run ONLY stitch (+ emit_fasta)
+    // from an existing tmp_dir/frag_unitigs.bin left by a killed run, skipping
+    // bucket-write + bucket-process. Times the stitch and writes <out>.fa/.u2c;
+    // does NOT finalize <out>.color_sets (its streaming dict state died with the
+    // original process, so it cannot be cleanly finalized). The stitch budget
+    // split mirrors build() exactly so the timing is representative.
+    void resume_stitch_benchmark_() {
+        if (m_cfg.tmp_dir.empty())
+            throw std::runtime_error("--resume-stitch requires -d <tmp_dir> (the killed run's scratch)");
+        const std::string tmp_dir = m_cfg.tmp_dir;
+        const std::string frag_path = tmp_dir + "/frag_unitigs.bin";
+        if (!std::filesystem::exists(frag_path))
+            throw std::runtime_error("--resume-stitch: no frag spill at " + frag_path +
+                                     " (is -d the killed run's scratch dir?)");
+        const std::string links_path = (m_cfg.k >= 2) ? (frag_path + ".links") : std::string();
+
+        std::cout << "[resume-stitch] BENCHMARK MODE -- reusing existing frag spill:\n  " << frag_path
+                  << "\n  (skips bucket-write/process + color finalize; <out>.color_sets NOT written)\n";
+
+        const double GiB = 1024.0 * 1024.0 * 1024.0;
+        seconds_timer build_timer;
+        build_timer.start();
+
+        // Recompute the producer counters (n_frags, total_seq) the killed run held
+        // in RAM, via one sequential scan of the frag spill.
+        uint64_t n_frags = 0, total_frag_seq_bytes = 0;
+        {
+            timer _("scan frag spill (recount)");
+            frag_unitig_stream_reader rd(frag_path);
+            uint8_t of;
+            std::vector<color_run> runs;
+            std::string seq;
+            while (rd.next(of, runs, seq)) {
+                ++n_frags;
+                total_frag_seq_bytes += seq.size();
+            }
+        }
+        m_num_color_classes = recover_num_color_classes_();
+        std::cout << "  n_frags=" << n_frags
+                  << ", total_frag_seq_bytes=" << format_bytes(total_frag_seq_bytes)
+                  << ", num_color_classes=" << m_num_color_classes << "\n";
+        if (m_num_color_classes == 0)
+            throw std::runtime_error("--resume-stitch: could not recover num_color_classes from " +
+                                     m_cfg.out_basename + ".color_sets[.tmp_offsets]");
+
+        // Governor (scoped to stitch, same construction as build()).
+        ram_governor governor(m_cfg.max_ram_gb > 0 ? (uint64_t)(m_cfg.max_ram_gb * GiB) : 0,
+                              /*high_frac=*/0.80, /*low_frac=*/0.62);
+        governor.start();
+
+        // Stitch budget split -- mirrors build()'s math (carry ~0 here: no resident dict).
+        const uint64_t unitig_bucket_count =
+            pick_unitig_bucket_count_(m_num_color_classes, total_frag_seq_bytes, m_cfg.max_ram_gb);
+        size_t unitig_ram_budget = SIZE_MAX;
+        uint64_t stitch_splittable = 0;
+        if (m_cfg.max_ram_gb > 0) {
+            const uint64_t total = (uint64_t)(m_cfg.max_ram_gb * GiB);
+            const uint64_t work = (uint64_t)(STITCH_BUDGET_FRAC * total);
+            const uint64_t assemble = stitch_assemble_budget(total);
+            stitch_splittable = work > assemble ? work - assemble : 256ull * 1024 * 1024;
+            const uint64_t est = (uint64_t)(total_frag_seq_bytes * 1.5);
+            unitig_ram_budget = std::min<uint64_t>(est, (uint64_t)(stitch_splittable * 0.4));
+        }
+        auto uwriter = std::make_unique<unitig_bucket_writer>(tmp_dir, m_num_color_classes,
+                                                              unitig_bucket_count, unitig_ram_budget);
+        auto uwriter_reg = governor.add(uwriter.get());
+        uint64_t stitch_ram_cap = 0;
+        if (m_cfg.max_ram_gb > 0)
+            stitch_ram_cap = stitch_splittable > unitig_ram_budget
+                                 ? stitch_splittable - unitig_ram_budget
+                                 : 256ull * 1024 * 1024;
+        const uint64_t stitch_buckets =
+            pick_stitch_buckets_(total_frag_seq_bytes, m_cfg.max_ram_gb, m_cfg.num_threads);
+        std::cout << "  stitch buckets: " << stitch_buckets << ", threads: " << m_cfg.num_threads
+                  << "\n  compact stitch: scalable, RAM-first cap "
+                  << (stitch_ram_cap ? format_bytes(stitch_ram_cap) : std::string("unlimited")) << "\n";
+
+        std::atomic<uint64_t> done{0};
+        progress prog("stitch", done, n_frags);
+        auto for_each_frag = [&, first_pass = true](auto&& fn) mutable {
+            frag_unitig_stream_reader rd(frag_path);
+            uint8_t of;
+            std::vector<color_run> runs;
+            std::string seq;
+            const bool count = first_pass;
+            while (rd.next(of, runs, seq)) {
+                fn(of, runs, seq);
+                if (count) done.fetch_add(1, std::memory_order_relaxed);
+            }
+            first_pass = false;
+        };
+        const uint64_t stitch_rss_target =
+            m_cfg.max_ram_gb > 0 ? (uint64_t)(m_cfg.max_ram_gb * GiB) : 0;
+        {
+            phase_rss_marker rss("stitch");
+            timer _("stitch");
+            compact_stitch_scalable(for_each_frag, n_frags, m_cfg.k, tmp_dir, std::ref(*uwriter),
+                                    stitch_buckets, /*frag_ranges=*/0, /*chain_buckets=*/0,
+                                    m_cfg.num_threads, links_path, stitch_ram_cap, stitch_rss_target,
+                                    total_frag_seq_bytes);
+            prog.stop();
+            std::cout << "  unitigs after stitching: " << uwriter->total_unitigs() << "\n";
+            rss.stop();
+        }
+        m_num_unitigs = uwriter->total_unitigs();
+        release_free_heap_to_os_();
+        {
+            phase_rss_marker rss("emit-fasta");
+            emit_fasta(*uwriter, m_cfg.out_basename, m_num_unitigs, m_cfg.max_ram_gb);
+            rss.stop();
+        }
+        std::cout << "  [resume-stitch] color finalize SKIPPED -- <out>.color_sets is NOT valid\n";
+
+        build_timer.stop();
+        m_peak_rss_bytes = process_peak_rss_bytes();
+        std::cout << "[resume-stitch] wrote " << m_cfg.out_basename << ".fa and "
+                  << m_cfg.out_basename << ".u2c (NOT .color_sets)\n"
+                  << "[resume-stitch total] " << build_timer.elapsed() << " s; peak RSS "
+                  << format_bytes(m_peak_rss_bytes) << "\n";
+    }
 
     void validate_and_resolve_config() {
         if (m_cfg.filenames_list.empty()) {
