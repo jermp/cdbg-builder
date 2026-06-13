@@ -957,4 +957,46 @@ inline void stitch_unitigs_extmem_file(Source& frag, uint32_t k, std::string con
     detail::ext_run_rounds(store, k, num_buckets, sink, done, num_threads);
 }
 
+namespace detail {
+
+// Streaming seed: feed a re-invocable for_each_frag(fn) -- the builder's frag
+// spill reader -- into round 0 instead of the random-access Source the indexed
+// seed needs. The builder dropped the O(num_fragments) frag index (RAM), so this
+// is the only way to drive the base-carrying stitch from the production frag
+// spill. fn is called as fn(uint8_t open_flags, std::vector<color_run>& runs,
+// std::string& seq) per fragment, in frag_id order (one read of the spill).
+template <typename ForEachFrag, typename Store, typename Sink>
+inline void ext_seed_round0_streaming(ForEachFrag&& for_each_frag, uint32_t k, Store& store,
+                                      Sink&& sink, std::atomic<uint64_t>* done) {
+    for_each_frag([&](uint8_t open_flags, std::vector<color_run>& runs, std::string& seq) {
+        ext_tig t;
+        t.runs = runs;
+        t.open_flags = open_flags;
+        t.seq.assign(seq.data(), seq.size());
+        ext_seed_one(std::move(t), k, store, sink, done);
+    });
+    store.advance();  // round-0 emissions become round-1 input
+}
+
+}  // namespace detail
+
+// Base-carrying external-memory stitch driven by a STREAMING frag source -- the
+// production path the builder uses to revive the fast (assemble-in-rounds) stitch
+// without the deferred attach/assemble re-bucketing of the id-only path. Reads
+// the frag spill ONCE (round-0 seed) and grows the unitig sequences in place
+// through the doubling rounds. Peak RAM is one round-store bucket's tigs per
+// in-flight thread, so it is bounded by num_buckets (sized from -g by the
+// caller); the round store is always file-backed.
+template <typename ForEachFrag, typename Sink>
+inline void stitch_unitigs_extmem_file_streaming(ForEachFrag&& for_each_frag, uint32_t k,
+                                                 std::string const& tmp_dir, Sink&& sink,
+                                                 uint32_t num_buckets,
+                                                 std::atomic<uint64_t>* done = nullptr,
+                                                 uint32_t num_threads = 1) {
+    if (num_buckets == 0) num_buckets = 1024;
+    detail::round_store_file store(tmp_dir, num_buckets);
+    detail::ext_seed_round0_streaming(for_each_frag, k, store, sink, done);
+    detail::ext_run_rounds(store, k, num_buckets, sink, done, num_threads);
+}
+
 }  // namespace cdbg

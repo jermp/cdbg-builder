@@ -451,11 +451,28 @@ struct builder {
                     m_cfg.max_ram_gb > 0
                         ? (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0)
                         : 0;
-                compact_stitch_scalable(for_each_frag, n_frags, m_cfg.k, tmp_dir,
-                                        std::ref(*uwriter_ptr), stitch_buckets,
-                                        /*frag_ranges=*/0, /*chain_buckets=*/0, m_cfg.num_threads,
-                                        frag_sink.links_path(), stitch_ram_cap, stitch_rss_target,
-                                        total_frag_seq_bytes);
+                if (m_cfg.id_only_stitch) {
+                    // HARD -g: defer base/color assembly to an on-disk re-bucket.
+                    compact_stitch_scalable(for_each_frag, n_frags, m_cfg.k, tmp_dir,
+                                            std::ref(*uwriter_ptr), stitch_buckets,
+                                            /*frag_ranges=*/0, /*chain_buckets=*/0,
+                                            m_cfg.num_threads, frag_sink.links_path(),
+                                            stitch_ram_cap, stitch_rss_target,
+                                            total_frag_seq_bytes);
+                } else {
+                    // DEFAULT: base-carrying -- assemble unitig sequences in the
+                    // doubling rounds (one frag-spill read, no deferred attach).
+                    // Faster and less disk-hungry; -g is held by the bucket-count
+                    // sizing (stitch_buckets) plus the RAM governor backstop on the
+                    // unitig writer. `done` is driven by for_each_frag's first-pass
+                    // fragment count (the single full read), so the stitch itself
+                    // takes nullptr to avoid double-counting against the n_frags bar.
+                    (void)stitch_ram_cap;
+                    (void)stitch_rss_target;
+                    stitch_unitigs_extmem_file_streaming(for_each_frag, m_cfg.k, tmp_dir,
+                                                         std::ref(*uwriter_ptr), stitch_buckets,
+                                                         /*done=*/nullptr, m_cfg.num_threads);
+                }
                 prog.stop();
                 std::cout << "  unitigs after stitching: " << uwriter_ptr->total_unitigs() << "\n";
             }
@@ -724,10 +741,19 @@ private:
         {
             phase_rss_marker rss("stitch");
             timer _("stitch");
-            compact_stitch_scalable(for_each_frag, n_frags, m_cfg.k, tmp_dir, std::ref(*uwriter),
-                                    stitch_buckets, /*frag_ranges=*/0, /*chain_buckets=*/0,
-                                    m_cfg.num_threads, links_path, stitch_ram_cap, stitch_rss_target,
-                                    total_frag_seq_bytes);
+            if (m_cfg.id_only_stitch) {
+                compact_stitch_scalable(for_each_frag, n_frags, m_cfg.k, tmp_dir, std::ref(*uwriter),
+                                        stitch_buckets, /*frag_ranges=*/0, /*chain_buckets=*/0,
+                                        m_cfg.num_threads, links_path, stitch_ram_cap,
+                                        stitch_rss_target, total_frag_seq_bytes);
+            } else {
+                (void)stitch_ram_cap;
+                (void)stitch_rss_target;
+                (void)links_path;
+                stitch_unitigs_extmem_file_streaming(for_each_frag, m_cfg.k, tmp_dir,
+                                                     std::ref(*uwriter), stitch_buckets,
+                                                     /*done=*/nullptr, m_cfg.num_threads);
+            }
             prog.stop();
             std::cout << "  unitigs after stitching: " << uwriter->total_unitigs() << "\n";
             rss.stop();
