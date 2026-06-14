@@ -58,12 +58,12 @@ bool parse_args(int argc, char** argv, cdbg::build_config& cfg) {
                "--resume-stitch", false, true);
     parser.add("keep_tmp", "Do not delete -d <tmp_dir> on success (keeps frag spill for --resume-stitch).",
                "--keep-tmp", false, true);
-    parser.add("id_only_stitch",
-               "Force the id-only (GGCAT-style) stitch, which HARD-enforces -g by "
-               "deferring base/color assembly to an on-disk re-bucket. Default is the "
-               "faster base-carrying stitch (assembles in the doubling rounds); use this "
-               "flag only when the base-carrying peak would not fit your -g.",
-               "--id-only-stitch", false, true);
+    parser.add("base_stitch",
+               "Use the base-carrying stitch (assembles unitig sequences in the doubling "
+               "rounds): faster on small/medium inputs that fit RAM, but it moves ALL bases "
+               "through every round -- multi-TB disk and a hard-to-bound peak at large scale. "
+               "Default is the id-only stitch, which HARD-enforces -g and is disk-frugal.",
+               "--base-stitch", false, true);
 
     if (!parser.parse()) return false;
 
@@ -82,7 +82,7 @@ bool parse_args(int argc, char** argv, cdbg::build_config& cfg) {
     if (parser.parsed("verbose")) cfg.verbose = parser.get<bool>("verbose");
     if (parser.parsed("resume_stitch")) cfg.resume_stitch = parser.get<bool>("resume_stitch");
     if (parser.parsed("keep_tmp")) cfg.keep_tmp = parser.get<bool>("keep_tmp");
-    if (parser.parsed("id_only_stitch")) cfg.id_only_stitch = parser.get<bool>("id_only_stitch");
+    if (parser.parsed("base_stitch")) cfg.base_stitch = parser.get<bool>("base_stitch");
     return true;
 }
 
