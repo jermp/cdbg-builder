@@ -12,14 +12,17 @@
 //    bucket's records by cid before writing FASTA, so the .fa output is
 //    strictly cid-ascending (which the u2c bit_vector consumer requires).
 //
-//    RAM-first: buckets are held in MEMORY up to a ram_budget; emit then
-//    reads them straight from RAM, so the unitig sequences never round-
-//    trip through disk (no temp-bucket write here, no read-back in emit).
-//    When the budget is exceeded the largest buckets are spilled to disk
-//    (one-way) and emit external-merge-sorts those -- so a bucket is
-//    EITHER fully in RAM OR fully on disk, and the -g bound is honored at
-//    all costs regardless of unitig volume. With no -g everything stays in
-//    RAM.
+//    Under a -g budget (the production case) it is WRITE-THROUGH: every
+//    finished unitig is streamed straight to its bucket's disk file and no
+//    unitig bytes are retained in RAM, so the stitch's only resident set is
+//    the round store + color dict (the proven README path: 661k stitch peak
+//    41 GiB within -g 64). emit then external-merge-sorts each bucket within
+//    a small cid-sort cap. Holding unitigs in RAM instead (the old RAM-first
+//    optimization, to skip the temp round-trip) blew past -g at 661k -- 1.31e9
+//    sunk unitigs over a few cid-skewed buckets that the bucket-granular
+//    governor spill could not hold -- so it is now used ONLY with NO -g
+//    (ram_budget == SIZE_MAX), where there is no budget to honor and inputs
+//    are small enough to keep everything in RAM and skip the disk round-trip.
 //
 //    Per-bucket on-disk format (spilled buckets only), a sequence of
 //    records until EOF:
@@ -116,6 +119,19 @@ public:
         const uint64_t cid = u.mono_cid();  // post-split: monochromatic
         const uint32_t b = bucket_for_cid(cid);
         ++m_total_unitigs;
+        // Write-through mode (a -g budget is in force): NEVER retain unitig bytes
+        // in RAM -- stream every record straight to its bucket's disk file, exactly
+        // like the proven README path (661k stitch peak 41 GiB). The RAM-first
+        // optimization (hold unitigs in RAM, skip the temp round-trip) trades disk
+        // I/O for RAM and at 661k scale -- 1.31e9 sunk unitigs over few, cid-skewed
+        // buckets -- the bucket-granular governor spill cannot hold -g, so RSS ran
+        // to 170 GiB. RAM-first is therefore used ONLY with no -g (ram_budget ==
+        // SIZE_MAX), where there is no budget to honor and inputs are small.
+        if (m_ram_budget != SIZE_MAX) {
+            write_record_(ensure_bucket_file_(b), cid, u.seq);
+            std::string().swap(u.seq);
+            return;
+        }
         if (m_files[b]) {
             // Bucket already spilled (one-way): write this record straight
             // through to disk and drop its bytes. A bucket is therefore EITHER
@@ -322,9 +338,9 @@ private:
             throw std::runtime_error("short write of unitig record to a bucket file");
     }
 
-    // Spill bucket b's RAM-resident records to its (lazily-opened) disk file and
-    // free the memory. One-way: after this, operator() routes b straight to disk.
-    void spill_bucket_(uint32_t b) {
+    // Lazily open bucket b's disk file (one-way: once a bucket has a file it is
+    // disk-resident). Shared by the write-through sink path and spill_bucket_.
+    std::FILE* ensure_bucket_file_(uint32_t b) {
         if (!m_files[b]) {
             std::string path = bucket_path(b);
             m_files[b] = std::fopen(path.c_str(), "wb+");
@@ -333,6 +349,13 @@ private:
                                          std::strerror(errno));
             ++m_spilled_buckets;
         }
+        return m_files[b];
+    }
+
+    // Spill bucket b's RAM-resident records to its (lazily-opened) disk file and
+    // free the memory. One-way: after this, operator() routes b straight to disk.
+    void spill_bucket_(uint32_t b) {
+        ensure_bucket_file_(b);
         for (auto const& r : m_ram[b]) write_record_(m_files[b], r.cid, r.seq);
         m_buffered_bytes -= m_ram_bytes[b];
         m_ram_bytes[b] = 0;
