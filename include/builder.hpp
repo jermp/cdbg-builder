@@ -728,7 +728,11 @@ private:
                   << (stitch_ram_cap ? format_bytes(stitch_ram_cap) : std::string("unlimited")) << "\n";
 
         std::atomic<uint64_t> done{0};
-        progress prog("stitch", done, n_frags);
+        // This bar tracks the round-0 SEED's single read of the frag spill (one
+        // tick per fragment); the doubling rounds that follow are reported by the
+        // stitch's own per-round lines. Labeled as the seed so 100% here cannot be
+        // mistaken for "stitch complete" -- it means "spill read, rounds starting".
+        progress prog("stitch seed (read spill)", done, n_frags);
         auto for_each_frag = [&, first_pass = true](auto&& fn) mutable {
             frag_unitig_stream_reader rd(frag_path);
             uint8_t of;
