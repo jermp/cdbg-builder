@@ -451,8 +451,12 @@ struct builder {
                     m_cfg.max_ram_gb > 0
                         ? (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0)
                         : 0;
-                if (m_cfg.id_only_stitch) {
-                    // HARD -g: defer base/color assembly to an on-disk re-bucket.
+                if (!m_cfg.base_stitch) {
+                    // DEFAULT: id-only (GGCAT-style). The doubling carries only
+                    // fragment-id chains; bases/colors are assembled once at the
+                    // end via an on-disk re-bucket. HARD-enforces -g and keeps
+                    // round-store disk traffic small (IDs, not bases) -- the safe
+                    // path at scale (661k completes within -g 64).
                     compact_stitch_scalable(for_each_frag, n_frags, m_cfg.k, tmp_dir,
                                             std::ref(*uwriter_ptr), stitch_buckets,
                                             /*frag_ranges=*/0, /*chain_buckets=*/0,
@@ -460,17 +464,16 @@ struct builder {
                                             stitch_ram_cap, stitch_rss_target,
                                             total_frag_seq_bytes);
                 } else {
-                    // DEFAULT: base-carrying -- assemble unitig sequences in the
-                    // doubling rounds (one frag-spill read, no deferred attach).
-                    // Faster and less disk-hungry. The round store is RAM-FIRST:
-                    // it keeps the rounds in RAM up to stitch_ram_cap and spills
-                    // only the overflow to disk, so when the working set fits -g
-                    // the whole stitch runs in memory. -g is held by that cap PLUS
-                    // the RAM governor backstop (measured RSS) on both the round
-                    // store and the unitig writer. `done` is driven by
-                    // for_each_frag's first-pass fragment count (the single full
-                    // read), so the stitch itself takes nullptr to avoid
-                    // double-counting against the n_frags bar.
+                    // --base-stitch: base-carrying -- assemble unitig sequences IN
+                    // the doubling rounds (one frag-spill read, no deferred attach).
+                    // Faster on small/medium inputs that fit RAM, but it shuffles
+                    // ALL bases through every round (multi-TB disk + hard-to-bound
+                    // peak at 661k scale). The round store is RAM-first (keeps
+                    // rounds in RAM up to stitch_ram_cap, spills overflow), with the
+                    // governor as backstop -- but at very large scale the
+                    // non-spillable per-bucket worker transients can still overshoot
+                    // -g, so this is opt-in for data that fits. `done` is driven by
+                    // for_each_frag's first-pass count, so the stitch takes nullptr.
                     (void)stitch_rss_target;
                     stitch_unitigs_extmem_file_streaming(for_each_frag, m_cfg.k, tmp_dir,
                                                          std::ref(*uwriter_ptr), stitch_buckets,
@@ -745,7 +748,7 @@ private:
         {
             phase_rss_marker rss("stitch");
             timer _("stitch");
-            if (m_cfg.id_only_stitch) {
+            if (!m_cfg.base_stitch) {
                 compact_stitch_scalable(for_each_frag, n_frags, m_cfg.k, tmp_dir, std::ref(*uwriter),
                                         stitch_buckets, /*frag_ranges=*/0, /*chain_buckets=*/0,
                                         m_cfg.num_threads, links_path, stitch_ram_cap,
