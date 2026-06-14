@@ -111,12 +111,12 @@ void run_stitch(which_stitch w, std::vector<stitchable_unitig>& frags, uint32_t 
         cdbg::stitch_unitigs_extmem(src, k, sink, /*num_buckets=*/16);
     } else if (w == which_stitch::ext_stream_ram or w == which_stitch::ext_stream_spill) {
         // Production base-carrying stitch (stitch_unitigs_extmem_file_streaming):
-        // streaming round-0 seed + the RAM-first round_store_hybrid. ext_stream_ram
-        // uses ram_cap=0 (pure RAM, never spills); ext_stream_spill uses a 4 KiB
-        // cap so nearly every round bucket spills to disk, stressing the overflow
-        // path (RAM tigs + spilled LZ4 frames merged on read at take_input_bucket).
-        // Both must match the oracle multiset, with 4 threads exercising the
-        // parallel round driver + per-bucket spill locking.
+        // streaming round-0 seed + the always-on-disk round_store_file. Validates
+        // that the streaming seed (driven by a re-invocable for_each, as the
+        // builder uses) produces the same unitig multiset as the random-access
+        // oracle, with 4 threads exercising the parallel round driver + per-bucket
+        // write locking. (Both enum cases run the same path now -- the earlier
+        // RAM-first hybrid round store was removed.)
         cdbg::vector_frag_source src(frags);
         std::string dir = std::filesystem::temp_directory_path().string() + "/cdbg_stitch_test_" +
                           std::to_string(::getpid()) + "_" + std::to_string(g_tmp_counter++);
@@ -131,10 +131,8 @@ void run_stitch(which_stitch w, std::vector<stitchable_unitig>& frags, uint32_t 
                 fn(src.open_flags(i), runs, seq);
             }
         };
-        const uint64_t cap = (w == which_stitch::ext_stream_spill) ? 4096ull : 0ull;
         cdbg::stitch_unitigs_extmem_file_streaming(for_each, k, dir, sink, /*num_buckets=*/16,
-                                                   /*done=*/nullptr, /*num_threads=*/4, cap,
-                                                   /*gov=*/nullptr);
+                                                   /*done=*/nullptr, /*num_threads=*/4);
         std::filesystem::remove_all(dir);
     } else if (w == which_stitch::compact_mem) {
         // GGCAT-style id-only compaction + fold assembly (parallel-stitch Step 1).

@@ -65,16 +65,16 @@ struct build_config {
     // Do not remove tmp_dir on success (keeps the frag spill so a later
     // --resume-stitch can reuse it; also for debugging).
     bool keep_tmp = false;
-    // Stitch algorithm selector. DEFAULT (false) = id-only (GGCAT-style): the
-    // doubling carries only fragment-id chains and bases/colors are assembled
-    // once at the end through an on-disk re-bucket. It HARD-enforces -g and keeps
-    // round-store disk traffic small (IDs, not bases), so it is the safe path at
-    // scale (661k completes within -g 64). Set true to use the base-carrying
-    // stitch, which assembles unitig sequences IN the doubling rounds: faster on
-    // small/medium inputs that fit RAM, but it shuffles ALL bases through every
-    // round -- multi-TB disk and a hard-to-bound peak at 661k scale (it overshot
-    // -g and filled the disk). Use --base-stitch only when the data fits.
-    bool base_stitch = false;
+    // Stitch algorithm selector. DEFAULT (false) = base-carrying: assembles
+    // unitig sequences IN the doubling rounds from a single frag-spill read,
+    // through an always-on-disk round store (one bucket per thread resident).
+    // This is the proven README path -- 661k completes in ~3.5h at ~41 GiB peak,
+    // within -g 64. Set true (--id-only-stitch) for the id-only (GGCAT-style)
+    // stitch, which carries only fragment-id chains and defers base/color
+    // assembly to an on-disk re-bucket: it HARD-enforces an arbitrarily tight -g
+    // but is ~3x slower at 661k. Use it when the base-carrying ~41 GiB peak would
+    // not fit a tighter -g.
+    bool id_only_stitch = false;
 };
 
 // ---- timer ------------------------------------------------------------------

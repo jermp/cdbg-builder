@@ -76,7 +76,6 @@
 #include "phase2_bucket_process/bucket_walker.hpp"  // stitchable_unitig, UNITIG_OPEN_*
 #include "kmer.hpp"
 #include "phase3_stitch/stitch.hpp"  // detail::side_junction_canonical, SIDE_*, revcomp_string
-#include "ram_governor.hpp"          // ram_spillable, ram_governor (RAM-first round store)
 
 namespace cdbg {
 
@@ -573,245 +572,6 @@ private:
     uint32_t m_out_round = 0;
 };
 
-// ---- shared ext_tig frame codec (file-backed round stores) ------------------
-// Frames on disk: [u32 uncompressed][u32 compressed][bytes] ..., terminated by
-// [u32 0]. Factored out so the RAM-first hybrid store reuses the exact codec
-// round_store_file uses inline.
-static constexpr size_t EXT_FRAME_BUDGET = 4u * 1024 * 1024;
-
-// Append tigs[lo,hi) to an open file as LZ4 frames (no EOF marker -- the caller
-// writes it once the round's file is final). Uses a LOCAL scratch buffer so
-// concurrent appends to DIFFERENT bucket files don't race.
-inline void ext_frames_append(std::FILE* f, std::vector<ext_tig> const& tigs, size_t lo,
-                              size_t hi) {
-    std::vector<uint8_t> batch;
-    auto flush = [&]() {
-        if (batch.empty()) return;
-        int src = (int)batch.size();
-        int bound = LZ4_compressBound(src);
-        std::vector<uint8_t> scratch((size_t)bound);
-        int comp = LZ4_compress_default((char const*)batch.data(), (char*)scratch.data(), src,
-                                        (int)scratch.size());
-        if (comp <= 0) throw std::runtime_error("ext-stitch LZ4 compress failed");
-        uint32_t u = (uint32_t)src, c = (uint32_t)comp;
-        if (std::fwrite(&u, sizeof(u), 1, f) != 1 or std::fwrite(&c, sizeof(c), 1, f) != 1 or
-            std::fwrite(scratch.data(), 1, (size_t)comp, f) != (size_t)comp)
-            throw std::runtime_error("short write to stitch round file");
-        batch.clear();
-    };
-    for (size_t i = lo; i < hi; ++i) {
-        ext_tig_serialize(tigs[i], batch);
-        if (batch.size() >= EXT_FRAME_BUDGET) flush();
-    }
-    flush();
-}
-
-// Read every frame from `path` (until the EOF marker or physical EOF) and
-// append the decoded tigs to `out`. Missing file = empty bucket (no-op).
-inline void ext_frames_read(std::string const& path, std::vector<ext_tig>& out) {
-    std::FILE* f = std::fopen(path.c_str(), "rb");
-    if (!f) return;
-    std::vector<uint8_t> comp, raw;
-    for (;;) {
-        uint32_t u = 0;
-        if (std::fread(&u, sizeof(u), 1, f) != 1) break;
-        if (u == 0) break;
-        uint32_t c = 0;
-        if (std::fread(&c, sizeof(c), 1, f) != 1) break;
-        if (comp.size() < c) comp.resize(c);
-        if (std::fread(comp.data(), 1, c, f) != c) break;
-        size_t base = raw.size();
-        raw.resize(base + u);
-        int decoded =
-            LZ4_decompress_safe((char const*)comp.data(), (char*)raw.data() + base, (int)c, (int)u);
-        if (decoded < 0 or (uint32_t) decoded != u)
-            throw std::runtime_error("ext-stitch round bucket LZ4 decode failed: " + path);
-    }
-    std::fclose(f);
-    size_t pos = 0;
-    while (pos < raw.size()) {
-        ext_tig t;
-        size_t got = ext_tig_deserialize(raw.data() + pos, raw.size() - pos, t);
-        if (got == 0) break;
-        pos += got;
-        out.push_back(std::move(t));
-    }
-}
-
-// Approximate resident RAM of a tig (for the hybrid store's spill accounting).
-// Counts the payload the vectors/string own; the counter is kept CONSISTENT by
-// computing this once at emit and tracking it per bucket (never recomputed).
-inline size_t ext_tig_ram_bytes(ext_tig const& t) {
-    return sizeof(ext_tig) + t.seq.size() + t.runs.size() * sizeof(color_run);
-}
-
-// RAM-FIRST round store. Keeps each round's tigs in RAM and spills the LARGEST
-// buckets to disk ONLY when resident bytes cross a -g-derived cap (or when the
-// RAM governor asks under measured-RSS pressure). When the working set fits the
-// cap the whole stitch runs in RAM (zero disk round-trips); when it does not,
-// only the overflow spills -- "use RAM as much as possible, spill to disk only
-// when necessary." Same Store interface as round_store_mem/round_store_file
-// (num_buckets/emit/take_input_bucket/advance), so ext_run_rounds is
-// store-agnostic. A bucket's data for a round may be split between RAM and disk
-// frames; take_input_bucket merges both. Implements ram_spillable so the
-// always-on governor's backstop can drive spills too.
-class round_store_hybrid : public ram_spillable {
-public:
-    round_store_hybrid(std::string dir, uint32_t num_buckets, uint64_t ram_cap)
-        : m_dir(std::move(dir))
-        , m_num_buckets(num_buckets)
-        , m_ram_cap(ram_cap)
-        , m_in_ram(num_buckets)
-        , m_out_ram(num_buckets)
-        , m_in_bytes(num_buckets, 0)
-        , m_out_bytes(num_buckets, 0)
-        , m_in_has_disk(num_buckets, 0)
-        , m_out_has_disk(num_buckets, 0)
-        , m_out_files(num_buckets, nullptr)
-        , m_locks(num_buckets) {}
-
-    ~round_store_hybrid() override {
-        for (auto* f : m_out_files)
-            if (f) std::fclose(f);
-    }
-    round_store_hybrid(round_store_hybrid const&) = delete;
-    round_store_hybrid& operator=(round_store_hybrid const&) = delete;
-
-    uint32_t num_buckets() const { return m_num_buckets; }
-
-    // Thread-safe per output bucket. After appending we update resident bytes
-    // and, if over the cap, spill down to the low watermark. The cap check is
-    // done OUTSIDE m_locks[b] so the global spill routine can lock buckets
-    // freely (no nested per-bucket lock).
-    void emit(uint32_t b, ext_tig&& t) {
-        const size_t est = ext_tig_ram_bytes(t);
-        {
-            std::lock_guard<std::mutex> lk(m_locks[b]);
-            m_out_ram[b].push_back(std::move(t));
-            m_out_bytes[b] += est;
-        }
-        const uint64_t r = m_resident.fetch_add(est, std::memory_order_relaxed) + est;
-        if (m_ram_cap and r > m_ram_cap)
-            spill_to_target_(m_ram_cap - m_ram_cap / 8);  // low water = 7/8 cap
-    }
-
-    // Move input bucket b's RAM tigs out, then append any spilled disk frames
-    // (deleting the file). Peak transient is one bucket's tigs in the caller.
-    std::vector<ext_tig> take_input_bucket(uint32_t b) {
-        std::vector<ext_tig> out;
-        std::string disk_path;
-        {
-            std::lock_guard<std::mutex> lk(m_locks[b]);
-            out = std::move(m_in_ram[b]);
-            m_in_ram[b].clear();
-            m_resident.fetch_sub(m_in_bytes[b], std::memory_order_relaxed);
-            m_in_bytes[b] = 0;
-            if (m_in_has_disk[b]) {
-                disk_path = bucket_path(m_in_round, b);
-                m_in_has_disk[b] = 0;
-            }
-        }
-        if (!disk_path.empty()) {
-            ext_frames_read(disk_path, out);
-            std::remove(disk_path.c_str());
-        }
-        return out;
-    }
-
-    // Output round becomes next round's input. Input RAM was fully consumed
-    // during the round (take_input_bucket runs for every bucket), so resident
-    // already equals the output RAM bytes -- no recompute needed.
-    void advance() {
-        for (uint32_t b = 0; b < m_num_buckets; ++b) {
-            if (m_out_files[b]) {
-                uint32_t eof = 0;
-                std::fwrite(&eof, sizeof(eof), 1, m_out_files[b]);
-                std::fclose(m_out_files[b]);
-                m_out_files[b] = nullptr;
-            }
-        }
-        m_in_ram.swap(m_out_ram);
-        m_in_bytes.swap(m_out_bytes);
-        m_in_has_disk.swap(m_out_has_disk);
-        for (uint32_t b = 0; b < m_num_buckets; ++b) {
-            m_out_ram[b].clear();
-            m_out_bytes[b] = 0;
-            m_out_has_disk[b] = 0;
-        }
-        m_in_round = m_out_round;
-        m_out_round = m_in_round + 1;
-    }
-
-    // ram_spillable: measured-RSS backstop from the governor.
-    uint64_t spillable_bytes() const override { return m_resident.load(std::memory_order_relaxed); }
-    uint64_t spill_under_pressure(uint64_t target_bytes) override {
-        const uint64_t cur = m_resident.load(std::memory_order_relaxed);
-        const uint64_t tgt = cur > target_bytes ? cur - target_bytes : 0;
-        return spill_to_target_(tgt);
-    }
-
-private:
-    std::string bucket_path(uint32_t round, uint32_t b) const {
-        return m_dir + "/stitch_r" + std::to_string(round) + "_b" + std::to_string(b) + ".bin";
-    }
-
-    // Spill output buckets (largest first) until resident <= resident_target.
-    // Only one thread spills at a time (try_lock); others return 0 and rely on
-    // the winner. Returns bytes freed.
-    uint64_t spill_to_target_(uint64_t resident_target) {
-        std::unique_lock<std::mutex> lk(m_spill_mu, std::try_to_lock);
-        if (!lk.owns_lock()) return 0;
-        uint64_t freed = 0;
-        while (m_resident.load(std::memory_order_relaxed) > resident_target) {
-            uint32_t best = UINT32_MAX;
-            size_t best_bytes = 0;
-            for (uint32_t b = 0; b < m_num_buckets; ++b) {  // largest-RAM victim (heuristic)
-                size_t sb = m_out_bytes[b];
-                if (sb > best_bytes) {
-                    best_bytes = sb;
-                    best = b;
-                }
-            }
-            if (best == UINT32_MAX or best_bytes == 0) break;
-            freed += spill_output_bucket_(best);
-        }
-        return freed;
-    }
-
-    uint64_t spill_output_bucket_(uint32_t b) {
-        std::lock_guard<std::mutex> lk(m_locks[b]);
-        if (m_out_ram[b].empty()) return 0;
-        if (!m_out_files[b]) {
-            std::string path = bucket_path(m_out_round, b);
-            m_out_files[b] = std::fopen(path.c_str(), "wb");
-            if (!m_out_files[b])
-                throw std::runtime_error("cannot open stitch round file: " + path + ": " +
-                                         std::strerror(errno));
-        }
-        ext_frames_append(m_out_files[b], m_out_ram[b], 0, m_out_ram[b].size());
-        m_out_has_disk[b] = 1;
-        const uint64_t freed = m_out_bytes[b];
-        m_out_ram[b].clear();
-        m_out_ram[b].shrink_to_fit();
-        m_out_bytes[b] = 0;
-        m_resident.fetch_sub(freed, std::memory_order_relaxed);
-        return freed;
-    }
-
-    std::string m_dir;
-    uint32_t m_num_buckets;
-    uint64_t m_ram_cap;  // 0 = unlimited (cap never trips; governor-only)
-    std::atomic<uint64_t> m_resident{0};
-
-    std::vector<std::vector<ext_tig>> m_in_ram, m_out_ram;
-    std::vector<size_t> m_in_bytes, m_out_bytes;
-    std::vector<uint8_t> m_in_has_disk, m_out_has_disk;
-    std::vector<std::FILE*> m_out_files;  // OUTPUT spill handles (round m_out_round)
-    std::vector<std::mutex> m_locks;      // per-bucket emit/take/spill
-    std::mutex m_spill_mu;                // serializes the global spill routine
-    uint32_t m_in_round = 0, m_out_round = 0;
-};
-
 // Route a tig to a round-output bucket by its chosen open end's
 // junction, recording the keyed side in toggle-independent form. Returns
 // false (and does nothing) if the tig is fully closed -- caller sinks it.
@@ -1221,28 +981,26 @@ inline void ext_seed_round0_streaming(ForEachFrag&& for_each_frag, uint32_t k, S
 }  // namespace detail
 
 // Base-carrying external-memory stitch driven by a STREAMING frag source -- the
-// production path the builder uses to revive the fast (assemble-in-rounds) stitch
+// production path the builder uses for the fast (assemble-in-rounds) stitch
 // without the deferred attach/assemble re-bucketing of the id-only path. Reads
 // the frag spill ONCE (round-0 seed) and grows the unitig sequences in place
 // through the doubling rounds.
 //
-// The round store is RAM-FIRST (round_store_hybrid): it keeps the rounds in RAM
-// and spills only the overflow above `ram_cap` to disk, so when the working set
-// fits -g the whole stitch runs in memory (no disk round-trips) and only spills
-// when it must -- the golden rule. `ram_cap == 0` => unlimited (pure RAM). If a
-// `gov` is given, the store also registers with the always-on RAM governor so a
-// measured-RSS overshoot (model undercount) still triggers spills.
+// The round store is the always-on-disk round_store_file: peak RAM is one
+// round-store bucket's tigs per in-flight thread (independent of fragment
+// count), bounded by num_buckets which the caller sizes from -g. This is the
+// proven README path (661k completes in ~3.5h at ~41 GiB, within -g 64). It
+// honors -g by keeping little in RAM rather than by spilling on demand; an
+// earlier RAM-first hybrid store that tried to use more RAM overshot -g and
+// filled the disk at 661k scale, so it was removed.
 template <typename ForEachFrag, typename Sink>
 inline void stitch_unitigs_extmem_file_streaming(ForEachFrag&& for_each_frag, uint32_t k,
                                                  std::string const& tmp_dir, Sink&& sink,
                                                  uint32_t num_buckets,
                                                  std::atomic<uint64_t>* done = nullptr,
-                                                 uint32_t num_threads = 1, uint64_t ram_cap = 0,
-                                                 ram_governor* gov = nullptr) {
+                                                 uint32_t num_threads = 1) {
     if (num_buckets == 0) num_buckets = 1024;
-    detail::round_store_hybrid store(tmp_dir, num_buckets, ram_cap);
-    ram_governor::registration reg;
-    if (gov) reg = gov->add(&store);
+    detail::round_store_file store(tmp_dir, num_buckets);
     detail::ext_seed_round0_streaming(for_each_frag, k, store, sink, done);
     detail::ext_run_rounds(store, k, num_buckets, sink, done, num_threads);
 }
