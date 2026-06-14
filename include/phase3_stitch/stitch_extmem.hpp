@@ -844,10 +844,16 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
         store.advance();
         const uint64_t joined = joined_this_round.load(std::memory_order_relaxed);
         ++rounds_run;
-        {
-            t_r0.stop();
-            if (round_no < 5) early_secs += t_r0.elapsed();
-        }
+        t_r0.stop();
+        if (round_no < 5) early_secs += t_r0.elapsed();
+        // Live per-round progress: the resume path's fragment-counted progress bar
+        // saturates at 100% the moment the round-0 seed finishes reading the spill
+        // and then says nothing for the whole doubling phase (the real work). One
+        // concise line per round (O(log L) rounds, ~33 at 661k) gives a real
+        // signal -- the round index advances and `joined` falls toward 0, which is
+        // the termination condition -- so a long run is never flying blind.
+        std::cout << "  [stitch] round " << round_no << ": joined=" << joined << ", "
+                  << t_r0.elapsed() << "s\n";
 #ifdef CDGB_STITCH_DEBUG
         std::cerr << "[ext-stitch round " << round_no << "] joined=" << joined << "\n";
 #endif
