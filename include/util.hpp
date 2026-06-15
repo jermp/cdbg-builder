@@ -57,6 +57,8 @@ struct build_config {
     // budget is a soft target, not a hard cap).
     double max_ram_gb = 0.0;
     bool verbose = false;
+    // Do not remove tmp_dir on success (keeps the scratch dir for debugging).
+    bool keep_tmp = false;
 };
 
 // ---- timer ------------------------------------------------------------------

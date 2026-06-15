@@ -51,6 +51,8 @@ bool parse_args(int argc, char** argv, cdbg::build_config& cfg) {
                " Smaller -> larger B but weaker dedup / bigger bucket files.",
                "--spill", false);
     parser.add("verbose", "Verbose output.", "--verbose", false, true);
+    parser.add("keep_tmp", "Do not delete -d <tmp_dir> on success (keeps scratch for debugging).",
+               "--keep-tmp", false, true);
 
     if (!parser.parse()) return false;
 
@@ -67,6 +69,7 @@ bool parse_args(int argc, char** argv, cdbg::build_config& cfg) {
     if (parser.parsed("flush_bases")) cfg.flush_bases = parser.get<uint64_t>("flush_bases");
     if (parser.parsed("spill_bytes")) cfg.spill_bytes = parser.get<uint64_t>("spill_bytes");
     if (parser.parsed("verbose")) cfg.verbose = parser.get<bool>("verbose");
+    if (parser.parsed("keep_tmp")) cfg.keep_tmp = parser.get<bool>("keep_tmp");
     return true;
 }
 
