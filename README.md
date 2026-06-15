@@ -146,59 +146,93 @@ hybrid color-set format.
 
 ## Experiment on Blackwell 661k
 
-	./cdbg-build -i /mnt/hd2/pibiri/DNA/filenames/blackwell-661k_filenames.txt -o /mnt/hd2/pibiri/DNA/bw-661k -k 31 -t 48 --verbose -d /mnt/hd2/pibiri/DNA/tmp_dir/ -g 64
+	/usr/bin/time -v ./cdbg-build -i /mnt/hd2/pibiri/DNA/filenames/blackwell-661k_filenames.txt -o /mnt/hd2/pibiri/DNA/bw-661k -k 31 -t 48 --verbose -d /mnt/hd2/pibiri/DNA/tmp_dir/ -g 64
 	
 	k = 31, m = 12, num_colors = 661405, num_threads = 48, num_buckets = 40329
 	  bucket-write model: flush_bases=4.00 KiB, spill_bytes=64.00 KiB, alpha=2, beta=7
 	  tmp_dir = /mnt/hd2/pibiri/DNA/tmp_dir/
-	[bucket-write] 661405/661405 (100.0%) 24689.1s      
-	[bucket-write] 24689.1 s
-	  [bucket-write peak RSS] 30.81 GiB (+30.70 GiB) [live in 119.78 MiB -> out 30.66 GiB]
-	  bucket bytes written: 464134845529 (compressed; 540328029902 uncompressed)
+	[bucket-write] 699.17 GiB/699.17 GiB (100.0%) | files 661405/661405 (100.0%) 15486.6s
+	[bucket-write] 15493.7 s
+	  [bucket-write peak RSS] 34.87 GiB (+34.76 GiB) [live in 119.92 MiB -> out 34.85 GiB]
+	  [bucket-write ctx-switch] voluntary 17924398  involuntary 3059151
+	  bucket bytes written: 433927435329 (compressed; 508906060943 uncompressed)
 	[bucket size dist] buckets=40329 nonempty=40329  uncompressed bytes:
-	  mean=12.78 MiB  p50=12.26  p90=17.74  p99=24.46  p999=33.59  max=114.36 MiB
-	  largest-48-sum=1.94 GiB (worst-case co-resident bucket bytes; kmer_info RAM is a ~constant multiple of this)
-	  max-bucket=119910429 bytes  total=503.22 GiB
+	  mean=12.03 MiB  p50=11.57  p90=16.62  p99=22.62  p999=30.65  max=88.04 MiB
+	  largest-48-sum=1.68 GiB (worst-case co-resident bucket bytes; kmer_info RAM is a ~constant multiple of this)
+	  max-bucket=92319292 bytes  total=473.96 GiB
 	[bucket-write profile] (per-thread time, ns/threads -> wall-equiv):
-	  seq_read      46.22s   (libdeflate gzip + kseq parsing)
-	  compute      1280.42s   (ACGT scan + 2-bit + ntHash + minimizer + per-thread append)
-	  flush        4962.68s   (writer.flush total = lock + hashmap + spill)
-	    lock_wait  240.85s
-	    hashmap    787.38s
-	    spill      3914.12s   (sort+unique + write_super_kmer + gzwrite)
-	  counts: files=661405 records=275184679404 flushes=2700095542 spills=26990321 inserts=16792621468
-	[bucket-process] 40329/40329 (100.0%) 14794.8s      
+	  seq_read      30.84s   (libdeflate gzip + kseq parsing)
+	  compute      1658.80s   (ACGT scan + 2-bit + ntHash + minimizer + per-thread append)
+	    scan2bit    25.31s   (ACGT-run scan + 2-bit only; helicase's domain)
+	  flush        3575.46s   (writer.flush total = lock + hashmap + spill)
+	    lock_wait  198.79s
+	    hashmap    496.74s
+	    spill      2859.65s   (sort+unique + write_super_kmer_packed + gzwrite)
+	  counts: files=661405 records=275184679404 flushes=2700094595 spills=19299630 inserts=14734927189
+	[bucket-process] 40329/40329 (100.0%) 18028.9s
 	  bucket fragments: 6079027539
 	  distinct color classes: 389111906
-	  global color dict resident: ~11.02 GiB (stays in RAM through stitch + emit)
-	[bucket-process] 14794.8 s
-	  [bucket-process peak RSS] 31.14 GiB (+332.80 MiB) [live in 748.09 MiB -> out 24.84 GiB]
+	  color-sets-dedup-map: ~13.92 GiB resident / 32.00 GiB budget (within -> no spill)
+	[bucket-process] 18028.9 s
+	  [bucket-process peak RSS] 34.87 GiB (+0) [live in 867.04 MiB -> out 25.45 GiB]
+	  [bucket-process ctx-switch] voluntary 155193662  involuntary 1243017
 	[bucket-process profile] (per-thread time, ns/threads -> wall-equiv):
-	  load        6153.45s   (bucket_reader + LZ4 + record intern + kmer hashmap roll)
-	  resolve     1256.40s   (rsid -> local cid; record_sets.at + local_dict.intern)
-	  walk        1675.65s   (classify_left_end + extend_and_emit)
-	  pre_decode   139.75s   (local_dict.at, lock-free)
-	  pre_hash     117.76s   (wyhash + fnv1a on decoded class, lock-free)
-	  merge_wait  2726.36s   (waiting on global_mu)
-	  merge        184.44s   (global_dict.intern_with_hashes under global_mu)
-	  counts: buckets=40329 records=16792621468 kmers=179239979488 local_classes=2282712132 unitigs=6079027539
-	  stitch buckets: 2319, threads: 48
-	[stitch] 507235476/6079027539 (8.3%) 4886.9s        [stitch] round-0 seed: 4887.07s
-	[stitch] 1313555819/6079027539 (21.6%) 12586.5s        [stitch] 33 rounds, 7699.66s total (6542.66s in rounds 0-4)
-	[stitch] 6079027539/6079027539 (100.0%) 12588.0s      
-	  unitigs after stitching: 1313598625
-	[stitch] 12588 s
-	  [stitch peak RSS] 41.03 GiB (+9.89 GiB) [live in 1.51 GiB -> out 9.57 GiB]
-	  [emit-fasta] 68 buckets, cid-sort RAM cap 6.40 GiB (external merge-sort if a bucket exceeds it)
-	[emit fasta] 1915.19 s
-	  [emit-fasta peak RSS] 41.03 GiB (+0) [live in 9.57 GiB -> out 7.07 GiB]
+	  load        5561.28s   (bucket_reader + LZ4 + record intern + kmer hashmap roll)
+	  resolve     1157.15s   (rsid -> local cid; record_sets.at + local_dict.intern)
+	  walk         399.80s   (classify_left_end + extend_and_emit)
+	  pre_decode   137.52s   (local_dict.at, lock-free)
+	  pre_hash     114.60s   (wyhash + fnv1a on decoded class, lock-free)
+	  merge_wait     0.00s   (waiting on global_mu)
+	  merge       2822.03s   (global_dict.intern_with_hashes under global_mu)
+	  counts: buckets=40329 records=14734927189 kmers=157408583654 local_classes=2282712132 unitigs=6079027539
+	  stitch buckets: 2328, threads: 48
+	  compact stitch: scalable, RAM-first cap 17.28 GiB
+	  [stitch] round 0: joined=1655257190, 2364.9s
+	  [stitch] round 1: joined=1102582898, 601.178s
+	  [stitch] round 2: joined=723853801, 414.466s
+	  [stitch] round 3: joined=450132365, 305.792s
+	  [stitch] round 4: joined=281920720, 240.161s
+	  [stitch] round 5: joined=183979910, 194.965s
+	  ... (rounds 6-29 omitted; joined halves each round) ...
+	  [stitch] round 30: joined=12, 0.307654s
+	  [stitch] round 31: joined=1, 1.26333s
+	  [stitch] round 32: joined=1, 1.23173s
+	  [stitch] round 33: joined=1, 0.170981s
+	  [stitch] round 34: joined=0, 0.156067s
+	  [stitch] 35 rounds, 5008.88s total (3926.5s in rounds 0-4)
+	[stitch] 6079027539/6079027539 (100.0%) 10717.8s
+	  unitigs after stitching: 1313598628
+	[stitch] 10717.8 s
+	  [stitch peak RSS] 37.76 GiB (+2.89 GiB) [live in 1.75 GiB -> out 8.14 GiB]
+	  [stitch ctx-switch] voluntary 14093458  involuntary 459244
+	  [emit-fasta] 68 buckets (68 spilled to disk, rest read from RAM), cid-sort RAM cap 6.40 GiB
+	[emit fasta] 1366.94 s
+	  [emit-fasta peak RSS] 37.76 GiB (+0) [live in 308.95 MiB -> out 6.15 GiB]
+	  [emit-fasta ctx-switch] voluntary 400024  involuntary 8238
 	  num_color_sets = 389111906
 	  num_total_integers = 1479253359128
 	  total bits for ints  = 3835033939822
 	  total bits for offs  = 6134587136
-	[emit color_sets] 34.083 s
-	  [emit-colors peak RSS] 41.03 GiB (+0) [live in 7.07 GiB -> out 7.07 GiB]
-	[removing tmp files] 6.487 s
-	[peak resident memory] 41.03 GiB  (within budget of 64.00 GiB)
+	[emit color_sets] 33.5212 s
+	  [emit-colors peak RSS] 37.76 GiB (+0) [live in 6.15 GiB -> out 6.15 GiB]
+	  [emit-colors ctx-switch] voluntary 24918  involuntary 105
+	[removing tmp files] 0.0505843 s
+	[peak resident memory] 37.76 GiB  (within budget of 64.00 GiB)
 	done. wrote /mnt/hd2/pibiri/DNA/bw-661k.fa, /mnt/hd2/pibiri/DNA/bw-661k.u2c, and /mnt/hd2/pibiri/DNA/bw-661k.color_sets
-	[total construction time] 54067.3 s
+	[total construction time] 45675.5 s
+	
+	        Command being timed: "/usr/bin/time -v ./cdbg-build -i /mnt/hd2/pibiri/DNA/filenames/blackwell-661k_filenames.txt -o /mnt/hd2/pibiri/DNA/bw-661k -k 31 -t 48 --verbose -d /mnt/hd2/pibiri/DNA/tmp_dir/ -g 64"
+	        User time (seconds): 237533.49
+	        System time (seconds): 6907.00
+	        Percent of CPU this job got: 535%
+	        Elapsed (wall clock) time (h:mm:ss or m:ss): 12:41:16
+	        Maximum resident set size (kbytes): 39592348
+	        Major (requiring I/O) page faults: 661406
+	        Minor (reclaiming a frame) page faults: 2135645097
+	        Voluntary context switches: 187637593
+	        Involuntary context switches: 4771183
+	        Swaps: 0
+	        File system inputs: 3537004528
+	        File system outputs: 4988045168
+	        Page size (bytes): 4096
+	        Exit status: 0
