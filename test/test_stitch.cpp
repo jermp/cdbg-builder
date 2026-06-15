@@ -28,11 +28,10 @@
 #include <filesystem>
 #include <unistd.h>
 
-#include "phase3_stitch/compact_extmem.hpp"  // GGCAT-style id-only compaction (parallel-stitch)
 #include "gen.hpp"
 #include "phase3_stitch/stitch.hpp"
 #include "phase3_stitch/stitch_extmem.hpp"
-#include "phase2_bucket_process/unitig_spill.hpp"  // frag_unitig_writer (+ companion links spill) + reader
+#include "phase2_bucket_process/unitig_spill.hpp"  // frag_unitig_writer + stream reader
 
 namespace {
 uint64_t g_tmp_counter = 0;
@@ -59,13 +58,8 @@ enum class which_stitch {
     ext_mem,
     ext_file,
     ext_file_mt,
-    ext_stream_ram,    // base-carrying streaming path, RAM-first store, no spill
-    ext_stream_spill,  // base-carrying streaming path, tiny cap forces spills
-    compact_mem,
-    compact_file,
-    compact_scalable,
-    compact_scalable_links,
-    compact_inram
+    ext_stream_ram,   // base-carrying streaming path, RAM-first store, no spill
+    ext_stream_spill  // base-carrying streaming path, tiny cap forces spills
 };
 
 char const* stitch_name(which_stitch w) {
@@ -78,18 +72,8 @@ char const* stitch_name(which_stitch w) {
             return "ext_file_mt";
         case which_stitch::ext_stream_ram:
             return "ext_stream_ram";
-        case which_stitch::ext_stream_spill:
-            return "ext_stream_spill";
-        case which_stitch::compact_mem:
-            return "compact_mem";
-        case which_stitch::compact_file:
-            return "compact_file";
-        case which_stitch::compact_scalable:
-            return "compact_scalable";
-        case which_stitch::compact_scalable_links:
-            return "compact_scalable_links";
         default:
-            return "compact_inram";
+            return "ext_stream_spill";
     }
 }
 
@@ -133,89 +117,6 @@ void run_stitch(which_stitch w, std::vector<stitchable_unitig>& frags, uint32_t 
         };
         cdbg::stitch_unitigs_extmem_file_streaming(for_each, k, dir, sink, /*num_buckets=*/16,
                                                    /*done=*/nullptr, /*num_threads=*/4);
-        std::filesystem::remove_all(dir);
-    } else if (w == which_stitch::compact_mem) {
-        // GGCAT-style id-only compaction + fold assembly (parallel-stitch Step 1).
-        // Must produce the same unitig multiset as ext_mem.
-        cdbg::vector_frag_source src(frags);
-        cdbg::compact_stitch_mem(src, k, sink, /*num_buckets=*/16);
-    } else if (w == which_stitch::compact_file) {
-        // id-only compaction with the file-backed round store (parallel-stitch
-        // Step B.1) -- validates the id_tig codec + on-disk doubling.
-        cdbg::vector_frag_source src(frags);
-        std::string dir = std::filesystem::temp_directory_path().string() + "/cdbg_stitch_test_" +
-                          std::to_string(::getpid()) + "_" + std::to_string(g_tmp_counter++);
-        std::filesystem::create_directories(dir);
-        cdbg::compact_stitch_file(src, k, dir, sink, /*num_buckets=*/16);
-        std::filesystem::remove_all(dir);
-    } else if (w == which_stitch::compact_scalable) {
-        // Full RAM-bounded path (parallel-stitch Step B.2): id-only doubling +
-        // disk-based re-bucket assembly. Small frag_ranges/chain_buckets force
-        // the multi-bucket join + group/sort logic even on tiny inputs.
-        cdbg::vector_frag_source src(frags);
-        std::string dir = std::filesystem::temp_directory_path().string() + "/cdbg_stitch_test_" +
-                          std::to_string(::getpid()) + "_" + std::to_string(g_tmp_counter++);
-        std::filesystem::create_directories(dir);
-        auto for_each = [&](auto&& fn) {
-            std::vector<cdbg::color_run> runs;
-            std::string seq;
-            for (uint64_t i = 0; i < src.size(); ++i) {
-                std::string_view sv = src.seq_view(i);
-                seq.assign(sv.data(), sv.size());
-                runs = src.runs(i);
-                fn(src.open_flags(i), runs, seq);
-            }
-        };
-        // 4 threads exercises the parallel round driver + thread-safe chain
-        // sink; output is a thread-count-independent multiset (compared canonical).
-        // A tiny RAM cap (4 KiB) forces the hybrid stores to spill almost every
-        // record to disk, stressing the overflow path (RAM batch + spilled frames
-        // merged on read). Output must still match the oracle.
-        cdbg::compact_stitch_scalable(for_each, src.size(), k, dir, sink, /*num_buckets=*/16,
-                                      /*frag_ranges=*/4, /*chain_buckets=*/4, /*num_threads=*/4,
-                                      /*links_path=*/"", /*ram_budget_bytes=*/4096);
-        std::filesystem::remove_all(dir);
-    } else if (w == which_stitch::compact_scalable_links) {
-        // Same as compact_scalable, but the seed reads the companion LINKS spill
-        // written by the real frag_unitig_writer (the production producer) rather
-        // than recomputing boundary k-mers from the bases. Routes the frags
-        // through the writer (frag spill + links), then runs the scalable stitch
-        // with links_path set. Must match the oracle exactly.
-        std::string dir = std::filesystem::temp_directory_path().string() + "/cdbg_stitch_test_" +
-                          std::to_string(::getpid()) + "_" + std::to_string(g_tmp_counter++);
-        std::filesystem::create_directories(dir);
-        std::string spill = dir + "/frag_unitigs.bin";
-        cdbg::frag_unitig_writer fw(spill, k);
-        for (auto const& u : frags) {
-            stitchable_unitig copy = u;  // writer moves the seq out
-            fw(std::move(copy));
-        }
-        fw.close_for_writing();
-        const std::string links = fw.links_path();
-        const uint64_t n = fw.count();
-        auto for_each = [&](auto&& fn) {
-            cdbg::frag_unitig_stream_reader rd(spill);
-            uint8_t of;
-            std::vector<cdbg::color_run> runs;
-            std::string seq;
-            while (rd.next(of, runs, seq)) fn(of, runs, seq);
-        };
-        cdbg::compact_stitch_scalable(for_each, n, k, dir, sink, /*num_buckets=*/16,
-                                      /*frag_ranges=*/4, /*chain_buckets=*/4, /*num_threads=*/4,
-                                      links);
-        std::filesystem::remove_all(dir);
-    } else if (w == which_stitch::compact_inram) {
-        // In-RAM arena path: load fragments into the compact arena, then seed +
-        // assemble straight from RAM (disk round store only). Must match oracle.
-        cdbg::vector_frag_source src(frags);
-        std::string dir = std::filesystem::temp_directory_path().string() + "/cdbg_stitch_test_" +
-                          std::to_string(::getpid()) + "_" + std::to_string(g_tmp_counter++);
-        std::filesystem::create_directories(dir);
-        cdbg::arena_frag_source arena;
-        arena.reserve(src.size(), 0, 0);
-        for (uint64_t i = 0; i < src.size(); ++i)
-            arena.append(src.open_flags(i), src.seq_view(i), src.runs(i));
-        cdbg::compact_stitch_inram(arena, k, dir, sink, /*num_buckets=*/16, /*num_threads=*/4);
         std::filesystem::remove_all(dir);
     } else {
         cdbg::vector_frag_source src(frags);
@@ -291,14 +192,7 @@ bool run_case(uint64_t seed, uint32_t k, uint64_t num_unitigs, uint64_t max_len,
     bool sr = run_case_impl(which_stitch::ext_stream_ram, seed, k, num_unitigs, max_len, max_frags);
     bool ss =
         run_case_impl(which_stitch::ext_stream_spill, seed, k, num_unitigs, max_len, max_frags);
-    bool e = run_case_impl(which_stitch::compact_mem, seed, k, num_unitigs, max_len, max_frags);
-    bool f = run_case_impl(which_stitch::compact_file, seed, k, num_unitigs, max_len, max_frags);
-    bool g =
-        run_case_impl(which_stitch::compact_scalable, seed, k, num_unitigs, max_len, max_frags);
-    bool gl = run_case_impl(which_stitch::compact_scalable_links, seed, k, num_unitigs, max_len,
-                            max_frags);
-    bool h = run_case_impl(which_stitch::compact_inram, seed, k, num_unitigs, max_len, max_frags);
-    return b and c and d and sr and ss and e and f and g and gl and h;
+    return b and c and d and sr and ss;
 }
 
 // Shared-cid branchy correctness case. Builds `num_clusters` branch
@@ -342,12 +236,7 @@ bool run_branch_case(uint64_t seed, uint32_t k, uint64_t num_clusters) {
     bool d = run_branch_case_impl(which_stitch::ext_file_mt, seed, k, num_clusters);
     bool sr = run_branch_case_impl(which_stitch::ext_stream_ram, seed, k, num_clusters);
     bool ss = run_branch_case_impl(which_stitch::ext_stream_spill, seed, k, num_clusters);
-    bool e = run_branch_case_impl(which_stitch::compact_mem, seed, k, num_clusters);
-    bool f = run_branch_case_impl(which_stitch::compact_file, seed, k, num_clusters);
-    bool g = run_branch_case_impl(which_stitch::compact_scalable, seed, k, num_clusters);
-    bool gl = run_branch_case_impl(which_stitch::compact_scalable_links, seed, k, num_clusters);
-    bool h = run_branch_case_impl(which_stitch::compact_inram, seed, k, num_clusters);
-    return b and c and d and sr and ss and e and f and g and gl and h;
+    return b and c and d and sr and ss;
 }
 
 // Larger case: report timing + fragment/unitig counts, plus the same
@@ -374,8 +263,7 @@ bool run_scale(uint64_t seed, uint32_t k, uint64_t num_unitigs) {
     bool ok = true;
     for (which_stitch w :
          {which_stitch::ext_mem, which_stitch::ext_file, which_stitch::ext_file_mt,
-          which_stitch::compact_mem, which_stitch::compact_file, which_stitch::compact_scalable,
-          which_stitch::compact_scalable_links, which_stitch::compact_inram}) {
+          which_stitch::ext_stream_ram, which_stitch::ext_stream_spill}) {
         cdbg::seconds_timer sw;
         sw.start();
         run_stitch(w, frags, k, out);

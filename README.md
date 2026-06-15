@@ -89,8 +89,8 @@ artifacts:
 2. **bucket-process** — walk each bucket independently into open-ended
    fragments and intern the global color sets.
 3. **stitch** — join fragments across buckets by matching their shared
-   **full boundary k-mer** (id-only doubling, then a single base/color
-   assembly pass).
+   **full boundary k-mer** (base-carrying hash-bucketed doubling: the
+   unitig sequences grow in place through the rounds).
 4. **emit** — write `.fa` + `.u2c` and finalize `.color_sets`.
 
 When `-g` is set, every phase sizes itself against that budget (and the

@@ -55,8 +55,8 @@ inputs (gzip FASTA, N files)
 B per-bucket files of LZ4-framed super-k-mer records      ← bucket-write
     │   per-bucket dBG; walk; intern colors
     ▼
-frag_unitigs.bin (cid + flags + seq) + links.bin          ← bucket-process
-(boundary k-mers per fragment) + streaming out.color_sets
+frag_unitigs.bin (cid + flags + seq)                      ← bucket-process
+    + streaming out.color_sets
     │   base-carrying doubling join (seed from frag spill),
     │   growing+splitting bases+colors in on-disk rounds
     ▼
@@ -89,16 +89,12 @@ artifact contract, the rest of the pipeline is unaffected.
 **Phase 2 — bucket-process** (`include/phase2_bucket_process/`)
 
 - *Reads:* the `B` `tmp/bucket_<b>.bin` files (one bucket per worker).
-- *Produces three artifacts:*
+- *Produces two artifacts:*
   - `tmp/frag_unitigs.bin` — a single stream of **open-ended fragments**
     `{ACGT seq, open_flags (which ends are still extendable), color-run
     sequence}`. The color runs reference **global** cids (the per-bucket
-    local→global merge, §4.7, runs before each fragment is written).
-  - `tmp/frag_unitigs.bin.links` — a companion **links spill**: one
-    fixed-size record per fragment, in the same `frag_id` order, holding
-    just that fragment's open-end **boundary k-mers** (§4.7). This lets
-    phase 3 seed its join from ~17 B/fragment instead of re-reading every
-    base out of the (multi-GB) frag spill.
+    local→global merge, §4.7, runs before each fragment is written). Phase 3
+    seeds its join by streaming this spill once.
   - `<out>.color_sets` — the distinct **global color classes**, interned
     and streamed to disk incrementally during the phase (the only artifact
     written progressively rather than at phase end; finalized by phase 4).
@@ -109,19 +105,15 @@ artifact contract, the rest of the pipeline is unaffected.
 
 **Phase 3 — stitch** (`include/phase3_stitch/`)
 
-- *Reads:* `tmp/frag_unitigs.bin` (streamed once to seed round 0; the
-  base-carrying default needs no links spill — that is the id-only seed).
+- *Reads:* `tmp/frag_unitigs.bin` (streamed once to seed round 0).
 - *Produces:* `tmp/unitig_bucket_<k>.bin`, `k ∈ [0, K)` — **finished,
   monochromatic** unitigs `{ACGT seq, cid}`, partitioned so bucket `k`
   holds every unitig whose `cid` falls in `k`'s range.
-- *How:* a GGCAT-style hash-bucketed iterative-doubling join. The default
-  (**base-carrying**) form carries each tig's growing bases+colors through the
+- *How:* a GGCAT-style hash-bucketed iterative-doubling join. The
+  **base-carrying** form carries each tig's growing bases+colors through the
   rounds and joins them in place, splitting into monochromatic unitigs at emit;
   the round store lives **on disk** (one bucket resident per thread), so peak
-  RAM is bounded by the bucket count, not the fragment count (§5). An opt-in
-  **id-only** variant (`--id-only-stitch`) carries only fragment-id chains and
-  assembles bases once at the end — slower at scale but RAM-first with a tighter
-  `-g` bound.
+  RAM is bounded by the bucket count, not the fragment count (§5).
 - *Why it's the natural handoff:* joining open ends by full boundary-k-mer
   match yields complete unitigs; cid-**range** bucketing means phase 4 can
   emit in strict cid order by walking buckets `0..K-1` (sorting only within
@@ -412,8 +404,8 @@ For each bucket independently:
    output goes directly to `<out>.color_sets`.
 
 Each bucket's fragments are emitted (batched, one lock per bucket; §4.7)
-into a single disk-backed `frag_unitig_writer` — both the frag spill and
-its companion links spill — for stitch to consume.
+into a single disk-backed `frag_unitig_writer` (the frag spill) for stitch
+to consume.
 
 ### 4.2 Per-bucket walker state
 
@@ -557,22 +549,13 @@ local → global and hands the bucket's fragments to the disk-backed
 `frag_unitig_writer`. Per-fragment record: `[u32 cid][u8 open_flags][u32
 seq_len][seq bytes][color runs]`.
 
-**Batched, single-lock write (+ companion links spill).** The whole
-bucket's fragments are serialized into thread-local buffers *outside* the
-frag-sink mutex, then written under **one** lock acquisition
-(`write_batch`), rather than locking once per fragment. process_buckets
-drains thousands of fragments per bucket from `T` threads, so the
-per-fragment lock was the dominant source of bucket-process voluntary
-context switches; batching collapses it to one lock per bucket. In the
-same batch the writer also appends each fragment's **links record** to the
-companion `frag_unitigs.bin.links` spill — a fixed-size
-`[u8 open_flags][kbytes kl][kbytes kr]` (`kbytes = (2k+7)/8 ≤ 16`), where
-`kl`/`kr` are the FORWARD boundary k-mers of the open ends (0 otherwise),
-computed bit-identically to the stitch's own `id_fwd_kmer`. The boundary
-k-mer compute is done *before* taking the lock (it is the only real CPU
-in the write); the lock then guards only the two `fwrite`s, and frag-spill
-and links-spill stay in the same `frag_id` order because both are written
-together per batch.
+**Batched, single-lock write.** The whole bucket's fragments are
+serialized into thread-local buffers *outside* the frag-sink mutex, then
+written under **one** lock acquisition (`write_batch`), rather than locking
+once per fragment. process_buckets drains thousands of fragments per bucket
+from `T` threads, so the per-fragment lock was the dominant source of
+bucket-process voluntary context switches; batching collapses it to one
+lock per bucket.
 
 Memory: per-thread merge buffer is `MERGE_BATCH × max-decoded-color-
 list`, a few MB at num_colors = 100K, plus the per-bucket serialization
@@ -641,12 +624,10 @@ form (`stitch_extmem.hpp`): each round carries every still-open tig's
 finished tig is split into monochromatic output unitigs at emit. The
 per-round tigs live in an **on-disk round store** (LZ4 bucket files, one
 bucket decoded in RAM per in-flight thread), so peak RAM is bounded by the
-bucket count — sized from `-g` — not by the fragment count. An opt-in
-**id-only** variant (`--id-only-stitch`, `compact_extmem.hpp`) instead carries
-only fragment-**id** chains through the rounds and assembles bases+colors once
-at the end; it is slower at scale but keeps RAM-first / spill-overflow stores
-with a tighter `-g` bound, and is also the independent reference `test_stitch`
-cross-checks the default against (§5.5).
+bucket count — sized from `-g` — not by the fragment count. The random-access
+variants (`stitch_unitigs_extmem` / `_file` in `stitch_extmem.hpp`) are kept as
+the independent reference `test_stitch` cross-checks the production streaming
+path against.
 
 > **Naming.** The internal steps are logged as `seed` / `round k`. Those are
 > **sub-steps of the single pipeline Phase 3 (stitch)** — not the four
@@ -714,8 +695,8 @@ per-bucket resident set.
 > so in practice it holds — measured **37.76 GiB on the 661k/`-g 64` build**,
 > 26 GiB under budget. But a pathological input (many fragments sharing one
 > boundary k-mer) could fatten one bucket past its share; nothing *enforces* a
-> byte ceiling. The `--id-only-stitch` path (§5.5) trades ~3× time for a hard
-> bound when that guarantee is required.
+> byte ceiling. The measured-RSS governor (§5.5) is the backstop if a bucket
+> ever fattens past its share.
 
 ### 5.4 The write-through unitig writer
 
@@ -731,43 +712,7 @@ RAM-first writer that held unitigs in RAM up to a budget and, at 661k — 1.31e9
 finished unitigs over a few cid-skewed buckets — overshot `-g` to ~170 GiB; the
 write-through default removes that failure mode.
 
-### 5.5 The id-only alternative (`--id-only-stitch`)
-
-`compact_extmem.hpp` is an opt-in stitch that mirrors GGCAT more literally: the
-doubling rounds carry only fragment-**id** chains (8-byte ids, no
-bases/colors), so the rounds are cheap and the bases are touched once. Four
-steps: **seed** from the `frag_unitigs.bin.links` companion (the boundary
-k-mers, ~17 B/fragment, no base read); **id-only doubling rounds**
-(`id_run_rounds`, the same join logic on id-chains); **attach** — stream the
-frag spill once, look up each fragment's member record, orient its bases/runs,
-re-bucket by `chain_id`; **assemble + split** — per chain bucket, group by
-`chain_id`, sort by `pos`, fold-assemble the bases (dropping shared k-mers),
-and cut into monochromatic unitigs.
-
-All its working stores (id-tig round store, member spill, per-chain bases
-spill) are **RAM-first hybrids**: records stay uncompressed in RAM and are read
-straight back when the working set fits the budget (`STITCH_BUDGET_FRAC =
-0.60·g`), LZ4-spilling buckets to disk only on overflow. Its one
-**non-spillable** structure is the attach pass's decoded per-`frag_id`-range
-member array (`arr[fid − lo]`, a random-access `frag_id → {chain_id, pos, …}`
-lookup):
-
-```
-member_set    = ⌈ n_frags / frag_ranges ⌉ · PER_FRAG          (PER_FRAG = 37 B)
-member_budget = min( avail, 0.25·g ),   avail = g − stitch_ram_cap
-frag_ranges   = clamp( ⌈ n_frags · PER_FRAG / member_budget ⌉, 64, 2¹⁶ )
-```
-
-`frag_ranges` (and likewise `chain_buckets` for the assemble bucket) is
-**scaled** so the resident range fits a `-g` share — more, smaller on-disk
-buckets, identical output — with an **abort** at the `2¹⁶` ceiling rather than
-silently exceeding `-g` (the trip point is linear in `-g`, ~1.9×10¹² fragments
-at `-g 4`, orders of magnitude above real inputs). This is the path to choose
-when a **hard** `-g` bound matters more than stitch speed; it is also the
-independent reference oracle `test_stitch` cross-checks the base-carrying
-default against — both must produce the identical unitig multiset.
-
-### 5.6 The RAM governor (measured-RSS backstop)
+### 5.5 The RAM governor (measured-RSS backstop)
 
 `include/ram_governor.hpp` is one controller that reads the process's **real
 RSS** and, above a high-watermark, asks every registered `ram_spillable`
@@ -777,12 +722,12 @@ models only decide *how much* stays in RAM for speed.
 
 **Current scope: stitch only**, constructed at build start but `start()`ed only
 before stitch, tripping at `0.80·g` / releasing at `0.62·g`. Its one registered
-participant is the unitig writer — but under the base-carrying default that
-writer is **write-through** (§5.4), so it holds ~nothing and the governor
-rarely has anything to reclaim; the round store is on-disk and unregistered.
-The governor therefore matters most for the **id-only** path's RAM-first
-stores, and as a general backstop. It cannot spill a *non-spillable* structure,
-so it does not remove the §9.1 floors.
+participant is the unitig writer — but under a `-g` budget that writer is
+**write-through** (§5.4), so it holds ~nothing and the governor rarely has
+anything to reclaim; the round store is on-disk and unregistered. With no `-g`
+the writer keeps unitigs in RAM and the governor can spill its largest buckets
+under pressure. It cannot spill a *non-spillable* structure, so it does not
+remove the §9.1 floors.
 
 **A note on `malloc_trim`.** The trim is what makes a spill actually *lower*
 RSS (freed glibc-arena pages otherwise stay resident), but it is **expensive**
@@ -1015,9 +960,7 @@ through to disk** (the write-through unitig writer, §5.4), so they add no RAM.
 The bucket count is sized so `num_threads` resident buckets fit a `-g` share;
 this bound is **statistical** (balanced hashing), not hard — see the §5.3
 caveat. Measured: **37.76 GiB on the 661k/`-g 64` build** (26 GiB under
-budget). The opt-in id-only path (§5.5) instead keeps RAM-first/spill-overflow
-stores sized to `STITCH_BUDGET_FRAC = 0.60·g`, with a tighter, harder bound,
-at ~3× the stitch time; the measured-RSS **governor** (§5.6) is the backstop.
+budget). The measured-RSS **governor** (§5.5) is the backstop.
 
 Emit peak: one cid-range bucket of records loaded for sorting (~3 MB
 on salmonella-25K). The u2c bit_vector is streamed straight to disk
@@ -1045,15 +988,14 @@ shrinks. The non-spillable structures and their fallbacks, per phase:
 | **bucket-process** | **color-sets-dedup-map** (`colorset_dedup_index`) | **# distinct color sets** | **none** | **No** — see below |
 | stitch (default) | on-disk round store working set | `num_threads` × bucket; bucket count from `-g` | on disk already; bound **statistical** (§5.3) | **Mostly** — statistical, not hard |
 | stitch (default) | unitig writer | — | **write-through to disk** under `-g` (§5.4) | **Yes** (hard, 0 RAM) |
-| stitch (`--id-only-stitch`) | RAM-first stores + member array | live data / data | spill overflow + scaled `frag_ranges`/`chain_buckets` (§5.5) | Yes |
 | emit | one cid-range bucket | data / K | **external merge-sort** if over cap (§6.2) | Yes |
 | emit | u2c | data | **streamed** (§6.2) | Yes |
 
 Everything **outside bucket-process** has a spill, stream, or scale fallback
-that holds it to a `-g` share — **except** the default stitch's on-disk round
-store, whose bound is **statistical** (balanced hashing), not hard (§5.3); the
-`--id-only-stitch` path makes it hard at ~3× the time. Bucket-process has the
-**only two** data-sized structures with **no fallback at all**:
+that holds it to a `-g` share — **except** the stitch's on-disk round store,
+whose bound is **statistical** (balanced hashing), not hard (§5.3), with the
+measured-RSS governor as backstop (§5.5). Bucket-process has the **only two**
+data-sized structures with **no fallback at all**:
 
 1. **The per-bucket walk set.** `bucket_reader` slurps a whole bucket into RAM
    and `load_bucket` builds the entire `kmer_info` hashmap resident; the walk
@@ -1112,7 +1054,7 @@ are independent:
 |---|---|---|
 | bucket-write | T worker threads, one input file each at a time; per-thread per-bucket buffers; per-bucket mutex guards `bucket_compactor` | per-bucket mutex + RSS watcher's `try_spill` sweep |
 | bucket-process | T worker threads pop next bucket from atomic counter; each owns one bucket end-to-end | per-bucket: thread-local; `global_mu` only during local→global merge; `mem_mu`/cv admission gate (§4.9) bounds resident buckets |
-| stitch (default) | seed `T`-way (§5.1); base-carrying doubling rounds `T`-way over independent per-round buckets via a **persistent worker pool** (§5.2), each holding one decoded round-store bucket; monochromatic split drained to the write-through sink | per-bucket waiting-map thread-local; round barrier between rounds (generation-counted, pool reused); sink drained under `sink_mu` (id-only path adds the attach/assemble passes, §5.5) |
+| stitch | seed `T`-way (§5.1); base-carrying doubling rounds `T`-way over independent per-round buckets via a **persistent worker pool** (§5.2), each holding one decoded round-store bucket; monochromatic split drained to the write-through sink | per-bucket waiting-map thread-local; round barrier between rounds (generation-counted, pool reused); sink drained under `sink_mu` |
 | emit | single-threaded | n/a |
 
 Inter-phase: each phase finishes before the next begins. There is no
@@ -1144,10 +1086,9 @@ root. Other shared files live in the phase that primarily owns them.
 | `compact_color_set_dict.hpp`                         | per-bucket color-set dict (hybrid in-memory) |
 | `streaming_color_set_dict.hpp`                       | global color-set dict; writes `.color_sets` |
 | `hybrid_color_sets.hpp`                              | static `encode_one` (sparse/dense/complementary) |
-| `unitig_spill.hpp`                                   | disk-backed frag/unitig sinks (batched write + companion links spill) + mmap reader |
+| `unitig_spill.hpp`                                   | disk-backed frag/unitig sinks (batched write) + streaming frag reader |
 | **Phase 3 — `include/phase3_stitch/`** | |
-| `stitch_extmem.hpp`                                  | **production stitch** (default): base-carrying iterative-doubling join; on-disk round store + write-through unitig writer |
+| `stitch_extmem.hpp`                                  | **production stitch**: base-carrying iterative-doubling join (`stitch_unitigs_extmem_file_streaming`); on-disk round store + write-through unitig writer. The random-access `stitch_unitigs_extmem` / `_file` variants are kept as `test_stitch`'s cross-check oracle |
 | `stitch.hpp`                                         | shared stitch helpers (side tags, junction, frag source) |
-| `compact_extmem.hpp`                                 | opt-in **id-only** stitch (`--id-only-stitch`): id-chain doubling + base/color assembly (RAM-first, spill-to-disk); also `test_stitch`'s cross-check oracle |
 | **Phase 4 — `include/phase4_emit/`** | |
 | `emit.hpp`                                           | `emit_fasta` (FASTA + u2c) + `emit_colors` (finalize `.color_sets`) |

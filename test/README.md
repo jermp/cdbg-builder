@@ -33,13 +33,12 @@ case with the seed (reproducible).
 |---|---|---|
 | `test_stitch` | stitch | split K random "true" unitigs (distinct cids) into overlapping fragments with OPEN internal boundaries, shuffle + randomly revcomp, stitch, and assert the K unitigs are reconstructed exactly (modulo orientation), each fully closed |
 
-It runs every stitch implementation against an independent oracle: the
-production id-only compaction stitch (`compact_mem` / `compact_file` /
-`compact_scalable` / `compact_scalable_links` / `compact_inram`, in
-`compact_extmem.hpp`) is cross-checked against the base-carrying
-external-memory reference (`ext_mem` / `ext_file`, in `stitch_extmem.hpp`,
-kept solely as this oracle). The `[scale]` case (50k unitigs) also gives
-an isolated per-phase timing number.
+It runs every stitch variant against an independent oracle: the production
+base-carrying streaming stitch (`ext_stream_ram` / `ext_stream_spill`,
+`stitch_unitigs_extmem_file_streaming` in `stitch_extmem.hpp`) is cross-checked
+against the random-access external-memory references (`ext_mem` / `ext_file` /
+`ext_file_mt`, in `stitch_extmem.hpp`, kept solely as this oracle). The
+`[scale]` case (50k unitigs) also gives an isolated per-phase timing number.
 
 `gen.hpp` holds the shared generators (`random_dna`, `revcomp`,
 `canonical`, `split_unitig`).

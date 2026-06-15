@@ -57,8 +57,8 @@
 #include "phase1_bucket_write/bucket_ingester.hpp"
 #include "phase2_bucket_process/bucket_walker.hpp"
 #include "phase1_bucket_write/minimizer.hpp"
-#include "phase3_stitch/compact_extmem.hpp"
 #include "phase3_stitch/stitch.hpp"
+#include "phase3_stitch/stitch_extmem.hpp"
 #include "phase2_bucket_process/streaming_color_set_dict.hpp"
 #include "phase2_bucket_process/unitig_spill.hpp"
 #include "phase4_emit/emit.hpp"
@@ -77,13 +77,6 @@ struct builder {
     void build() {
         validate_and_resolve_config();
 
-        // Benchmark/recovery: resume from an existing frag spill, skipping
-        // bucket-write + bucket-process (see resume_stitch_benchmark_).
-        if (m_cfg.resume_stitch) {
-            resume_stitch_benchmark_();
-            return;
-        }
-
         // RAM governor: the measured-RSS backstop that reclaims glibc-retained
         // pages under pressure and spills registered participants (the unitig
         // writer during stitch -- the buffer the per-phase watcher couldn't
@@ -93,7 +86,7 @@ struct builder {
         // so polling during them is pure overhead for no benefit -- it must not
         // slow the fast phases. budget 0 => disabled. Trip a touch below -g
         // (0.80/0.62) so the spill+trim lag on a spinning disk has room before
-        // the hard cap. See algorithm.md §5.6.
+        // the hard cap. See algorithm.md §5.5.
         ram_governor governor(m_cfg.max_ram_gb > 0
                                   ? (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0)
                                   : 0,
@@ -242,11 +235,7 @@ struct builder {
         // is just 16 bytes of metadata; the compressed bit_vector
         // never sits in RAM. EF offsets are appended to the file at
         // finalize().
-        // Emit the companion links spill (boundary k-mers per fragment, in
-        // frag_id order) during bucket-process, so the scalable stitch can seed
-        // from ~1.6 GB of links instead of re-reading the whole frag spill. The
-        // links file is a small disk-only cost that never counts against -g.
-        frag_unitig_writer frag_sink(tmp_dir + "/frag_unitigs.bin", m_cfg.k);
+        frag_unitig_writer frag_sink(tmp_dir + "/frag_unitigs.bin");
         streaming_color_set_dict global_dict(m_num_colors, m_cfg.out_basename + ".color_sets");
         std::mutex global_mu;
         {
@@ -342,40 +331,15 @@ struct builder {
                 const uint64_t unitig_bucket_count = pick_unitig_bucket_count_(
                     m_num_color_classes, total_frag_seq_bytes, m_cfg.max_ram_gb);
 
-                // Stitch's whole working-RAM share of -g is STITCH_BUDGET_FRAC*g;
-                // the remaining (1-frac)*g is HEADROOM for glibc arena retention +
-                // scratch (which scale with thread churn, not with -g). EVERYTHING
-                // the phase allocates is sized to sum within the working share:
-                //   work = unitig_ram_budget + stitch_ram_cap + assemble_transient
-                // so they cannot co-peak past -g. (This replaces the old fixed 2 GiB
-                // "carry" reserve, which didn't scale with -g and left the assemble
-                // transient + glibc to pile on TOP of the budget -- the 100k/-g16
-                // overshoot.) The color dict is freed before stitch (carry ~0), but
-                // we subtract it if still resident.
-                //
-                // In-RAM unitig output budget: keeping stitched unitigs in memory
-                // skips the temp-bucket write here AND the read-back in emit (~half
-                // of emit on a spinning disk). Stitching only merges fragments, so
-                // total unitig bases <= total_frag_seq_bytes; budget at ~1.5x for
-                // std::string/vector overhead, but never more than 40% of the
-                // splittable share. No -g => SIZE_MAX (keep every unitig in RAM); the
-                // writer spills its largest buckets when the budget is exceeded.
+                // The write-through unitig_bucket_writer only needs to know
+                // "finite (=> write-through, under -g)" vs "SIZE_MAX (=> keep in
+                // RAM, no -g)". No -g => SIZE_MAX (keep every unitig in RAM, skip
+                // the temp round-trip); under -g => a finite budget so the writer
+                // streams every unitig straight to its bucket file.
                 size_t unitig_ram_budget = SIZE_MAX;
-                uint64_t stitch_splittable = 0;  // work for unitig writer + stores
-                if (m_cfg.max_ram_gb > 0) {
-                    const uint64_t total = m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0;
-                    const uint64_t carry = global_dict.resident_bytes();  // ~0 post-release
-                    uint64_t work = (uint64_t)(STITCH_BUDGET_FRAC * total);
-                    work = work > carry ? work - carry : 256ull * 1024 * 1024;
-                    // Reserve the non-spillable phase-3 assemble transient FIRST, so
-                    // unitig + stores + transient all fit inside `work` (chain_buckets
-                    // bounds the real set to exactly stitch_assemble_budget).
-                    const uint64_t assemble = stitch_assemble_budget(total);
-                    stitch_splittable = work > assemble ? work - assemble : 256ull * 1024 * 1024;
-                    const uint64_t est = (uint64_t)(total_frag_seq_bytes * 1.5);
-                    unitig_ram_budget =
-                        std::min<uint64_t>(est, (uint64_t)(stitch_splittable * 0.4));
-                }
+                if (m_cfg.max_ram_gb > 0)
+                    unitig_ram_budget = (size_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0 *
+                                                 STITCH_BUDGET_FRAC);
                 uwriter_ptr = std::make_unique<unitig_bucket_writer>(
                     tmp_dir, m_num_color_classes, unitig_bucket_count, unitig_ram_budget);
                 // Govern the unitig writer for the stitch's duration: under -g
@@ -401,36 +365,6 @@ struct builder {
                 // RNG), so this fans out cleanly. Output is unchanged --
                 // emit_fasta sorts each cid-bucket, so .fa is identical
                 // regardless of which thread emitted which unitig.
-                // GGCAT-style id-only compaction on a single, always-on-disk
-                // path: the doubling carries only fragment-id chains; bases +
-                // colors are assembled at the end through an on-disk re-bucket.
-                // The stores are RAM-FIRST: round store, member, and base
-                // records stay in RAM up to a -g-derived cap and spill only the
-                // overflow to disk. So when the working set fits, the whole
-                // stitch runs in RAM (no disk round-trip); when it does not, it
-                // degrades to disk and the -g bound is honored at all costs.
-                // Round 0 seeds from the precomputed links spill (boundary
-                // k-mers, ~17 B/fragment), not a second full frag-spill read.
-                //
-                // The stores get whatever of the splittable share the unitig writer
-                // didn't take, so unitig_writer + stores = stitch_splittable (and,
-                // with the assemble transient reserved out above, the three sum to
-                // STITCH_BUDGET_FRAC*g). 0 means no -g => use all RAM.
-                uint64_t stitch_ram_cap = 0;
-                if (m_cfg.max_ram_gb > 0) {
-                    stitch_ram_cap = stitch_splittable > unitig_ram_budget
-                                         ? stitch_splittable - unitig_ram_budget
-                                         : 256ull * 1024 * 1024;
-                }
-                std::cout << "  compact stitch: scalable, RAM-first cap "
-                          << (stitch_ram_cap ? format_bytes(stitch_ram_cap)
-                                             : std::string("unlimited"))
-                          << "\n";
-                // The two NON-spillable stitch fan-out knobs -- frag_ranges
-                // (phase-2 member array) and chain_buckets (phase-3 assemble set)
-                // -- are sized from -g INSIDE compact_stitch_scalable, next to the
-                // structures they bound. The orchestrator only carves the budget
-                // (stitch_ram_cap, the -g target) and hands it down.
                 auto for_each_frag = [&, first_pass = true](auto&& fn) mutable {
                     frag_unitig_stream_reader rd(frag_sink.path());
                     uint8_t of;
@@ -443,48 +377,23 @@ struct builder {
                     }
                     first_pass = false;
                 };
-                // Hard -g target for the stitch's measured-RSS backstop (0 = no
-                // -g): the payload-model cap (stitch_ram_cap) undercounts real
-                // RSS, so the watcher force-spills the stores when live RSS
-                // crosses the budget, keeping the whole process within -g.
-                const uint64_t stitch_rss_target =
-                    m_cfg.max_ram_gb > 0
-                        ? (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0)
-                        : 0;
-                if (m_cfg.id_only_stitch) {
-                    // --id-only-stitch: GGCAT-style. The doubling carries only
-                    // fragment-id chains; bases/colors are assembled once at the
-                    // end via an on-disk re-bucket. HARD-enforces an arbitrarily
-                    // tight -g (but ~3x slower at 661k). For a -g too tight for the
-                    // base-carrying ~41 GiB peak.
-                    compact_stitch_scalable(for_each_frag, n_frags, m_cfg.k, tmp_dir,
-                                            std::ref(*uwriter_ptr), stitch_buckets,
-                                            /*frag_ranges=*/0, /*chain_buckets=*/0,
-                                            m_cfg.num_threads, frag_sink.links_path(),
-                                            stitch_ram_cap, stitch_rss_target,
-                                            total_frag_seq_bytes);
-                } else {
-                    // DEFAULT: base-carrying -- assemble unitig sequences IN the
-                    // doubling rounds from a single frag-spill read, through an
-                    // always-on-disk round store (one bucket per thread resident).
-                    // The proven README path: 661k in ~3.5h at ~41 GiB, within -g.
-                    // -g is held by keeping little in RAM + the bucket-count sizing;
-                    // the governor still backstops the unitig writer. `done` is
-                    // driven by for_each_frag's first-pass count, so the stitch
-                    // takes nullptr.
-                    (void)stitch_ram_cap;
-                    (void)stitch_rss_target;
-                    stitch_unitigs_extmem_file_streaming(for_each_frag, m_cfg.k, tmp_dir,
-                                                         std::ref(*uwriter_ptr), stitch_buckets,
-                                                         /*done=*/nullptr, m_cfg.num_threads);
-                }
+                // Base-carrying: assemble unitig sequences IN the doubling rounds
+                // from a single frag-spill read, through an always-on-disk round
+                // store (one bucket per thread resident). The proven README path:
+                // 661k in ~3.5h at ~41 GiB, within -g. -g is held by keeping little
+                // in RAM + the bucket-count sizing; the governor still backstops the
+                // unitig writer. `done` is driven by for_each_frag's first-pass
+                // count, so the stitch takes nullptr.
+                stitch_unitigs_extmem_file_streaming(for_each_frag, m_cfg.k, tmp_dir,
+                                                     std::ref(*uwriter_ptr), stitch_buckets,
+                                                     /*done=*/nullptr, m_cfg.num_threads);
                 prog.stop();
                 std::cout << "  unitigs after stitching: " << uwriter_ptr->total_unitigs() << "\n";
             }
             rss.stop();
         }
-        // Spill file no longer needed; safe to unlink (kept under --keep-tmp so a
-        // later --resume-stitch can reuse it).
+        // Spill file no longer needed; safe to unlink (kept under --keep-tmp for
+        // debugging).
         if (!m_cfg.keep_tmp) frag_sink.unlink();
         m_num_unitigs = uwriter_ptr->total_unitigs();
 
@@ -509,7 +418,7 @@ struct builder {
         }
 
         // Remove the scratch dir and everything under it (unless --keep-tmp,
-        // which preserves the frag spill for a later --resume-stitch).
+        // which preserves the scratch dir for debugging).
         if (!m_cfg.keep_tmp) {
             timer _("removing tmp files");
             std::error_code ec;
@@ -625,164 +534,6 @@ private:
     // The measured-RSS watcher (trip 0.70*g) is the backstop if the model still
     // undercounts; this fraction is what keeps the watcher from having to fire.
     static constexpr double STITCH_BUDGET_FRAC = 0.60;
-
-    // Recover num_color_classes for a --resume-stitch run from the on-disk
-    // color-set state the killed run left behind: the offsets sidecar (8 B per
-    // class, present iff the run died before finalize), else the finalized
-    // <out>.color_sets header (num_color_sets is a u64 at byte offset 12).
-    uint64_t recover_num_color_classes_() const {
-        std::error_code ec;
-        const std::string off = m_cfg.out_basename + ".color_sets.tmp_offsets";
-        if (std::filesystem::exists(off, ec)) {
-            auto sz = std::filesystem::file_size(off, ec);
-            if (!ec && sz >= 8) return (uint64_t)sz / 8;
-        }
-        const std::string cs = m_cfg.out_basename + ".color_sets";
-        if (std::filesystem::exists(cs, ec)) {
-            std::FILE* f = std::fopen(cs.c_str(), "rb");
-            if (f) {
-                uint64_t n = 0;
-                bool ok = std::fseek(f, 12, SEEK_SET) == 0 && std::fread(&n, sizeof(n), 1, f) == 1;
-                std::fclose(f);
-                if (ok) return n;
-            }
-        }
-        return 0;
-    }
-
-    // BENCHMARK/RECOVERY path for --resume-stitch: run ONLY stitch (+ emit_fasta)
-    // from an existing tmp_dir/frag_unitigs.bin left by a killed run, skipping
-    // bucket-write + bucket-process. Times the stitch and writes <out>.fa/.u2c;
-    // does NOT finalize <out>.color_sets (its streaming dict state died with the
-    // original process, so it cannot be cleanly finalized). The stitch budget
-    // split mirrors build() exactly so the timing is representative.
-    void resume_stitch_benchmark_() {
-        if (m_cfg.tmp_dir.empty())
-            throw std::runtime_error("--resume-stitch requires -d <tmp_dir> (the killed run's scratch)");
-        const std::string tmp_dir = m_cfg.tmp_dir;
-        const std::string frag_path = tmp_dir + "/frag_unitigs.bin";
-        if (!std::filesystem::exists(frag_path))
-            throw std::runtime_error("--resume-stitch: no frag spill at " + frag_path +
-                                     " (is -d the killed run's scratch dir?)");
-        const std::string links_path = (m_cfg.k >= 2) ? (frag_path + ".links") : std::string();
-
-        std::cout << "[resume-stitch] BENCHMARK MODE -- reusing existing frag spill:\n  " << frag_path
-                  << "\n  (skips bucket-write/process + color finalize; <out>.color_sets NOT written)\n";
-
-        const double GiB = 1024.0 * 1024.0 * 1024.0;
-        seconds_timer build_timer;
-        build_timer.start();
-
-        // Recompute the producer counters (n_frags, total_seq) the killed run held
-        // in RAM, via one sequential scan of the frag spill.
-        uint64_t n_frags = 0, total_frag_seq_bytes = 0;
-        {
-            timer _("scan frag spill (recount)");
-            frag_unitig_stream_reader rd(frag_path);
-            uint8_t of;
-            std::vector<color_run> runs;
-            std::string seq;
-            while (rd.next(of, runs, seq)) {
-                ++n_frags;
-                total_frag_seq_bytes += seq.size();
-            }
-        }
-        m_num_color_classes = recover_num_color_classes_();
-        std::cout << "  n_frags=" << n_frags
-                  << ", total_frag_seq_bytes=" << format_bytes(total_frag_seq_bytes)
-                  << ", num_color_classes=" << m_num_color_classes << "\n";
-        if (m_num_color_classes == 0)
-            throw std::runtime_error("--resume-stitch: could not recover num_color_classes from " +
-                                     m_cfg.out_basename + ".color_sets[.tmp_offsets]");
-
-        // Governor (scoped to stitch, same construction as build()).
-        ram_governor governor(m_cfg.max_ram_gb > 0 ? (uint64_t)(m_cfg.max_ram_gb * GiB) : 0,
-                              /*high_frac=*/0.80, /*low_frac=*/0.62);
-        governor.start();
-
-        // Stitch budget split -- mirrors build()'s math (carry ~0 here: no resident dict).
-        const uint64_t unitig_bucket_count =
-            pick_unitig_bucket_count_(m_num_color_classes, total_frag_seq_bytes, m_cfg.max_ram_gb);
-        size_t unitig_ram_budget = SIZE_MAX;
-        uint64_t stitch_splittable = 0;
-        if (m_cfg.max_ram_gb > 0) {
-            const uint64_t total = (uint64_t)(m_cfg.max_ram_gb * GiB);
-            const uint64_t work = (uint64_t)(STITCH_BUDGET_FRAC * total);
-            const uint64_t assemble = stitch_assemble_budget(total);
-            stitch_splittable = work > assemble ? work - assemble : 256ull * 1024 * 1024;
-            const uint64_t est = (uint64_t)(total_frag_seq_bytes * 1.5);
-            unitig_ram_budget = std::min<uint64_t>(est, (uint64_t)(stitch_splittable * 0.4));
-        }
-        auto uwriter = std::make_unique<unitig_bucket_writer>(tmp_dir, m_num_color_classes,
-                                                              unitig_bucket_count, unitig_ram_budget);
-        auto uwriter_reg = governor.add(uwriter.get());
-        uint64_t stitch_ram_cap = 0;
-        if (m_cfg.max_ram_gb > 0)
-            stitch_ram_cap = stitch_splittable > unitig_ram_budget
-                                 ? stitch_splittable - unitig_ram_budget
-                                 : 256ull * 1024 * 1024;
-        const uint64_t stitch_buckets =
-            pick_stitch_buckets_(total_frag_seq_bytes, m_cfg.max_ram_gb, m_cfg.num_threads);
-        std::cout << "  stitch buckets: " << stitch_buckets << ", threads: " << m_cfg.num_threads
-                  << "\n  compact stitch: scalable, RAM-first cap "
-                  << (stitch_ram_cap ? format_bytes(stitch_ram_cap) : std::string("unlimited")) << "\n";
-
-        std::atomic<uint64_t> done{0};
-        // This bar tracks the round-0 SEED's single read of the frag spill (one
-        // tick per fragment); the doubling rounds that follow are reported by the
-        // stitch's own per-round lines. Labeled as the seed so 100% here cannot be
-        // mistaken for "stitch complete" -- it means "spill read, rounds starting".
-        progress prog("stitch seed (read spill)", done, n_frags);
-        auto for_each_frag = [&, first_pass = true](auto&& fn) mutable {
-            frag_unitig_stream_reader rd(frag_path);
-            uint8_t of;
-            std::vector<color_run> runs;
-            std::string seq;
-            const bool count = first_pass;
-            while (rd.next(of, runs, seq)) {
-                fn(of, runs, seq);
-                if (count) done.fetch_add(1, std::memory_order_relaxed);
-            }
-            first_pass = false;
-        };
-        const uint64_t stitch_rss_target =
-            m_cfg.max_ram_gb > 0 ? (uint64_t)(m_cfg.max_ram_gb * GiB) : 0;
-        {
-            phase_rss_marker rss("stitch");
-            timer _("stitch");
-            if (m_cfg.id_only_stitch) {
-                compact_stitch_scalable(for_each_frag, n_frags, m_cfg.k, tmp_dir, std::ref(*uwriter),
-                                        stitch_buckets, /*frag_ranges=*/0, /*chain_buckets=*/0,
-                                        m_cfg.num_threads, links_path, stitch_ram_cap,
-                                        stitch_rss_target, total_frag_seq_bytes);
-            } else {
-                (void)stitch_ram_cap;
-                (void)stitch_rss_target;
-                (void)links_path;
-                stitch_unitigs_extmem_file_streaming(for_each_frag, m_cfg.k, tmp_dir,
-                                                     std::ref(*uwriter), stitch_buckets,
-                                                     /*done=*/nullptr, m_cfg.num_threads);
-            }
-            prog.stop();
-            std::cout << "  unitigs after stitching: " << uwriter->total_unitigs() << "\n";
-            rss.stop();
-        }
-        m_num_unitigs = uwriter->total_unitigs();
-        release_free_heap_to_os_();
-        {
-            phase_rss_marker rss("emit-fasta");
-            emit_fasta(*uwriter, m_cfg.out_basename, m_num_unitigs, m_cfg.max_ram_gb);
-            rss.stop();
-        }
-        std::cout << "  [resume-stitch] color finalize SKIPPED -- <out>.color_sets is NOT valid\n";
-
-        build_timer.stop();
-        m_peak_rss_bytes = process_peak_rss_bytes();
-        std::cout << "[resume-stitch] wrote " << m_cfg.out_basename << ".fa and "
-                  << m_cfg.out_basename << ".u2c (NOT .color_sets)\n"
-                  << "[resume-stitch total] " << build_timer.elapsed() << " s; peak RSS "
-                  << format_bytes(m_peak_rss_bytes) << "\n";
-    }
 
     void validate_and_resolve_config() {
         if (m_cfg.filenames_list.empty()) {
