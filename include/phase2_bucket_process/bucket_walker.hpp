@@ -19,10 +19,12 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <filesystem>
 #include <iostream>
 #include <condition_variable>
 #include <mutex>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -606,7 +608,8 @@ template <typename Sink>
 inline void process_buckets(bucket_writer const& writer, uint32_t k, uint64_t num_colors,
                             uint32_t num_threads, Sink&& sink,
                             streaming_color_set_dict& global_dict, std::mutex& global_mu,
-                            std::atomic<uint64_t>* done = nullptr, uint64_t mem_budget_bytes = 0) {
+                            std::atomic<uint64_t>* done = nullptr, uint64_t mem_budget_bytes = 0,
+                            bool delete_consumed_buckets = false) {
     if (num_threads == 0) num_threads = 1;
     // global_dict is now internally sharded/thread-safe, so the caller's
     // global_mu is no longer used to guard the merge. Kept in the signature
@@ -677,6 +680,14 @@ inline void process_buckets(bucket_writer const& writer, uint32_t k, uint64_t nu
                                        local_dict);
             } catch (std::exception& e) {
                 std::cerr << "error processing bucket " << b << ": " << e.what() << '\n';
+            }
+            // The bucket file is fully consumed by process_bucket; delete it now
+            // so scratch never accumulates all B bucket files at once (at 661k
+            // they total ~500 GiB). Only the frag spill that bucket-process
+            // produces is needed downstream. Gated so --keep-tmp can preserve them.
+            if (delete_consumed_buckets) {
+                std::error_code ec;
+                std::filesystem::remove(writer.bucket_path(b), ec);
             }
             // Release the admitted memory once kmer_info/local_dict for this
             // bucket are gone (they go out of scope at the end of this loop

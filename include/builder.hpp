@@ -57,8 +57,8 @@
 #include "phase1_bucket_write/bucket_ingester.hpp"
 #include "phase2_bucket_process/bucket_walker.hpp"
 #include "phase1_bucket_write/minimizer.hpp"
-#include "phase3_stitch/compact_extmem.hpp"
 #include "phase3_stitch/stitch.hpp"
+#include "phase3_stitch/stitch_extmem.hpp"
 #include "phase2_bucket_process/streaming_color_set_dict.hpp"
 #include "phase2_bucket_process/unitig_spill.hpp"
 #include "phase4_emit/emit.hpp"
@@ -86,7 +86,7 @@ struct builder {
         // so polling during them is pure overhead for no benefit -- it must not
         // slow the fast phases. budget 0 => disabled. Trip a touch below -g
         // (0.80/0.62) so the spill+trim lag on a spinning disk has room before
-        // the hard cap. See ram-governor.md.
+        // the hard cap. See algorithm.md §5.5.
         ram_governor governor(m_cfg.max_ram_gb > 0
                                   ? (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0)
                                   : 0,
@@ -235,11 +235,7 @@ struct builder {
         // is just 16 bytes of metadata; the compressed bit_vector
         // never sits in RAM. EF offsets are appended to the file at
         // finalize().
-        // Emit the companion links spill (boundary k-mers per fragment, in
-        // frag_id order) during bucket-process, so the scalable stitch can seed
-        // from ~1.6 GB of links instead of re-reading the whole frag spill. The
-        // links file is a small disk-only cost that never counts against -g.
-        frag_unitig_writer frag_sink(tmp_dir + "/frag_unitigs.bin", m_cfg.k);
+        frag_unitig_writer frag_sink(tmp_dir + "/frag_unitigs.bin");
         streaming_color_set_dict global_dict(m_num_colors, m_cfg.out_basename + ".color_sets");
         std::mutex global_mu;
         {
@@ -270,7 +266,8 @@ struct builder {
                 }
                 global_dict.set_dedup_budget(dedup_budget);
                 process_buckets(*writer, m_cfg.k, m_num_colors, m_cfg.num_threads, frag_sink,
-                                global_dict, global_mu, &done, bp_budget);
+                                global_dict, global_mu, &done, bp_budget,
+                                /*delete_consumed_buckets=*/!m_cfg.keep_tmp);
                 prog.stop();
                 std::cout << "  bucket fragments: " << frag_sink.count() << "\n";
                 std::cout << "  distinct color classes: " << global_dict.size() << "\n";
@@ -334,40 +331,15 @@ struct builder {
                 const uint64_t unitig_bucket_count = pick_unitig_bucket_count_(
                     m_num_color_classes, total_frag_seq_bytes, m_cfg.max_ram_gb);
 
-                // Stitch's whole working-RAM share of -g is STITCH_BUDGET_FRAC*g;
-                // the remaining (1-frac)*g is HEADROOM for glibc arena retention +
-                // scratch (which scale with thread churn, not with -g). EVERYTHING
-                // the phase allocates is sized to sum within the working share:
-                //   work = unitig_ram_budget + stitch_ram_cap + assemble_transient
-                // so they cannot co-peak past -g. (This replaces the old fixed 2 GiB
-                // "carry" reserve, which didn't scale with -g and left the assemble
-                // transient + glibc to pile on TOP of the budget -- the 100k/-g16
-                // overshoot.) The color dict is freed before stitch (carry ~0), but
-                // we subtract it if still resident.
-                //
-                // In-RAM unitig output budget: keeping stitched unitigs in memory
-                // skips the temp-bucket write here AND the read-back in emit (~half
-                // of emit on a spinning disk). Stitching only merges fragments, so
-                // total unitig bases <= total_frag_seq_bytes; budget at ~1.5x for
-                // std::string/vector overhead, but never more than 40% of the
-                // splittable share. No -g => SIZE_MAX (keep every unitig in RAM); the
-                // writer spills its largest buckets when the budget is exceeded.
+                // The write-through unitig_bucket_writer only needs to know
+                // "finite (=> write-through, under -g)" vs "SIZE_MAX (=> keep in
+                // RAM, no -g)". No -g => SIZE_MAX (keep every unitig in RAM, skip
+                // the temp round-trip); under -g => a finite budget so the writer
+                // streams every unitig straight to its bucket file.
                 size_t unitig_ram_budget = SIZE_MAX;
-                uint64_t stitch_splittable = 0;  // work for unitig writer + stores
-                if (m_cfg.max_ram_gb > 0) {
-                    const uint64_t total = m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0;
-                    const uint64_t carry = global_dict.resident_bytes();  // ~0 post-release
-                    uint64_t work = (uint64_t)(STITCH_BUDGET_FRAC * total);
-                    work = work > carry ? work - carry : 256ull * 1024 * 1024;
-                    // Reserve the non-spillable phase-3 assemble transient FIRST, so
-                    // unitig + stores + transient all fit inside `work` (chain_buckets
-                    // bounds the real set to exactly stitch_assemble_budget).
-                    const uint64_t assemble = stitch_assemble_budget(total);
-                    stitch_splittable = work > assemble ? work - assemble : 256ull * 1024 * 1024;
-                    const uint64_t est = (uint64_t)(total_frag_seq_bytes * 1.5);
-                    unitig_ram_budget =
-                        std::min<uint64_t>(est, (uint64_t)(stitch_splittable * 0.4));
-                }
+                if (m_cfg.max_ram_gb > 0)
+                    unitig_ram_budget = (size_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0 *
+                                                 STITCH_BUDGET_FRAC);
                 uwriter_ptr = std::make_unique<unitig_bucket_writer>(
                     tmp_dir, m_num_color_classes, unitig_bucket_count, unitig_ram_budget);
                 // Govern the unitig writer for the stitch's duration: under -g
@@ -393,36 +365,6 @@ struct builder {
                 // RNG), so this fans out cleanly. Output is unchanged --
                 // emit_fasta sorts each cid-bucket, so .fa is identical
                 // regardless of which thread emitted which unitig.
-                // GGCAT-style id-only compaction on a single, always-on-disk
-                // path: the doubling carries only fragment-id chains; bases +
-                // colors are assembled at the end through an on-disk re-bucket.
-                // The stores are RAM-FIRST: round store, member, and base
-                // records stay in RAM up to a -g-derived cap and spill only the
-                // overflow to disk. So when the working set fits, the whole
-                // stitch runs in RAM (no disk round-trip); when it does not, it
-                // degrades to disk and the -g bound is honored at all costs.
-                // Round 0 seeds from the precomputed links spill (boundary
-                // k-mers, ~17 B/fragment), not a second full frag-spill read.
-                //
-                // The stores get whatever of the splittable share the unitig writer
-                // didn't take, so unitig_writer + stores = stitch_splittable (and,
-                // with the assemble transient reserved out above, the three sum to
-                // STITCH_BUDGET_FRAC*g). 0 means no -g => use all RAM.
-                uint64_t stitch_ram_cap = 0;
-                if (m_cfg.max_ram_gb > 0) {
-                    stitch_ram_cap = stitch_splittable > unitig_ram_budget
-                                         ? stitch_splittable - unitig_ram_budget
-                                         : 256ull * 1024 * 1024;
-                }
-                std::cout << "  compact stitch: scalable, RAM-first cap "
-                          << (stitch_ram_cap ? format_bytes(stitch_ram_cap)
-                                             : std::string("unlimited"))
-                          << "\n";
-                // The two NON-spillable stitch fan-out knobs -- frag_ranges
-                // (phase-2 member array) and chain_buckets (phase-3 assemble set)
-                // -- are sized from -g INSIDE compact_stitch_scalable, next to the
-                // structures they bound. The orchestrator only carves the budget
-                // (stitch_ram_cap, the -g target) and hands it down.
                 auto for_each_frag = [&, first_pass = true](auto&& fn) mutable {
                     frag_unitig_stream_reader rd(frag_sink.path());
                     uint8_t of;
@@ -435,26 +377,24 @@ struct builder {
                     }
                     first_pass = false;
                 };
-                // Hard -g target for the stitch's measured-RSS backstop (0 = no
-                // -g): the payload-model cap (stitch_ram_cap) undercounts real
-                // RSS, so the watcher force-spills the stores when live RSS
-                // crosses the budget, keeping the whole process within -g.
-                const uint64_t stitch_rss_target =
-                    m_cfg.max_ram_gb > 0
-                        ? (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0)
-                        : 0;
-                compact_stitch_scalable(for_each_frag, n_frags, m_cfg.k, tmp_dir,
-                                        std::ref(*uwriter_ptr), stitch_buckets,
-                                        /*frag_ranges=*/0, /*chain_buckets=*/0, m_cfg.num_threads,
-                                        frag_sink.links_path(), stitch_ram_cap, stitch_rss_target,
-                                        total_frag_seq_bytes);
+                // Base-carrying: assemble unitig sequences IN the doubling rounds
+                // from a single frag-spill read, through an always-on-disk round
+                // store (one bucket per thread resident). The proven README path:
+                // 661k in ~3.5h at ~41 GiB, within -g. -g is held by keeping little
+                // in RAM + the bucket-count sizing; the governor still backstops the
+                // unitig writer. `done` is driven by for_each_frag's first-pass
+                // count, so the stitch takes nullptr.
+                stitch_unitigs_extmem_file_streaming(for_each_frag, m_cfg.k, tmp_dir,
+                                                     std::ref(*uwriter_ptr), stitch_buckets,
+                                                     /*done=*/nullptr, m_cfg.num_threads);
                 prog.stop();
                 std::cout << "  unitigs after stitching: " << uwriter_ptr->total_unitigs() << "\n";
             }
             rss.stop();
         }
-        // Spill file no longer needed; safe to unlink.
-        frag_sink.unlink();
+        // Spill file no longer needed; safe to unlink (kept under --keep-tmp for
+        // debugging).
+        if (!m_cfg.keep_tmp) frag_sink.unlink();
         m_num_unitigs = uwriter_ptr->total_unitigs();
 
         // Stitch allocates large transient buffers that are freed when it
@@ -477,11 +417,14 @@ struct builder {
             rss.stop();
         }
 
-        // Remove the scratch dir and everything under it.
-        {
+        // Remove the scratch dir and everything under it (unless --keep-tmp,
+        // which preserves the scratch dir for debugging).
+        if (!m_cfg.keep_tmp) {
             timer _("removing tmp files");
             std::error_code ec;
             std::filesystem::remove_all(tmp_dir, ec);
+        } else {
+            std::cout << "  --keep-tmp: leaving scratch dir " << tmp_dir << " in place\n";
         }
 
         // Peak resident set size across the whole build, as tracked by

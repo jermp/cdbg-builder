@@ -3,10 +3,11 @@
 // External-memory cross-bucket stitch via GGCAT-style hash-bucketed
 // iterative doubling.
 //
-// NOTE: this is no longer the production stitch -- the builder uses the
-// id-only compaction stitch in compact_extmem.hpp. This base-carrying
-// implementation is retained as the independent reference oracle that
-// test_stitch cross-checks the production path against.
+// The production stitch is stitch_unitigs_extmem_file_streaming (below): the
+// base-carrying, streaming-seed path the builder drives from the frag spill.
+// The random-access variants stitch_unitigs_extmem / _file in this file are
+// retained as independent reference oracles that test_stitch cross-checks
+// against.
 //
 // It supersedes the in-RAM stitch (stitch.hpp), whose by_junction map + adj
 // array + visited array are all O(num_fragments) resident -- hundreds of
@@ -844,10 +845,16 @@ inline void ext_run_rounds(Store& store, uint32_t k, uint32_t num_buckets, Sink&
         store.advance();
         const uint64_t joined = joined_this_round.load(std::memory_order_relaxed);
         ++rounds_run;
-        {
-            t_r0.stop();
-            if (round_no < 5) early_secs += t_r0.elapsed();
-        }
+        t_r0.stop();
+        if (round_no < 5) early_secs += t_r0.elapsed();
+        // Live per-round progress: the resume path's fragment-counted progress bar
+        // saturates at 100% the moment the round-0 seed finishes reading the spill
+        // and then says nothing for the whole doubling phase (the real work). One
+        // concise line per round (O(log L) rounds, ~33 at 661k) gives a real
+        // signal -- the round index advances and `joined` falls toward 0, which is
+        // the termination condition -- so a long run is never flying blind.
+        std::cout << "  [stitch] round " << round_no << ": joined=" << joined << ", "
+                  << t_r0.elapsed() << "s\n";
 #ifdef CDGB_STITCH_DEBUG
         std::cerr << "[ext-stitch round " << round_no << "] joined=" << joined << "\n";
 #endif
@@ -942,10 +949,9 @@ inline void stitch_unitigs_extmem(Source& frag, uint32_t k, Sink&& sink, uint32_
 // External-memory stitch with FILE-backed round storage, RANDOM-ACCESS source.
 // Peak RAM is one round-store bucket's tigs at a time (plus per-bucket write
 // batches), independent of fragment count -- EXCEPT that a random-access Source
-// (e.g. frag_unitig_reader) may itself hold an O(num_fragments) index. This
-// path is no longer used in production (the builder uses compact_stitch_scalable
-// in compact_extmem.hpp); it is retained as the independent reference oracle for
-// test_stitch (vector_frag_source).
+// may itself hold an O(num_fragments) index. This path is not used in
+// production (the builder uses the streaming variant below); it is retained as
+// the independent reference oracle for test_stitch (vector_frag_source).
 template <typename Source, typename Sink>
 inline void stitch_unitigs_extmem_file(Source& frag, uint32_t k, std::string const& tmp_dir,
                                        Sink&& sink, uint32_t num_buckets,
@@ -954,6 +960,53 @@ inline void stitch_unitigs_extmem_file(Source& frag, uint32_t k, std::string con
     if (num_buckets == 0) num_buckets = 1024;
     detail::round_store_file store(tmp_dir, num_buckets);
     detail::ext_seed_round0(frag, k, store, sink, done);
+    detail::ext_run_rounds(store, k, num_buckets, sink, done, num_threads);
+}
+
+namespace detail {
+
+// Streaming seed: feed a re-invocable for_each_frag(fn) -- the builder's frag
+// spill reader -- into round 0 instead of the random-access Source the indexed
+// seed needs. The builder dropped the O(num_fragments) frag index (RAM), so this
+// is the only way to drive the base-carrying stitch from the production frag
+// spill. fn is called as fn(uint8_t open_flags, std::vector<color_run>& runs,
+// std::string& seq) per fragment, in frag_id order (one read of the spill).
+template <typename ForEachFrag, typename Store, typename Sink>
+inline void ext_seed_round0_streaming(ForEachFrag&& for_each_frag, uint32_t k, Store& store,
+                                      Sink&& sink, std::atomic<uint64_t>* done) {
+    for_each_frag([&](uint8_t open_flags, std::vector<color_run>& runs, std::string& seq) {
+        ext_tig t;
+        t.runs = runs;
+        t.open_flags = open_flags;
+        t.seq.assign(seq.data(), seq.size());
+        ext_seed_one(std::move(t), k, store, sink, done);
+    });
+    store.advance();  // round-0 emissions become round-1 input
+}
+
+}  // namespace detail
+
+// Base-carrying external-memory stitch driven by a STREAMING frag source -- the
+// production path the builder uses for the fast (assemble-in-rounds) stitch.
+// Reads the frag spill ONCE (round-0 seed) and grows the unitig sequences in
+// place through the doubling rounds.
+//
+// The round store is the always-on-disk round_store_file: peak RAM is one
+// round-store bucket's tigs per in-flight thread (independent of fragment
+// count), bounded by num_buckets which the caller sizes from -g. This is the
+// proven README path (661k completes in ~3.5h at ~41 GiB, within -g 64). It
+// honors -g by keeping little in RAM rather than by spilling on demand; an
+// earlier RAM-first hybrid store that tried to use more RAM overshot -g and
+// filled the disk at 661k scale, so it was removed.
+template <typename ForEachFrag, typename Sink>
+inline void stitch_unitigs_extmem_file_streaming(ForEachFrag&& for_each_frag, uint32_t k,
+                                                 std::string const& tmp_dir, Sink&& sink,
+                                                 uint32_t num_buckets,
+                                                 std::atomic<uint64_t>* done = nullptr,
+                                                 uint32_t num_threads = 1) {
+    if (num_buckets == 0) num_buckets = 1024;
+    detail::round_store_file store(tmp_dir, num_buckets);
+    detail::ext_seed_round0_streaming(for_each_frag, k, store, sink, done);
     detail::ext_run_rounds(store, k, num_buckets, sink, done, num_threads);
 }
 

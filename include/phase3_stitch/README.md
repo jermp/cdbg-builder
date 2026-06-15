@@ -2,19 +2,18 @@
 
 Glue the open-ended fragments from Phase 2 into maximal unitigs across bucket
 boundaries, by matching the **full boundary k-mer** the two sides share. Uses
-GGCAT-style hash-bucketed iterative doubling in an **id-only** form: the rounds
-carry only fragment-**id** chains (no bases, no colors), so they are cheap; the
-bases+colors of each closed chain are assembled exactly **once** at the end.
-Internal steps (logged as `seed` / `rounds` / `phase2` / `phase3`) are
-sub-steps of this single pipeline phase, **not** the four top-level phases. All
-working stores are RAM-first with spill-to-disk overflow, so the phase honors
-`-g` at all costs.
+GGCAT-style hash-bucketed iterative doubling in a **base-carrying** form: each
+round carries the growing unitig sequences (and their color runs) and grows them
+in place as fragments join. Internal steps (logged as `seed` / `rounds`) are
+sub-steps of this single pipeline phase, **not** the four top-level phases. The
+round store is always on disk (one bucket's tigs per in-flight thread resident),
+so the phase honors `-g` by keeping little in RAM rather than by spilling on
+demand.
 
 See `algorithm.md` §5 for the full description.
 
 ## Input
-- `tmp/frag_unitigs.bin.links` — to seed round 0 (boundary k-mers).
-- `tmp/frag_unitigs.bin` — streamed once, to attach bases+colors during assembly.
+- `tmp/frag_unitigs.bin` — streamed once (round-0 seed), carrying bases + colors.
 
 ## Output
 - `tmp/unitig_bucket_<k>.bin`, `k ∈ [0, K)` — **finished, monochromatic**
@@ -25,6 +24,5 @@ See `algorithm.md` §5 for the full description.
 ## Files
 | file | role |
 |---|---|
-| `compact_extmem.hpp` | **production stitch**: id-only doubling join + base/color assembly (RAM-first, spill-to-disk) |
+| `stitch_extmem.hpp` | **production stitch**: base-carrying external-memory streaming doubling (`stitch_unitigs_extmem_file_streaming`); the random-access `stitch_unitigs_extmem` / `_file` variants are kept as `test_stitch`'s independent reference oracles |
 | `stitch.hpp` | shared stitch helpers (side tags, junction k-mers, frag source) |
-| `stitch_extmem.hpp` | base-carrying external-memory stitch; **retired from the build**, kept as `test_stitch`'s independent reference oracle |
