@@ -93,7 +93,7 @@ struct builder {
         // so polling during them is pure overhead for no benefit -- it must not
         // slow the fast phases. budget 0 => disabled. Trip a touch below -g
         // (0.80/0.62) so the spill+trim lag on a spinning disk has room before
-        // the hard cap. See ram-governor.md.
+        // the hard cap. See algorithm.md §5.6.
         ram_governor governor(m_cfg.max_ram_gb > 0
                                   ? (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0)
                                   : 0,
