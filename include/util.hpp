@@ -57,24 +57,8 @@ struct build_config {
     // budget is a soft target, not a hard cap).
     double max_ram_gb = 0.0;
     bool verbose = false;
-    // Benchmark/recovery: skip bucket-write + bucket-process and run stitch
-    // (+ emit_fasta) from an existing `tmp_dir/frag_unitigs.bin` left by a
-    // killed run. Times the stitch; does NOT finalize <out>.color_sets (its
-    // streaming state died with the original process). Requires -d.
-    bool resume_stitch = false;
-    // Do not remove tmp_dir on success (keeps the frag spill so a later
-    // --resume-stitch can reuse it; also for debugging).
+    // Do not remove tmp_dir on success (keeps the scratch dir for debugging).
     bool keep_tmp = false;
-    // Stitch algorithm selector. DEFAULT (false) = base-carrying: assembles
-    // unitig sequences IN the doubling rounds from a single frag-spill read,
-    // through an always-on-disk round store (one bucket per thread resident).
-    // This is the proven README path -- 661k completes in ~3.5h at ~41 GiB peak,
-    // within -g 64. Set true (--id-only-stitch) for the id-only (GGCAT-style)
-    // stitch, which carries only fragment-id chains and defers base/color
-    // assembly to an on-disk re-bucket: it HARD-enforces an arbitrarily tight -g
-    // but is ~3x slower at 661k. Use it when the base-carrying ~41 GiB peak would
-    // not fit a tighter -g.
-    bool id_only_stitch = false;
 };
 
 // ---- timer ------------------------------------------------------------------

@@ -3,10 +3,11 @@
 // External-memory cross-bucket stitch via GGCAT-style hash-bucketed
 // iterative doubling.
 //
-// NOTE: this is no longer the production stitch -- the builder uses the
-// id-only compaction stitch in compact_extmem.hpp. This base-carrying
-// implementation is retained as the independent reference oracle that
-// test_stitch cross-checks the production path against.
+// The production stitch is stitch_unitigs_extmem_file_streaming (below): the
+// base-carrying, streaming-seed path the builder drives from the frag spill.
+// The random-access variants stitch_unitigs_extmem / _file in this file are
+// retained as independent reference oracles that test_stitch cross-checks
+// against.
 //
 // It supersedes the in-RAM stitch (stitch.hpp), whose by_junction map + adj
 // array + visited array are all O(num_fragments) resident -- hundreds of
@@ -948,10 +949,9 @@ inline void stitch_unitigs_extmem(Source& frag, uint32_t k, Sink&& sink, uint32_
 // External-memory stitch with FILE-backed round storage, RANDOM-ACCESS source.
 // Peak RAM is one round-store bucket's tigs at a time (plus per-bucket write
 // batches), independent of fragment count -- EXCEPT that a random-access Source
-// (e.g. frag_unitig_reader) may itself hold an O(num_fragments) index. This
-// path is no longer used in production (the builder uses compact_stitch_scalable
-// in compact_extmem.hpp); it is retained as the independent reference oracle for
-// test_stitch (vector_frag_source).
+// may itself hold an O(num_fragments) index. This path is not used in
+// production (the builder uses the streaming variant below); it is retained as
+// the independent reference oracle for test_stitch (vector_frag_source).
 template <typename Source, typename Sink>
 inline void stitch_unitigs_extmem_file(Source& frag, uint32_t k, std::string const& tmp_dir,
                                        Sink&& sink, uint32_t num_buckets,
@@ -987,10 +987,9 @@ inline void ext_seed_round0_streaming(ForEachFrag&& for_each_frag, uint32_t k, S
 }  // namespace detail
 
 // Base-carrying external-memory stitch driven by a STREAMING frag source -- the
-// production path the builder uses for the fast (assemble-in-rounds) stitch
-// without the deferred attach/assemble re-bucketing of the id-only path. Reads
-// the frag spill ONCE (round-0 seed) and grows the unitig sequences in place
-// through the doubling rounds.
+// production path the builder uses for the fast (assemble-in-rounds) stitch.
+// Reads the frag spill ONCE (round-0 seed) and grows the unitig sequences in
+// place through the doubling rounds.
 //
 // The round store is the always-on-disk round_store_file: peak RAM is one
 // round-store bucket's tigs per in-flight thread (independent of fragment

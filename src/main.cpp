@@ -51,20 +51,8 @@ bool parse_args(int argc, char** argv, cdbg::build_config& cfg) {
                " Smaller -> larger B but weaker dedup / bigger bucket files.",
                "--spill", false);
     parser.add("verbose", "Verbose output.", "--verbose", false, true);
-    parser.add("resume_stitch",
-               "BENCHMARK/RECOVERY: skip bucket-write+process and run stitch (+emit_fasta) from an "
-               "existing -d <tmp_dir>/frag_unitigs.bin left by a killed run. Times the stitch; does "
-               "NOT finalize <out>.color_sets. Requires -d; -i is ignored.",
-               "--resume-stitch", false, true);
-    parser.add("keep_tmp", "Do not delete -d <tmp_dir> on success (keeps frag spill for --resume-stitch).",
+    parser.add("keep_tmp", "Do not delete -d <tmp_dir> on success (keeps scratch for debugging).",
                "--keep-tmp", false, true);
-    parser.add("id_only_stitch",
-               "Use the id-only (GGCAT-style) stitch, which carries only fragment-id chains "
-               "and defers base/color assembly to an on-disk re-bucket so it HARD-enforces an "
-               "arbitrarily tight -g (but is ~3x slower at 661k). Default is the base-carrying "
-               "stitch (assembles in the doubling rounds, ~41 GiB peak at 661k). Use this only "
-               "when the base-carrying peak would not fit your -g.",
-               "--id-only-stitch", false, true);
 
     if (!parser.parse()) return false;
 
@@ -81,9 +69,7 @@ bool parse_args(int argc, char** argv, cdbg::build_config& cfg) {
     if (parser.parsed("flush_bases")) cfg.flush_bases = parser.get<uint64_t>("flush_bases");
     if (parser.parsed("spill_bytes")) cfg.spill_bytes = parser.get<uint64_t>("spill_bytes");
     if (parser.parsed("verbose")) cfg.verbose = parser.get<bool>("verbose");
-    if (parser.parsed("resume_stitch")) cfg.resume_stitch = parser.get<bool>("resume_stitch");
     if (parser.parsed("keep_tmp")) cfg.keep_tmp = parser.get<bool>("keep_tmp");
-    if (parser.parsed("id_only_stitch")) cfg.id_only_stitch = parser.get<bool>("id_only_stitch");
     return true;
 }
 

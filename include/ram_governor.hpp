@@ -2,7 +2,7 @@
 
 // ram_governor: one always-on, measured-RSS controller shared by ALL phases.
 //
-// WHY (see algorithm.md §5.6): today each phase predicts its structures' sizes,
+// WHY (see algorithm.md §5.5): today each phase predicts its structures' sizes,
 // sums them, and trusts the model to fit -g. That is fragile -- every new
 // dataset finds a size the model under-counted, a co-peak it didn't expect, or
 // glibc holding freed pages, and -g is silently exceeded. The governor moves
@@ -33,9 +33,10 @@
 //
 // Wired into the build scoped to the stitch phase (constructed at build start,
 // start()ed before stitch) with the unitig writer as its one registered
-// participant; see algorithm.md §5.6. Under the write-through unitig writer
-// (the default), that participant holds ~nothing, so the governor is mainly a
-// backstop for the id-only path's RAM-first stores.
+// participant; see algorithm.md §5.5. Under the write-through unitig writer
+// (the production case under -g), that participant streams unitigs straight to
+// disk, so the governor is a measured-RSS backstop; with no -g the writer keeps
+// unitigs in RAM and the governor can spill its largest buckets under pressure.
 
 #include <algorithm>
 #include <atomic>
