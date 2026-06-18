@@ -383,7 +383,13 @@ private:
 
 // ext_tig (de)serialization for the file-backed round store. Layout:
 //   [u8 open_flags][u64 rng][u32 nruns]{[u64 cid][u32 num_kmers]}*
-//   [u32 seq_len][seq_len bytes ACGT]
+//   [u32 seq_len][ceil(seq_len/4) bytes: 2-bit-packed ACGT]
+// The bases are 2-bit packed (A/C/G/T only -- bucket-write emits ACGT runs),
+// cutting the round-file seq volume ~4x before LZ4. The round I/O is the
+// stitch's dominant cost and LZ4 compresses ACGT ASCII poorly, so the packing
+// is most of the win. (GGCAT carries 2-bit-compressed reads for the same
+// reason; here we pack only at the disk boundary, leaving the in-RAM ext_tig
+// and the join/split logic ASCII and untouched.)
 inline void ext_tig_serialize(ext_tig const& t, std::vector<uint8_t>& out) {
     auto put = [&](void const* p, size_t n) {
         uint8_t const* b = (uint8_t const*)p;
@@ -399,7 +405,12 @@ inline void ext_tig_serialize(ext_tig const& t, std::vector<uint8_t>& out) {
     }
     uint32_t len = (uint32_t)t.seq.size();
     put(&len, sizeof(len));
-    put(t.seq.data(), len);
+    // 2-bit pack the ACGT bases: base i -> bits 2*(i%4) of packed byte i/4.
+    const size_t packed = (size_t)(len + 3) / 4;
+    const size_t off = out.size();
+    out.resize(off + packed, 0);
+    for (uint32_t i = 0; i < len; ++i)
+        out[off + (i >> 2)] |= (uint8_t)(nuc_to_2bit(t.seq[i]) << (2 * (i & 3)));
 }
 
 // Returns bytes consumed, 0 on malformed/EOF.
@@ -426,9 +437,13 @@ inline size_t ext_tig_deserialize(uint8_t const* buf, size_t buf_len, ext_tig& t
     uint32_t len;
     std::memcpy(&len, buf + p, sizeof(len));
     p += sizeof(len);
-    if (buf_len < p + len) return 0;
-    t.seq.assign((char const*)buf + p, len);
-    p += len;
+    const size_t packed = (size_t)(len + 3) / 4;
+    if (buf_len < p + packed) return 0;
+    // Unpack the 2-bit ACGT bases back to an ASCII string (the in-RAM form).
+    t.seq.resize(len);
+    for (uint32_t i = 0; i < len; ++i)
+        t.seq[i] = twobit_to_nuc((uint8_t)((buf[p + (i >> 2)] >> (2 * (i & 3))) & 3));
+    p += packed;
     return p;
 }
 
