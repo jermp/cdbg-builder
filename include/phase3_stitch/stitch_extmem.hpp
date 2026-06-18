@@ -999,6 +999,100 @@ inline void ext_seed_round0_streaming(ForEachFrag&& for_each_frag, uint32_t k, S
     store.advance();  // round-0 emissions become round-1 input
 }
 
+// Parallel producer/consumer round-0 seed. The serial seed above is
+// single-threaded (one stream, all per-fragment CPU on the reader), which makes
+// it the largest single piece of the stitch at scale. Here ONE reader thread
+// drives for_each_frag's serial spill read and hands BATCHES of fragments to
+// `num_threads` workers that do the per-fragment CPU -- boundary-k-mer compute,
+// 2-bit serialize, LZ4, and route into the round store. This overlaps the read
+// with the CPU and fans the dominant cost (LZ4 of the whole round-0 output)
+// across cores.
+//
+// Safety: the base-carrying seed is ORDER-INDEPENDENT (per-tig rng is
+// content-seeded via ext_seed_from_seq; routing is by boundary-k-mer hash), so
+// fragments may be processed in any order. The round store's emit is per-bucket
+// locked (thread-safe); the sink (closed-fragment unitigs) is guarded here.
+// A bounded queue gives backpressure so in-flight RAM stays small. Falls back
+// to the serial seed for num_threads <= 1.
+template <typename ForEachFrag, typename Store, typename Sink>
+inline void ext_seed_round0_streaming_par(ForEachFrag&& for_each_frag, uint32_t k, Store& store,
+                                          Sink&& sink, std::atomic<uint64_t>* done,
+                                          uint32_t num_threads) {
+    if (num_threads <= 1) {
+        ext_seed_round0_streaming(for_each_frag, k, store, sink, done);
+        return;
+    }
+    struct frag_item {
+        uint8_t open_flags;
+        std::vector<color_run> runs;
+        std::string seq;
+    };
+    using batch_t = std::vector<frag_item>;
+    constexpr size_t BATCH = 2048;
+    const size_t MAX_Q = (size_t)num_threads * 3;  // backpressure: bounds in-flight RAM
+
+    std::mutex mu;
+    std::condition_variable cv_items, cv_space;
+    std::vector<batch_t> q;  // seed is order-independent, so LIFO is fine
+    bool reading_done = false;
+
+    // The round store's emit is already per-bucket locked; the sink is not
+    // assumed thread-safe, so guard it (closed fragments only -- a minority).
+    std::mutex sink_mu;
+    auto guarded_sink = [&](stitchable_unitig&& u) {
+        std::lock_guard<std::mutex> lk(sink_mu);
+        sink(std::move(u));
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(num_threads);
+    for (uint32_t w = 0; w < num_threads; ++w) {
+        workers.emplace_back([&]() {
+            for (;;) {
+                batch_t b;
+                {
+                    std::unique_lock<std::mutex> lk(mu);
+                    cv_items.wait(lk, [&] { return !q.empty() or reading_done; });
+                    if (q.empty()) return;  // q empty + reading_done => finished
+                    b = std::move(q.back());
+                    q.pop_back();
+                }
+                cv_space.notify_one();
+                for (auto& it : b) {
+                    ext_tig t;
+                    t.runs = std::move(it.runs);
+                    t.open_flags = it.open_flags;
+                    t.seq = std::move(it.seq);
+                    ext_seed_one(std::move(t), k, store, guarded_sink, done);
+                }
+            }
+        });
+    }
+
+    batch_t cur;
+    cur.reserve(BATCH);
+    for_each_frag([&](uint8_t open_flags, std::vector<color_run>& runs, std::string& seq) {
+        cur.push_back(frag_item{open_flags, runs, seq});
+        if (cur.size() >= BATCH) {
+            std::unique_lock<std::mutex> lk(mu);
+            cv_space.wait(lk, [&] { return q.size() < MAX_Q; });
+            q.push_back(std::move(cur));
+            lk.unlock();
+            cv_items.notify_one();
+            cur.clear();
+            cur.reserve(BATCH);
+        }
+    });
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        if (!cur.empty()) q.push_back(std::move(cur));
+        reading_done = true;
+    }
+    cv_items.notify_all();
+    for (auto& wkr : workers) wkr.join();
+    store.advance();  // round-0 emissions become round-1 input
+}
+
 }  // namespace detail
 
 // Base-carrying external-memory stitch driven by a STREAMING frag source -- the
@@ -1021,7 +1115,7 @@ inline void stitch_unitigs_extmem_file_streaming(ForEachFrag&& for_each_frag, ui
                                                  uint32_t num_threads = 1) {
     if (num_buckets == 0) num_buckets = 1024;
     detail::round_store_file store(tmp_dir, num_buckets);
-    detail::ext_seed_round0_streaming(for_each_frag, k, store, sink, done);
+    detail::ext_seed_round0_streaming_par(for_each_frag, k, store, sink, done, num_threads);
     detail::ext_run_rounds(store, k, num_buckets, sink, done, num_threads);
 }
 
