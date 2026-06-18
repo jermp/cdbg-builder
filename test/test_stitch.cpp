@@ -105,17 +105,27 @@ void run_stitch(which_stitch w, std::vector<stitchable_unitig>& frags, uint32_t 
         std::string dir = std::filesystem::temp_directory_path().string() + "/cdbg_stitch_test_" +
                           std::to_string(::getpid()) + "_" + std::to_string(g_tmp_counter++);
         std::filesystem::create_directories(dir);
-        auto for_each = [&](auto&& fn) {
-            std::vector<cdbg::color_run> runs;
-            std::string seq;
-            for (uint64_t i = 0; i < src.size(); ++i) {
-                std::string_view sv = src.seq_view(i);
-                seq.assign(sv.data(), sv.size());
-                runs = src.runs(i);
-                fn(src.open_flags(i), runs, seq);
+        // Write the fragments to a real frag spill, then drive the streaming
+        // seed from the block-buffered RAW reader -- exercising
+        // frag_unitig_block_reader + frag_record_parse + the parallel raw seed
+        // end-to-end, cross-checked against the random-access oracle.
+        std::string fpath = dir + "/frag.bin";
+        {
+            cdbg::frag_unitig_writer fw(fpath);
+            for (auto const& f : frags) {
+                cdbg::stitchable_unitig u = f;
+                fw(std::move(u));
             }
+            fw.close_for_writing();
+        }
+        auto for_each_raw = [&](auto&& fn) {
+            cdbg::frag_unitig_block_reader rd(fpath);
+            uint8_t const* rec;
+            uint32_t len;
+            while (rd.next_raw(rec, len)) fn(rec, len);
         };
-        cdbg::stitch_unitigs_extmem_file_streaming(for_each, k, dir, sink, /*num_buckets=*/16,
+        cdbg::stitch_unitigs_extmem_file_streaming(for_each_raw, cdbg::frag_record_parse, k, dir,
+                                                   sink, /*num_buckets=*/16,
                                                    /*done=*/nullptr, /*num_threads=*/4);
         std::filesystem::remove_all(dir);
     } else {
