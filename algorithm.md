@@ -683,6 +683,19 @@ then deletes its file. So the resident set at any instant is **one decoded
 bucket per in-flight thread** — `num_threads` co-resident — plus the small
 per-bucket write batches, **independent of the fragment count**.
 
+**2-bit-packed sequences (the round-file encoding).** A tig's bases are the
+bulk of its serialized bytes, so they are **2-bit packed** (A/C/G/T only —
+bucket-write emits ACGT runs) before the LZ4 frame, cutting the round-file
+sequence volume ~4×. This matters because LZ4 compresses ACGT *ASCII* poorly
+(≈1.2× on this data), so the packing — not LZ4 — is what captures the density.
+It lives **only at the disk boundary** (`ext_tig_serialize`/`deserialize`); the
+in-RAM `ext_tig` and the entire join/split logic stay ASCII and untouched, so
+it carries zero algorithmic risk. Since the per-round LZ4+disk round-trip is
+the stitch's dominant cost, this is a pure win: on 100k/`-g 16` it cut the
+stitch ~24% (the rounds ~31%) and round-file writes ~14%, at **zero RAM cost**
+and byte-identical output. (Same idea as GGCAT's 2-bit-compressed reads,
+applied at our disk boundary.)
+
 `pick_stitch_buckets_` sizes the bucket **count** so `num_threads` resident
 buckets fit a `-g` share: `count ≈ total_frag_seq_bytes · OVERHEAD ·
 num_threads / (SHARE · g)` (OVERHEAD ≈ 7, SHARE = 0.5). More buckets → smaller
