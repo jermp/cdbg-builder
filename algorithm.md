@@ -641,12 +641,29 @@ distinct k-mers route to different slots and never false-join — no global
 
 ### 5.1 Step A — seed (round 0)
 
-The seed streams the frag spill (`frag_unitigs.bin`) once, building one tig
-per fragment: `{ seq, runs, open_flags, rng }`, with `rng` content-seeded so
+The seed reads the frag spill (`frag_unitigs.bin`) once, building one tig per
+fragment: `{ seq, runs, open_flags, rng }`, with `rng` content-seeded so
 distinct tigs pick presented ends independently. A closed fragment (no open
 end) is split at its color-run boundaries and sunk immediately as finished
 unitigs; an open one is routed to bucket `H(presented boundary k-mer)`. The
 round-0 emissions become round 1's input.
+
+**Parallel seed (producer/consumer).** The seed was the stitch's single-threaded
+floor — a serial reader doing ~5 `fread`s + a parse + ~2 allocations *per
+fragment* (at 661k, billions of each). It is now split (`ext_seed_round0_raw_par`,
+`frag_unitig_block_reader`): ONE reader thread reads the spill in large blocks
+(one `fread` per 8 MiB, record boundaries by pointer advance — no per-field
+`fread`) and only `memcpy`s each record's **raw bytes** into a worker batch;
+`num_threads` workers then do the per-fragment work — **parse** the raw record
+(`frag_record_parse`, where the `runs`/`seq` allocations land), boundary-k-mer,
+2-bit serialize, LZ4, and route. So both the `fread` calls and the ~2B
+allocations move off the single reader onto the workers. This is safe because
+the base-carrying seed is **order-independent** (content-seeded `rng`, hash
+routing), the round store's `emit` is per-bucket locked, and the sink is guarded;
+a bounded batch queue gives backpressure (small, fixed in-flight RAM). Measured:
+the seed dropped ~270s → ~91s on 100k (and the bigger the input, the larger the
+win — at 661k the seed is the dominant single read). `num_threads <= 1` runs a
+serial raw seed (still block-buffered).
 
 ### 5.2 Step B — base-carrying doubling rounds
 
@@ -1067,7 +1084,7 @@ are independent:
 |---|---|---|
 | bucket-write | T worker threads, one input file each at a time; per-thread per-bucket buffers; per-bucket mutex guards `bucket_compactor` | per-bucket mutex + RSS watcher's `try_spill` sweep |
 | bucket-process | T worker threads pop next bucket from atomic counter; each owns one bucket end-to-end | per-bucket: thread-local; `global_mu` only during local→global merge; `mem_mu`/cv admission gate (§4.9) bounds resident buckets |
-| stitch | seed `T`-way (§5.1); base-carrying doubling rounds `T`-way over independent per-round buckets via a **persistent worker pool** (§5.2), each holding one decoded round-store bucket; monochromatic split drained to the write-through sink | per-bucket waiting-map thread-local; round barrier between rounds (generation-counted, pool reused); sink drained under `sink_mu` |
+| stitch | seed: 1 reader (block reads) + `T` parse/route workers via a bounded queue (§5.1); base-carrying doubling rounds `T`-way over independent per-round buckets via a **persistent worker pool** (§5.2), each holding one decoded round-store bucket; monochromatic split drained to the write-through sink | per-bucket waiting-map thread-local; round barrier between rounds (generation-counted, pool reused); sink drained under `sink_mu` / a seed `sink_mu` |
 | emit | single-threaded | n/a |
 
 Inter-phase: each phase finishes before the next begins. There is no
@@ -1099,7 +1116,7 @@ root. Other shared files live in the phase that primarily owns them.
 | `compact_color_set_dict.hpp`                         | per-bucket color-set dict (hybrid in-memory) |
 | `streaming_color_set_dict.hpp`                       | global color-set dict; writes `.color_sets` |
 | `hybrid_color_sets.hpp`                              | static `encode_one` (sparse/dense/complementary) |
-| `unitig_spill.hpp`                                   | disk-backed frag/unitig sinks (batched write) + streaming frag reader |
+| `unitig_spill.hpp`                                   | disk-backed frag/unitig sinks (batched write) + streaming + block-buffered raw frag readers |
 | **Phase 3 — `include/phase3_stitch/`** | |
 | `stitch_extmem.hpp`                                  | **production stitch**: base-carrying iterative-doubling join (`stitch_unitigs_extmem_file_streaming`); on-disk round store + write-through unitig writer. The random-access `stitch_unitigs_extmem` / `_file` variants are kept as `test_stitch`'s cross-check oracle |
 | `stitch.hpp`                                         | shared stitch helpers (side tags, junction, frag source) |
