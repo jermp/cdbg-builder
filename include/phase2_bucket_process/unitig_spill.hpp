@@ -609,4 +609,114 @@ private:
     std::FILE* m_file = nullptr;
 };
 
+// ----------------------------------------------------------------------------
+// Block-buffered RAW-record reader over a frag spill (drives the parallel seed).
+//
+// The per-field-fread stream reader above costs ~5 stdio calls + a parse + a
+// per-fragment allocation PER fragment, all on one thread -- the serial floor
+// that bottlenecked the parallel round-0 seed (the workers starved). This reader
+// instead reads the spill in large BLOCKS (one fread per block) and yields each
+// complete record as a raw (ptr, len) byte range -- no per-field fread, no
+// parse, no allocation. The seed's reader thread just memcpy's the raw bytes
+// into a worker batch; the PARSE (frag_record_parse) then runs on the worker
+// threads, moving the ~5B fread calls and ~2B allocations off the single reader.
+//
+// The returned ptr is valid only until the next next_raw() (the block may be
+// compacted/refilled), so the consumer must copy the bytes immediately.
+class frag_unitig_block_reader {
+public:
+    explicit frag_unitig_block_reader(std::string path) : m_path(std::move(path)) {
+        m_file = std::fopen(m_path.c_str(), "rb");
+        if (!m_file) throw std::runtime_error("cannot open frag spill: " + m_path);
+        m_buf.resize(BLOCK);
+    }
+    ~frag_unitig_block_reader() {
+        if (m_file) std::fclose(m_file);
+    }
+    frag_unitig_block_reader(frag_unitig_block_reader const&) = delete;
+    frag_unitig_block_reader& operator=(frag_unitig_block_reader const&) = delete;
+
+    // Yield the next complete record's raw bytes. Returns false at clean EOF;
+    // throws on a truncated record.
+    bool next_raw(uint8_t const*& rec, uint32_t& rec_len) {
+        // [u8 flags][u32 nruns] -> 5 bytes to learn nruns.
+        if (!ensure(1 + sizeof(uint32_t))) {
+            if (m_end == m_pos and m_eof) return false;  // clean EOF
+            throw std::runtime_error("truncated frag record header in " + m_path);
+        }
+        uint32_t nruns;
+        std::memcpy(&nruns, m_buf.data() + m_pos + 1, sizeof(nruns));
+        const size_t runs_bytes = (size_t)nruns * (sizeof(uint64_t) + sizeof(uint32_t));
+        const size_t hdr = 1 + sizeof(uint32_t) + runs_bytes + sizeof(uint32_t);
+        if (!ensure(hdr)) throw std::runtime_error("truncated frag record runs in " + m_path);
+        uint32_t seq_len;
+        std::memcpy(&seq_len, m_buf.data() + m_pos + 1 + sizeof(uint32_t) + runs_bytes,
+                    sizeof(seq_len));
+        const size_t total = hdr + seq_len;
+        if (!ensure(total)) throw std::runtime_error("truncated frag record seq in " + m_path);
+        rec = m_buf.data() + m_pos;
+        rec_len = (uint32_t)total;
+        m_pos += total;
+        return true;
+    }
+
+private:
+    static constexpr size_t BLOCK = 8u << 20;  // 8 MiB block
+
+    // Ensure >= n contiguous bytes at m_pos; compact + refill if not (growing the
+    // buffer if a single record exceeds BLOCK). False only if EOF arrives first.
+    bool ensure(size_t n) {
+        if (m_end - m_pos >= n) return true;
+        const size_t rem = m_end - m_pos;
+        if (m_pos != 0) {
+            std::memmove(m_buf.data(), m_buf.data() + m_pos, rem);
+            m_pos = 0;
+            m_end = rem;
+        }
+        if (n > m_buf.size()) m_buf.resize(n);
+        while (m_end < n and not m_eof) {
+            size_t got = std::fread(m_buf.data() + m_end, 1, m_buf.size() - m_end, m_file);
+            if (got == 0) {
+                m_eof = true;
+                break;
+            }
+            m_end += got;
+        }
+        return m_end - m_pos >= n;
+    }
+
+    std::string m_path;
+    std::FILE* m_file = nullptr;
+    std::vector<uint8_t> m_buf;
+    size_t m_pos = 0, m_end = 0;
+    bool m_eof = false;
+};
+
+// Parse one raw frag record (from frag_unitig_writer / frag_unitig_block_reader)
+// into its fields. Format:
+//   [u8 flags][u32 nruns][nruns x (u64 cid + u32 num_kmers)][u32 seq_len][seq]
+// `runs`/`seq` are overwritten. Deliberately a free function so the parallel
+// seed can call it from WORKER threads (the runs/seq allocations land there, not
+// on the single reader).
+inline void frag_record_parse(uint8_t const* rec, uint32_t /*len*/, uint8_t& open_flags,
+                              std::vector<color_run>& runs, std::string& seq) {
+    size_t o = 0;
+    open_flags = rec[o];
+    o += 1;
+    uint32_t nruns;
+    std::memcpy(&nruns, rec + o, sizeof(nruns));
+    o += sizeof(nruns);
+    runs.resize(nruns);
+    for (uint32_t i = 0; i < nruns; ++i) {
+        std::memcpy(&runs[i].cid, rec + o, sizeof(uint64_t));
+        o += sizeof(uint64_t);
+        std::memcpy(&runs[i].num_kmers, rec + o, sizeof(uint32_t));
+        o += sizeof(uint32_t);
+    }
+    uint32_t seq_len;
+    std::memcpy(&seq_len, rec + o, sizeof(seq_len));
+    o += sizeof(seq_len);
+    seq.assign((char const*)rec + o, seq_len);
+}
+
 }  // namespace cdbg

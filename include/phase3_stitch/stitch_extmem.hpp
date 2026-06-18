@@ -980,22 +980,107 @@ inline void stitch_unitigs_extmem_file(Source& frag, uint32_t k, std::string con
 
 namespace detail {
 
-// Streaming seed: feed a re-invocable for_each_frag(fn) -- the builder's frag
-// spill reader -- into round 0 instead of the random-access Source the indexed
-// seed needs. The builder dropped the O(num_fragments) frag index (RAM), so this
-// is the only way to drive the base-carrying stitch from the production frag
-// spill. fn is called as fn(uint8_t open_flags, std::vector<color_run>& runs,
-// std::string& seq) per fragment, in frag_id order (one read of the spill).
-template <typename ForEachFrag, typename Store, typename Sink>
-inline void ext_seed_round0_streaming(ForEachFrag&& for_each_frag, uint32_t k, Store& store,
-                                      Sink&& sink, std::atomic<uint64_t>* done) {
-    for_each_frag([&](uint8_t open_flags, std::vector<color_run>& runs, std::string& seq) {
-        ext_tig t;
-        t.runs = runs;
-        t.open_flags = open_flags;
-        t.seq.assign(seq.data(), seq.size());
-        ext_seed_one(std::move(t), k, store, sink, done);
+// Parallel producer/consumer round-0 seed driven by a RAW-record source. The
+// seed was the stitch's single-threaded floor: a serial reader did ~5 fread
+// calls + a parse + ~2 allocations PER fragment. Here `for_each_raw(fn)` yields
+// each fragment's raw record bytes (fn(uint8_t const* rec, uint32_t len), from a
+// block-buffered reader -- no per-field fread); the reader thread only memcpy's
+// those bytes into a worker batch, and `num_threads` workers do the PARSE (via
+// `parse`, which allocates runs/seq) plus boundary-k-mer compute, 2-bit
+// serialize, LZ4, and route. So both the fread calls and the ~2B allocations
+// move off the single reader onto the workers.
+//
+// Safety: the base-carrying seed is ORDER-INDEPENDENT (per-tig rng is
+// content-seeded; routing is by boundary-k-mer hash), so fragments may be
+// processed in any order. The round store's emit is per-bucket locked; the sink
+// is guarded here. A bounded queue gives backpressure. num_threads <= 1 runs a
+// serial raw seed (still block-buffered, just no workers).
+template <typename ForEachRaw, typename ParseFn, typename Store, typename Sink>
+inline void ext_seed_round0_raw_par(ForEachRaw&& for_each_raw, ParseFn&& parse, uint32_t k,
+                                    Store& store, Sink&& sink, std::atomic<uint64_t>* done,
+                                    uint32_t num_threads) {
+    if (num_threads <= 1) {
+        for_each_raw([&](uint8_t const* rec, uint32_t len) {
+            ext_tig t;
+            uint8_t of;
+            parse(rec, len, of, t.runs, t.seq);
+            t.open_flags = of;
+            ext_seed_one(std::move(t), k, store, sink, done);
+        });
+        store.advance();
+        return;
+    }
+    // A batch is a flat copy of several raw records + their (offset, len). The
+    // reader fills it (cheap memcpy, no parse/alloc); a worker parses each.
+    struct raw_batch {
+        std::vector<uint8_t> bytes;
+        std::vector<std::pair<uint32_t, uint32_t>> recs;  // (offset, len)
+    };
+    constexpr size_t BATCH_BYTES = 1u << 20;  // ~1 MiB of raw records per batch
+    const size_t MAX_Q = (size_t)num_threads * 3;  // backpressure: bounds in-flight RAM
+
+    std::mutex mu;
+    std::condition_variable cv_items, cv_space;
+    std::vector<raw_batch> q;  // seed is order-independent, so LIFO is fine
+    bool reading_done = false;
+
+    // The round store's emit is already per-bucket locked; the sink is not
+    // assumed thread-safe, so guard it (closed fragments only -- a minority).
+    std::mutex sink_mu;
+    auto guarded_sink = [&](stitchable_unitig&& u) {
+        std::lock_guard<std::mutex> lk(sink_mu);
+        sink(std::move(u));
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(num_threads);
+    for (uint32_t w = 0; w < num_threads; ++w) {
+        workers.emplace_back([&]() {
+            for (;;) {
+                raw_batch b;
+                {
+                    std::unique_lock<std::mutex> lk(mu);
+                    cv_items.wait(lk, [&] { return !q.empty() or reading_done; });
+                    if (q.empty()) return;  // q empty + reading_done => finished
+                    b = std::move(q.back());
+                    q.pop_back();
+                }
+                cv_space.notify_one();
+                for (auto const& r : b.recs) {
+                    ext_tig t;
+                    uint8_t of;
+                    parse(b.bytes.data() + r.first, r.second, of, t.runs, t.seq);
+                    t.open_flags = of;
+                    ext_seed_one(std::move(t), k, store, guarded_sink, done);
+                }
+            }
+        });
+    }
+
+    raw_batch cur;
+    cur.bytes.reserve(BATCH_BYTES + 4096);
+    for_each_raw([&](uint8_t const* rec, uint32_t len) {
+        const uint32_t off = (uint32_t)cur.bytes.size();
+        cur.bytes.insert(cur.bytes.end(), rec, rec + len);
+        cur.recs.emplace_back(off, len);
+        if (cur.bytes.size() >= BATCH_BYTES) {
+            std::unique_lock<std::mutex> lk(mu);
+            cv_space.wait(lk, [&] { return q.size() < MAX_Q; });
+            q.push_back(std::move(cur));
+            lk.unlock();
+            cv_items.notify_one();
+            cur.bytes.clear();
+            cur.recs.clear();
+            cur.bytes.reserve(BATCH_BYTES + 4096);
+        }
     });
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        if (!cur.recs.empty()) q.push_back(std::move(cur));
+        reading_done = true;
+    }
+    cv_items.notify_all();
+    for (auto& wkr : workers) wkr.join();
     store.advance();  // round-0 emissions become round-1 input
 }
 
@@ -1013,15 +1098,19 @@ inline void ext_seed_round0_streaming(ForEachFrag&& for_each_frag, uint32_t k, S
 // honors -g by keeping little in RAM rather than by spilling on demand; an
 // earlier RAM-first hybrid store that tried to use more RAM overshot -g and
 // filled the disk at 661k scale, so it was removed.
-template <typename ForEachFrag, typename Sink>
-inline void stitch_unitigs_extmem_file_streaming(ForEachFrag&& for_each_frag, uint32_t k,
-                                                 std::string const& tmp_dir, Sink&& sink,
+// `for_each_raw(fn)` yields each fragment's raw record bytes via fn(uint8_t
+// const* rec, uint32_t len) (a block-buffered reader); `parse` decodes one raw
+// record into (open_flags, runs, seq). Splitting read from parse lets the
+// round-0 seed parse on worker threads (see ext_seed_round0_raw_par).
+template <typename ForEachRaw, typename ParseFn, typename Sink>
+inline void stitch_unitigs_extmem_file_streaming(ForEachRaw&& for_each_raw, ParseFn&& parse,
+                                                 uint32_t k, std::string const& tmp_dir, Sink&& sink,
                                                  uint32_t num_buckets,
                                                  std::atomic<uint64_t>* done = nullptr,
                                                  uint32_t num_threads = 1) {
     if (num_buckets == 0) num_buckets = 1024;
     detail::round_store_file store(tmp_dir, num_buckets);
-    detail::ext_seed_round0_streaming(for_each_frag, k, store, sink, done);
+    detail::ext_seed_round0_raw_par(for_each_raw, parse, k, store, sink, done, num_threads);
     detail::ext_run_rounds(store, k, num_buckets, sink, done, num_threads);
 }
 

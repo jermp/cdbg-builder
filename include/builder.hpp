@@ -365,27 +365,28 @@ struct builder {
                 // RNG), so this fans out cleanly. Output is unchanged --
                 // emit_fasta sorts each cid-bucket, so .fa is identical
                 // regardless of which thread emitted which unitig.
-                auto for_each_frag = [&, first_pass = true](auto&& fn) mutable {
-                    frag_unitig_stream_reader rd(frag_sink.path());
-                    uint8_t of;
-                    std::vector<color_run> runs;
-                    std::string seq;
-                    const bool count = first_pass;
-                    while (rd.next(of, runs, seq)) {
-                        fn(of, runs, seq);
-                        if (count) done.fetch_add(1, std::memory_order_relaxed);
+                // Yield each fragment's RAW record bytes via a block-buffered
+                // reader (one fread per block, no per-field fread); the seed
+                // parses them on worker threads. `done` (the progress bar) is
+                // ticked once per record here on the reader thread.
+                auto for_each_raw = [&](auto&& fn) {
+                    frag_unitig_block_reader rd(frag_sink.path());
+                    uint8_t const* rec;
+                    uint32_t len;
+                    while (rd.next_raw(rec, len)) {
+                        fn(rec, len);
+                        done.fetch_add(1, std::memory_order_relaxed);
                     }
-                    first_pass = false;
                 };
                 // Base-carrying: assemble unitig sequences IN the doubling rounds
                 // from a single frag-spill read, through an always-on-disk round
                 // store (one bucket per thread resident). The proven README path:
                 // 661k in ~3.5h at ~41 GiB, within -g. -g is held by keeping little
                 // in RAM + the bucket-count sizing; the governor still backstops the
-                // unitig writer. `done` is driven by for_each_frag's first-pass
-                // count, so the stitch takes nullptr.
-                stitch_unitigs_extmem_file_streaming(for_each_frag, m_cfg.k, tmp_dir,
-                                                     std::ref(*uwriter_ptr), stitch_buckets,
+                // unitig writer. `done` is driven by for_each_raw above, so the
+                // stitch takes nullptr.
+                stitch_unitigs_extmem_file_streaming(for_each_raw, frag_record_parse, m_cfg.k,
+                                                     tmp_dir, std::ref(*uwriter_ptr), stitch_buckets,
                                                      /*done=*/nullptr, m_cfg.num_threads);
                 prog.stop();
                 std::cout << "  unitigs after stitching: " << uwriter_ptr->total_unitigs() << "\n";
