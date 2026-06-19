@@ -66,20 +66,10 @@ inline void emit_super_kmers(uint8_t const* bases, uint32_t L, uint32_t k, uint3
     // LOW bits, which stay uniform even when the magnitude is skewed.
     auto bucket_of = [&](uint64_t h) -> uint32_t { return (uint32_t)((h >> 1) % num_buckets); };
 
-    uint64_t fwd = 0, rc = 0;
-    if (!nthash_init(bases, m, fwd, rc)) return;  // run is ACGT-only, shouldn't happen
-
+    // O(1)-space sliding-window minimizer: it owns the ntHash roll and re-scans
+    // on expiry (no ring buffer, no modulo). init() covers (k-1)-mer 0's window.
     windowed_min mq;
-    mq.reset((int32_t)W);
-    mq.push(canonical_mhash(fwd, rc), 0);
-
-    // Fill the first (k-1)-mer's window: m-mers at positions 0..k-m-1.
-    for (uint32_t i = 1; i < k - m; ++i) {
-        uint8_t out_b = bases[i - 1];
-        uint8_t in_b = bases[i + m - 1];
-        nthash_roll(out_b, in_b, m, fwd, rc);
-        mq.push(canonical_mhash(fwd, rc), (int32_t)i);
-    }
+    if (!mq.init(bases, m, (int32_t)W)) return;  // run is ACGT-only, shouldn't happen
 
     uint32_t run_a = 0;  // first (k-1)-mer index of the running minimizer block
     bool is_first_super = true;
@@ -114,12 +104,7 @@ inline void emit_super_kmers(uint8_t const* bases, uint32_t L, uint32_t k, uint3
     // the ending super A owns its last X iff mA < mB; the starting super B owns
     // its first X iff mB < mA. (mA != mB at a split, so exactly one owns it.)
     for (uint32_t j = 1; j <= K; ++j) {
-        uint32_t mpos = j + k - m - 1;  // rightmost m-mer of (k-1)-mer j
-        uint8_t out_b = bases[mpos - 1];
-        uint8_t in_b = bases[mpos + m - 1];
-        nthash_roll(out_b, in_b, m, fwd, rc);
-        mq.push(canonical_mhash(fwd, rc), (int32_t)mpos);
-
+        mq.advance();  // slide to (k-1)-mer j's window (rightmost m-mer j+k-m-1)
         uint64_t new_min = mq.min_hash();  // minimizer of (k-1)-mer j
         if (new_min != cur_min) {
             uint32_t first_kmer = (run_a == 0) ? 0 : run_a - 1;
