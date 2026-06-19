@@ -761,7 +761,7 @@ per-bucket resident set.
 > is sized to the *average* bucket, and `take_input_bucket` decodes a whole
 > bucket at once. Uniform hashing of boundary k-mers keeps buckets balanced
 > *with high probability* (and distinct dBG k-mers route to distinct buckets),
-> so in practice it holds — measured **37.76 GiB on the 661k/`-g 64` build**,
+> so in practice it holds — measured **36.52 GiB on the 661k/`-g 64` build**,
 > 26 GiB under budget. But a pathological input (many fragments sharing one
 > boundary k-mer) could fatten one bucket past its share; nothing *enforces* a
 > byte ceiling. The measured-RSS governor (§5.5) is the backstop if a bucket
@@ -1042,7 +1042,7 @@ plus the carried-forward color dict; finished unitigs are **written straight
 through to disk** (the write-through unitig writer, §5.4), so they add no RAM.
 The bucket count is sized so `num_threads` resident buckets fit a `-g` share;
 this bound is **statistical** (balanced hashing), not hard — see the §5.3
-caveat. Measured: **37.76 GiB on the 661k/`-g 64` build** (26 GiB under
+caveat. Measured: **36.52 GiB on the 661k/`-g 64` build** (27 GiB under
 budget). The measured-RSS **governor** (§5.5) is the backstop.
 
 Emit peak: one cid-range bucket of records loaded for sorting (~3 MB
