@@ -33,7 +33,6 @@ inline uint64_t ror64(uint64_t x, unsigned r) {
     r &= 63u;
     return (x >> r) | (x << ((64 - r) & 63));
 }
-inline uint64_t comp_seed(uint8_t b) { return NT_SEED[b ^ 3u]; }
 
 // Initialize fwd/rc ntHash for the m-mer at `s[0..m]`. Returns false if any
 // base is non-ACGT (in which case fwd/rc are not set). rc-hash of `s[0..m]`
