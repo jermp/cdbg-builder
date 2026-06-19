@@ -131,7 +131,7 @@ struct windowed_min {
             // Cached min left the window: re-scan [pos-W+1, pos] with a local
             // ntHash (leaves fwd/rc -- the steady-state roll -- untouched).
             int32_t start = pos - W + 1;
-            uint64_t f, r;
+            uint64_t f = 0, r = 0;  // nthash_init fills these (window is ACGT-only)
             nthash_init(bases + start, m, f, r);
             uint64_t best = canonical_mhash(f, r);
             int32_t best_pos = start;
