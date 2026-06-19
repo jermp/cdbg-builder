@@ -92,7 +92,7 @@ inline kmer_int_t side_junction_canonical(std::string_view seq, uint32_t k, uint
 // Source adapter wrapping a std::vector<stitchable_unitig> so the templated
 // stitch entry points (stitch_unitigs_extmem / _file) can accept in-memory
 // frags. Used by unit tests and any dev path that already has frags in RAM;
-// the production builder streams frags via frag_unitig_stream_reader instead.
+// the production builder streams frags via frag_unitig_block_reader instead.
 struct vector_frag_source {
     std::vector<stitchable_unitig> const& v;
     explicit vector_frag_source(std::vector<stitchable_unitig> const& vec) : v(vec) {}

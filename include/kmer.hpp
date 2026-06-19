@@ -115,11 +115,6 @@ inline kmer_int_t shift_append(kmer_int_t x, uint8_t nt, uint32_t k) {
     return ((x << 2) | (kmer_int_t)(nt & 3)) & kmer_mask(k);
 }
 
-// shift and prepend: drop last symbol, prepend `nt` at the left.
-inline kmer_int_t shift_prepend(kmer_int_t x, uint8_t nt, uint32_t k) {
-    return ((x >> 2) | ((kmer_int_t)(nt & 3) << (2 * (k - 1)))) & kmer_mask(k);
-}
-
 inline std::string kmer_to_string(kmer_int_t x, uint32_t k) {
     std::string s(k, 'N');
     for (uint32_t i = 0; i < k; ++i) {

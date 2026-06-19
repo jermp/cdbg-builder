@@ -37,13 +37,13 @@
 //    File format: a sequence of records, one per fragment, until EOF:
 //      [u32 cid][u8 open_flags][u32 seq_len][seq_len bytes raw ACGT]
 //
-// 3) frag_unitig_stream_reader  -- sequential, no-index view over (2)'s file
-//    Used by the production stitch. Pulls fragments one at a time via
-//    next(), holding only ONE fragment resident -- no per-fragment index
-//    at all. The stitch seeds round 0 by reading every fragment once in
-//    order and never revisits the spill, so a random-access index would be
-//    pure overhead; at 5.7e9 fragments a 24 B/entry index was ~137 GB,
-//    the last O(num_fragments) structure in the stitch. This removes it.
+// 3) frag_unitig_block_reader  -- block-buffered raw-record view over (2)'s file
+//    Drives the parallel round-0 seed. Reads the spill in large blocks (one
+//    fread per block) and yields each complete record as a raw (ptr, len)
+//    range; the per-record parse (frag_record_parse) runs on worker threads,
+//    so no per-fragment index is ever built -- the last O(num_fragments)
+//    in-RAM structure in the stitch is gone. Peak RAM is one block, not
+//    num_fragments.
 
 #include <algorithm>
 #include <cerrno>
@@ -420,7 +420,7 @@ private:
 // to a single append-only file in tmp_dir, so the accumulating
 // std::vector<stitchable_unitig> never grows to its multi-GB peak
 // during bucket-process. After bucket-process completes, the stitch
-// reads it lazily via frag_unitig_stream_reader (one fragment at a time).
+// reads it back in blocks via frag_unitig_block_reader.
 //
 // File format: a sequence of records, one per finished fragment.
 //   [u32 cid]
@@ -544,69 +544,6 @@ private:
     std::mutex m_mu;
     uint64_t m_count = 0;
     uint64_t m_total_seq_bytes = 0;
-};
-
-// ----------------------------------------------------------------------------
-// Streaming (no-index) reader over a frag_unitig_writer's spill file.
-//
-// The stitch seeds round 0 by reading every fragment exactly once, in order,
-// and nothing afterward revisits the original spill (later rounds live in the
-// round_store). So the random-access frag_unitig_reader index -- a
-// std::vector<entry> at 24 B/fragment, ~137 GB at 5.7e9 fragments, the last
-// O(num_fragments) in-RAM structure in the stitch -- is pure overhead in
-// production. This reader keeps only ONE fragment resident: a pull `next()`
-// decodes the next record into reused buffers. Peak RAM is one fragment, not
-// num_fragments.
-//
-// It deliberately does NOT satisfy the random-access Source interface (size /
-// runs(i) / seq_view(i)); it exposes a pull `next(open_flags, runs, seq)` that
-// the stitch's streaming seed path consumes. Record format matches
-// frag_unitig_writer exactly:
-//   [u8 flags][u32 nruns][nruns x (u64 cid + u32 num_kmers)][u32 seq_len][seq]
-class frag_unitig_stream_reader {
-public:
-    explicit frag_unitig_stream_reader(std::string path) : m_path(std::move(path)) {
-        m_file = std::fopen(m_path.c_str(), "rb");
-        if (!m_file) throw std::runtime_error("cannot open frag spill: " + m_path);
-    }
-    ~frag_unitig_stream_reader() {
-        if (m_file) std::fclose(m_file);
-    }
-    frag_unitig_stream_reader(frag_unitig_stream_reader const&) = delete;
-    frag_unitig_stream_reader& operator=(frag_unitig_stream_reader const&) = delete;
-
-    // Decode the next fragment into the caller's buffers. Returns false at EOF.
-    // `runs` and `seq` are resized to this fragment's contents (capacity reused
-    // across calls, so steady-state is alloc-free).
-    bool next(uint8_t& open_flags, std::vector<color_run>& runs, std::string& seq) {
-        uint8_t flags = 0;
-        size_t got = std::fread(&flags, sizeof(flags), 1, m_file);
-        if (got != 1) {
-            if (std::feof(m_file)) return false;
-            throw std::runtime_error("short read of flags from " + m_path);
-        }
-        uint32_t nruns = 0;
-        if (std::fread(&nruns, sizeof(nruns), 1, m_file) != 1)
-            throw std::runtime_error("short read of nruns from " + m_path);
-        runs.resize(nruns);
-        for (uint32_t r = 0; r < nruns; ++r) {
-            if (std::fread(&runs[r].cid, sizeof(uint64_t), 1, m_file) != 1 or
-                std::fread(&runs[r].num_kmers, sizeof(uint32_t), 1, m_file) != 1)
-                throw std::runtime_error("short read of run from " + m_path);
-        }
-        uint32_t seq_len = 0;
-        if (std::fread(&seq_len, sizeof(seq_len), 1, m_file) != 1)
-            throw std::runtime_error("short read of seq_len from " + m_path);
-        open_flags = flags;
-        seq.resize(seq_len);
-        if (seq_len > 0 and std::fread(seq.data(), 1, seq_len, m_file) != (size_t)seq_len)
-            throw std::runtime_error("short read of seq from " + m_path);
-        return true;
-    }
-
-private:
-    std::string m_path;
-    std::FILE* m_file = nullptr;
 };
 
 // ----------------------------------------------------------------------------

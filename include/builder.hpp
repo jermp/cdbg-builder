@@ -226,8 +226,8 @@ struct builder {
         // bucket-process and was the dominant peak contributor.
         // Instead each fragment is streamed through a disk-backed
         // frag_unitig_writer to a single tmp file. Stitch then reads
-        // that file back with a streaming frag_unitig_stream_reader that
-        // holds one fragment at a time.
+        // that file back with a block-buffered frag_unitig_block_reader
+        // (parsed on worker threads via frag_record_parse).
         //
         // Streaming dict: encodes each new color set into its bvb at
         // intern() time and immediately flushes complete 64-bit words
