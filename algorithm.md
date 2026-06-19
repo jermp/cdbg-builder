@@ -135,6 +135,17 @@ end of `build()`; only the three `<out>.*` files persist.
 
 ## 3. Phase 1: bucket-write (`include/phase1_bucket_write/`)
 
+**Data flow & memory map:**
+
+```
+in  (disk) : N gzip FASTA files                        - one color per file (mmap'd -> page cache)
+RAM        : per-thread super-k-mer buffers (keys/recs)   sized B*(alpha*T*flush + beta*spill)
+             per-bucket compactor hashmaps (online dedup) spilled by the RSS watcher (3.6)
+             held to ~0.5*g; peak ~34.6 GiB @ 661k/-g64
+out (disk) : B x bucket_<b>.bin                        - LZ4-framed, compacted super-k-mer records
+```
+
+
 ### 3.1 Goal
 
 Read every input file (libdeflate-decompressed if `.gz`), decompose
@@ -389,6 +400,19 @@ bases). See `super_kmer.hpp`.
 
 ## 4. Phase 2: bucket-process (`include/phase2_bucket_process/`)
 
+**Data flow & memory map:**
+
+```
+in  (disk) : B x bucket_<b>.bin                        - one bucket per worker thread
+RAM        : per-bucket walk set (kmer_info + visited + frags + local_dict)  bucket-sized, non-spillable
+             color-sets-dedup-map (streaming_color_set_dict, hash128->cid)   grows w/ #color sets; ~13.9 GiB @ 661k
+             per-thread local->global merge buffers
+             admission gate holds the phase to ~0.82*g; peak ~34.6 GiB @ 661k/-g64
+out (disk) : frag_unitigs.bin   - fragments {seq, open_flags, color runs (global cids)}
+             <out>.color_sets   - distinct color classes, STREAMED out during the phase (finalized in phase 4)
+```
+
+
 ### 4.1 Goal
 
 For each bucket independently:
@@ -617,6 +641,21 @@ bucket-write (§3.8) previews how many buckets will fit at once.
 
 ## 5. Phase 3: stitch (`include/phase3_stitch/`)
 
+**Data flow & memory map:**
+
+```
+in  (disk) : frag_unitigs.bin             - streamed once (parallel block-reader seed, 5.1)
+RAM        : round-store working set        one decoded LZ4 bucket per in-flight thread
+                                            (num_threads x bucket, sized from -g; statistical, 5.3)
+             seed batch queue               a few MiB of raw records in flight (bounded backpressure)
+             unitig writer                  WRITE-THROUGH under -g -> 0 unitig bytes in RAM (5.4)
+             peak ~36.5 GiB @ 661k/-g64
+tmp (disk) : stitch_r{round}_b*.bin         LZ4 round files (2-bit-packed seqs), deleted as consumed
+out (disk) : K x unitig_bucket_<k>.bin    - finished monochromatic unitigs, cid-range bucketed
+                                            (written through during the rounds)
+```
+
+
 External-memory, GGCAT-faithful hash-bucketed iterative-doubling join
 (`extend_unitigs.rs`). The **production default** is the **base-carrying**
 form (`stitch_extmem.hpp`): each round carries every still-open tig's
@@ -771,6 +810,20 @@ confined to where RSS truly approaches `-g`.
 ---
 
 ## 6. Phase 4: emit (`include/phase4_emit/emit.hpp`)
+
+**Data flow & memory map** (single-threaded):
+
+```
+in  (disk) : K x unitig_bucket_<k>.bin   +   <out>.color_sets (to finalize)
+RAM        : one cid-range bucket loaded for the cid-sort   <= cap; external merge-sort if over (6.2)
+             u2c: only the current 64-bit word              (run-end bits, ascending -> streamed)
+             color_set_dict: per-class metadata only
+             peak bounded, well under -g
+out (disk) : <out>.fa           - cid-ascending FASTA (headers = color-set id)
+             <out>.u2c          - unitig -> color-set bit_vector (run-end markers)
+             <out>.color_sets   - finalized: hybrid bits + Elias-Fano offsets + header
+```
+
 
 ### 6.1 Cid-range unitig spill (already done by stitch)
 
