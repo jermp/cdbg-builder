@@ -74,55 +74,83 @@ inline uint32_t compute_best_m(uint32_t k) {
     return (k + 2) / 4;
 }
 
-// Sliding-window minimum over a stream of (uint64_t hash, int32_t pos) pairs,
-// returning the current minimum's hash. Rescan-on-expiry over a fixed-size ring
-// buffer of the last W m-mer hashes plus a cached (cur_min, cur_min_pos):
+// Sliding-window minimum of the canonical m-mer hash over a (k-1)-mer's window
+// of W = k-m m-mers, returning the current minimum's hash. O(1) SPACE: it keeps
+// only the running (min hash, min position) plus the rolling ntHash state -- no
+// ring buffer, no modulo. It OWNS the ntHash roll (sshash minimizer_iterator
+// style):
 //
-//   - Common path (~all pushes): O(1) — store h at pos % W in the ring,
-//     and if h <= cur_min update the cached min.
-//   - When the cached min's position falls out of the window, rescan the
-//     W ring slots for the new min: O(W).
+//   - init():      roll over the first window's W m-mers, cache the min.
+//   - advance():   roll one m-mer right. If the cached min is still in the
+//                  window (common path): O(1) -- compare the new m-mer and keep
+//                  the running min. If the cached min just left the window:
+//                  RE-SCAN by re-rolling the W m-mers of the new window from a
+//                  local ntHash and taking their min: O(W).
 //
-// For random DNA the expected expiration rate is ~1/W per push, so the
-// amortised cost stays O(1) with a small constant: no allocations, a dense
-// linear rescan, and a branch-predictable common path.
-//
-// W = k - m + 1, bounded by MAX_K + 1 = 64 for the supported k range.
-// The 64-slot static array fits in a single cache line.
+// For random DNA the expiry rate is ~1/W per step, so the re-scan amortises to
+// O(1) with no per-step division and no buffer. Ties keep the RIGHTMOST (newest)
+// position (`<=`), matching the previous ring-buffer implementation exactly, so
+// the chosen minimizer -- and thus the bucketing and all downstream output -- is
+// unchanged.
 struct windowed_min {
-    static constexpr int32_t MAX_W = 64;
-    uint64_t hashes[MAX_W];
-    int32_t window_size = 0;
+    uint8_t const* bases = nullptr;  // 2-bit-encoded run bases
+    uint32_t m = 0;
+    int32_t W = 0;                   // window size in m-mers (= k - m)
+    int32_t pos = 0;                 // absolute index of the current rightmost m-mer
+    uint64_t fwd = 0, rc = 0;        // rolling ntHash at `pos`
     uint64_t cur_min = ~uint64_t(0);
     int32_t cur_min_pos = -1;
 
-    void reset(int32_t window) {
-        assert(window > 0 and window <= MAX_W);
-        window_size = window;
-        cur_min = ~uint64_t(0);
-        cur_min_pos = -1;
+    // Roll over the first window (m-mers at positions [0, W-1]) and cache its
+    // min. Returns false iff a non-ACGT base is hit (matches nthash_init).
+    bool init(uint8_t const* b, uint32_t mm, int32_t window) {
+        assert(window > 0);
+        bases = b;
+        m = mm;
+        W = window;
+        if (!nthash_init(bases, m, fwd, rc)) return false;
+        cur_min = canonical_mhash(fwd, rc);
+        cur_min_pos = 0;
+        for (int32_t i = 1; i < W; ++i) {
+            nthash_roll(bases[i - 1], bases[i + (int32_t)m - 1], m, fwd, rc);
+            uint64_t h = canonical_mhash(fwd, rc);
+            if (h <= cur_min) {  // <= keeps the rightmost (newest) on ties
+                cur_min = h;
+                cur_min_pos = i;
+            }
+        }
+        pos = W - 1;
+        return true;
     }
 
-    void push(uint64_t h, int32_t pos) {
-        hashes[(uint32_t)pos % (uint32_t)window_size] = h;
-        // Did the previously-tracked minimum just slide out of the window?
-        if (cur_min_pos + window_size <= pos) {
-            int32_t start = pos - window_size + 1;
-            if (start < 0) start = 0;
-            uint64_t best = hashes[(uint32_t)start % (uint32_t)window_size];
+    // Slide the window right by one m-mer.
+    void advance() {
+        ++pos;
+        nthash_roll(bases[pos - 1], bases[pos + (int32_t)m - 1], m, fwd, rc);
+        if (cur_min_pos + W <= pos) {
+            // Cached min left the window: re-scan [pos-W+1, pos] with a local
+            // ntHash (leaves fwd/rc -- the steady-state roll -- untouched).
+            int32_t start = pos - W + 1;
+            uint64_t f, r;
+            nthash_init(bases + start, m, f, r);
+            uint64_t best = canonical_mhash(f, r);
             int32_t best_pos = start;
             for (int32_t p = start + 1; p <= pos; ++p) {
-                uint64_t hp = hashes[(uint32_t)p % (uint32_t)window_size];
-                if (hp <= best) {  // <= keeps the rightmost (newest) position on ties
+                nthash_roll(bases[p - 1], bases[p + (int32_t)m - 1], m, f, r);
+                uint64_t hp = canonical_mhash(f, r);
+                if (hp <= best) {
                     best = hp;
                     best_pos = p;
                 }
             }
             cur_min = best;
             cur_min_pos = best_pos;
-        } else if (h <= cur_min) {
-            cur_min = h;
-            cur_min_pos = pos;
+        } else {
+            uint64_t h = canonical_mhash(fwd, rc);
+            if (h <= cur_min) {
+                cur_min = h;
+                cur_min_pos = pos;
+            }
         }
     }
 
