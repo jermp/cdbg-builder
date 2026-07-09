@@ -175,9 +175,23 @@ inline void ext_concat_runs(std::vector<color_run>& a, std::vector<color_run> b)
         uint64_t b_x = b.front().cid;
         uint64_t real = (a_x != COLOR_RUN_FOREIGN) ? a_x : b_x;  // foreign if both foreign
         if (a_x != real) {
-            // a's X run was a foreign placeholder (length 1 at the open end);
-            // flip it to the real cid recovered from b's owning side.
-            a.back().cid = real;
+            // a's boundary k-mer X was a FOREIGN placeholder; give X the real
+            // cid recovered from b's owning side. The placeholder run can span
+            // MORE than one k-mer -- an all-foreign bridge fragment (a super-
+            // k-mer owning none of its k-mers) has its consecutive foreign
+            // k-mers coalesced by push_cid into a SINGLE FOREIGN run -- but only
+            // the single shared boundary k-mer (a's LAST k-mer) is reconciled at
+            // this seam. Overwriting the whole run's cid would recolor its other
+            // k-mers to the neighbour's color, over-joining a monochromatic-split
+            // unitig past a color change (the owning side then loses that
+            // boundary k-mer -- the under/over-join pair). So peel X off as its
+            // own {real, 1} unit and leave the rest of the run FOREIGN.
+            if (a.back().num_kmers > 1) {
+                a.back().num_kmers -= 1;
+                a.push_back(color_run{real, 1});
+            } else {
+                a.back().cid = real;
+            }
             // Coalesce the just-reconciled X unit backward into a's preceding
             // run when they now share a cid. Without this, every join across a
             // same-color boundary leaves a spurious [run(c,n), run(c,1)] split;
