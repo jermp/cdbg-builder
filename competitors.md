@@ -1,12 +1,12 @@
 GGCAT
-=====
+===
 
 	/usr/bin/time -v ggcat build -k 31 -j 32 -l /mnt/hd2/pibiri/DNA/filenames/blackwell-100k_filenames.txt -s 1 -c -o /mnt/hd2/pibiri/DNA/bw-100k-ggcat -m 16 -t /mnt/hd2/pibiri/DNA/tmp_dir
-	
+
 	/usr/bin/time -v ggcat build -k 31 -j 48 -l /mnt/hd2/pibiri/DNA/filenames/blackwell-661k_filenames.txt -s 1 -c -o /mnt/hd2/pibiri/DNA/bw-661k-ggcat -m 64 -t /mnt/hd2/pibiri/DNA/tmp_dir
-	
+
 	/usr/bin/time -v ggcat build -k 31 -j 32 -l /mnt/hd2/pibiri/DNA/filenames/se_4546_filenames.txt -s 1 -c -o /mnt/hd2/pibiri/DNA/se-4546-ggcat -m 8 -t /mnt/hd2/pibiri/DNA/tmp_dir
-	
+
 CF3
 ===
 

@@ -87,10 +87,9 @@ struct builder {
         // slow the fast phases. budget 0 => disabled. Trip a touch below -g
         // (0.80/0.62) so the spill+trim lag on a spinning disk has room before
         // the hard cap. See algorithm.md §5.5.
-        ram_governor governor(m_cfg.max_ram_gb > 0
-                                  ? (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0)
-                                  : 0,
-                              /*high_frac=*/0.80, /*low_frac=*/0.62);
+        ram_governor governor(
+            m_cfg.max_ram_gb > 0 ? (uint64_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0) : 0,
+            /*high_frac=*/0.80, /*low_frac=*/0.62);
 
         // Read the filenames list: one input path per line, blanks skipped.
         // File at line i is color i.
@@ -236,7 +235,7 @@ struct builder {
         // never sits in RAM. EF offsets are appended to the file at
         // finalize().
         frag_unitig_writer frag_sink(tmp_dir + "/frag_unitigs.bin");
-        streaming_color_set_dict global_dict(m_num_colors, m_cfg.out_basename + ".color_sets");
+        streaming_color_set_dict global_dict(m_num_colors, m_cfg.cs_filename());
         std::mutex global_mu;
         {
             phase_rss_marker rss("bucket-process");
@@ -338,8 +337,8 @@ struct builder {
                 // streams every unitig straight to its bucket file.
                 size_t unitig_ram_budget = SIZE_MAX;
                 if (m_cfg.max_ram_gb > 0)
-                    unitig_ram_budget = (size_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0 *
-                                                 STITCH_BUDGET_FRAC);
+                    unitig_ram_budget =
+                        (size_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0 * STITCH_BUDGET_FRAC);
                 uwriter_ptr = std::make_unique<unitig_bucket_writer>(
                     tmp_dir, m_num_color_classes, unitig_bucket_count, unitig_ram_budget);
                 // Govern the unitig writer for the stitch's duration: under -g
@@ -386,7 +385,8 @@ struct builder {
                 // unitig writer. `done` is driven by for_each_raw above, so the
                 // stitch takes nullptr.
                 stitch_unitigs_extmem_file_streaming(for_each_raw, frag_record_parse, m_cfg.k,
-                                                     tmp_dir, std::ref(*uwriter_ptr), stitch_buckets,
+                                                     tmp_dir, std::ref(*uwriter_ptr),
+                                                     stitch_buckets,
                                                      /*done=*/nullptr, m_cfg.num_threads);
                 prog.stop();
                 std::cout << "  unitigs after stitching: " << uwriter_ptr->total_unitigs() << "\n";
@@ -446,8 +446,8 @@ struct builder {
             std::cout << "\n";
         }
 
-        std::cout << "done. wrote " << m_cfg.out_basename << ".fa, " << m_cfg.out_basename
-                  << ".u2c, and " << m_cfg.out_basename << ".color_sets\n";
+        std::cout << "done. wrote " << m_cfg.fa_filename() << ", " << m_cfg.u2c_filename()
+                  << ", and " << m_cfg.cs_filename() << "\n";
         build_timer.stop();
         std::cout << "[total construction time] " << build_timer.elapsed() << " s\n";
     }
@@ -479,7 +479,6 @@ private:
                                  " is available for it. " + remedy +
                                  " (-g is a hard limit; aborting rather than exceeding it.)");
     }
-
 
     //   - bucket_log2 (more buckets -> smaller per-bucket data structures)
     //   - color-bvb spill threshold (in bytes; 0 = never spill)
@@ -583,15 +582,14 @@ private:
             const double floor_min = (double)MIN_AUTO_BUCKETS * per_bucket;
             if (floor_min > M) {
                 const double t_room = M / (double)MIN_AUTO_BUCKETS - m_cfg.beta * m_spill_bytes;
-                const long t_max =
-                    t_room > 0 ? (long)(t_room / (m_cfg.alpha * m_flush_bases)) : 0;
+                const long t_max = t_room > 0 ? (long)(t_room / (m_cfg.alpha * m_flush_bases)) : 0;
                 std::string remedy =
                     t_max >= 1
                         ? "Reduce -t to <= " + std::to_string(t_max) + ", or raise -g."
                         : "Raise -g (even -t 1 does not fit; spill_bytes/flush_bases too large).";
-                fail_ram_budget_("bucket-write per-thread buffers at -t " +
-                                     std::to_string(m_cfg.num_threads),
-                                 (uint64_t)floor_min, (uint64_t)M, remedy);
+                fail_ram_budget_(
+                    "bucket-write per-thread buffers at -t " + std::to_string(m_cfg.num_threads),
+                    (uint64_t)floor_min, (uint64_t)M, remedy);
             }
         }
 

@@ -94,8 +94,9 @@ inline void emit_fasta(unitig_bucket_writer& uwriter, std::string const& out_bas
                        uint64_t num_unitigs, double max_ram_gb) {
     timer _("emit fasta");
 
-    FILE* fa = std::fopen((out_basename + ".fa").c_str(), "wb");
-    if (!fa) throw std::runtime_error("cannot open " + out_basename + ".fa");
+    const std::string fasta_filename = fa_filename(out_basename);
+    FILE* fa = std::fopen(fasta_filename.c_str(), "wb");
+    if (!fa) throw std::runtime_error("cannot open " + fasta_filename);
     constexpr size_t BUF_BYTES = 1 << 20;
     std::vector<char> buf(BUF_BYTES);
     size_t pos = 0;
@@ -103,7 +104,7 @@ inline void emit_fasta(unitig_bucket_writer& uwriter, std::string const& out_bas
         if (pos == 0) return;
         if (std::fwrite(buf.data(), 1, pos, fa) != pos) {
             std::fclose(fa);
-            throw std::runtime_error("short write to " + out_basename + ".fa");
+            throw std::runtime_error("short write to " + fasta_filename);
         }
         pos = 0;
     };
@@ -114,7 +115,8 @@ inline void emit_fasta(unitig_bucket_writer& uwriter, std::string const& out_bas
     // u2c is streamed straight to <out>.u2c word-by-word: its set bits (run
     // ends) are produced in ascending unitig order, so it never needs to sit in
     // RAM as a num_unitigs-bit bitmap (a non-spillable -g violator at scale).
-    streaming_bit_vector_writer u2c_writer(out_basename + ".u2c", num_unitigs);
+    const std::string u2c_filename = cdbg::u2c_filename(out_basename);
+    streaming_bit_vector_writer u2c_writer(u2c_filename, num_unitigs);
     size_t emitted = 0;
     uint64_t prev_cid = 0;
 
@@ -156,7 +158,8 @@ inline void emit_fasta(unitig_bucket_writer& uwriter, std::string const& out_bas
     std::fclose(fa);
 
     std::cout << "  [emit-fasta] " << uwriter.num_buckets() << " buckets ("
-              << uwriter.spilled_buckets() << " spilled to disk, rest read from RAM), cid-sort RAM cap "
+              << uwriter.spilled_buckets()
+              << " spilled to disk, rest read from RAM), cid-sort RAM cap "
               << format_bytes(emit_mem_cap) << "\n";
 
     // Close out the very last run, then flush the trailing/zero words.
