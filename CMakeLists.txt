@@ -101,7 +101,8 @@ add_subdirectory(${LIBDEFLATE_DIR} ${CMAKE_BINARY_DIR}/libdeflate EXCLUDE_FROM_A
 
 find_package(Threads REQUIRED)
 
-add_executable(cdbg-build src/main.cpp)
+add_executable(cdbg-build src/main.cpp
+        include/stream.hpp)
 target_link_libraries(cdbg-build PRIVATE Threads::Threads lz4_static libdeflate_static)
 target_include_directories(cdbg-build PRIVATE ${LIBDEFLATE_DIR})
 
