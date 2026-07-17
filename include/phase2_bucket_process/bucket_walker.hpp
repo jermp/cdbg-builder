@@ -80,7 +80,7 @@ struct kmer_entry {
 inline constexpr uint8_t UNITIG_OPEN_LEFT = 1u << 0;
 inline constexpr uint8_t UNITIG_OPEN_RIGHT = 1u << 1;
 
-// A run of consecutive k-mers along a tig that share one color class.
+// A run of consecutive k-mers along a tig that share one color set.
 // num_kmers counts k-mers (a length-L tig of L = seq.size()-k+1 k-mers has
 // runs summing to L). This is the RLE color sequence GGCAT carries on a
 // topological unitig (UnitigColorData); the monochromatic split at emit

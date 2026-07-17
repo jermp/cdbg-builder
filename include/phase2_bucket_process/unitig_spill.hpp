@@ -7,7 +7,7 @@
 // 1) unitig_bucket_writer  -- stitch -> emit
 //    Sink for the stitch. Partitions finished merged unitigs into K
 //    cid-range buckets: bucket b holds every unitig with cid in
-//    [b * S, (b+1) * S) where S = ceil(num_color_classes / num_buckets).
+//    [b * S, (b+1) * S) where S = ceil(num_color_sets / num_buckets).
 //    emit_fasta iterates buckets in ascending order and sorts each
 //    bucket's records by cid before writing FASTA, so the .fa output is
 //    strictly cid-ascending (which the u2c bit_vector consumer requires).
@@ -59,7 +59,7 @@
 #include <vector>
 
 #include "phase2_bucket_process/bucket_walker.hpp"  // stitchable_unitig
-#include "ram_governor.hpp"                          // ram_spillable
+#include "ram_governor.hpp"                         // ram_spillable
 
 namespace cdbg {
 
@@ -71,7 +71,7 @@ namespace cdbg {
 // operator() calls.
 class unitig_bucket_writer : public ram_spillable {
 public:
-    // num_color_classes is the final cid space (size of global_dict).
+    // num_color_sets is the final cid space (size of global_dict).
     // num_buckets controls how the cid range is partitioned. Picked
     // so per-bucket peak fits comfortably in the budget remainder.
     //
@@ -82,13 +82,13 @@ public:
     // i.e. the unitig sequences never round-trip through disk. SIZE_MAX = keep
     // everything in RAM (the no-`-g` default); a finite budget spills the
     // overflow so the `-g` bound is honored regardless of unitig volume.
-    unitig_bucket_writer(std::string dir, uint64_t num_color_classes, uint32_t num_buckets,
+    unitig_bucket_writer(std::string dir, uint64_t num_color_sets, uint32_t num_buckets,
                          size_t ram_budget = SIZE_MAX)
         : m_dir(std::move(dir))
-        , m_num_color_classes(num_color_classes)
+        , m_num_color_sets(num_color_sets)
         , m_num_buckets(num_buckets == 0 ? 1 : num_buckets)
         , m_ram_budget(ram_budget) {
-        if (num_color_classes == 0) {
+        if (num_color_sets == 0) {
             // No unitigs ever produced -> a single empty bucket.
             m_num_buckets = 1;
         }
@@ -167,7 +167,7 @@ public:
 
     uint64_t total_unitigs() const { return m_total_unitigs; }
     uint32_t num_buckets() const { return m_num_buckets; }
-    uint64_t num_color_classes() const { return m_num_color_classes; }
+    uint64_t num_color_sets() const { return m_num_color_sets; }
 
     std::string bucket_path(uint32_t b) const {
         return m_dir + "/unitig_bucket_" + std::to_string(b) + ".bin";
@@ -383,18 +383,18 @@ private:
     }
 
     uint32_t bucket_for_cid(uint64_t cid) const {
-        if (m_num_color_classes == 0 or m_num_buckets <= 1) return 0;
+        if (m_num_color_sets == 0 or m_num_buckets <= 1) return 0;
         // Cids in [b * S, (b+1) * S) live in bucket b, where
-        // S = ceil(num_color_classes / num_buckets). Last bucket
+        // S = ceil(num_color_sets / num_buckets). Last bucket
         // mops up any rounding remainder.
-        const uint64_t S = (m_num_color_classes + m_num_buckets - 1) / m_num_buckets;
+        const uint64_t S = (m_num_color_sets + m_num_buckets - 1) / m_num_buckets;
         uint32_t b = (uint32_t)(cid / S);
         if (b >= m_num_buckets) b = m_num_buckets - 1;
         return b;
     }
 
     std::string m_dir;
-    uint64_t m_num_color_classes;
+    uint64_t m_num_color_sets;
     uint32_t m_num_buckets;
     std::vector<std::FILE*> m_files;  // null until the bucket spills
     uint64_t m_total_unitigs = 0;

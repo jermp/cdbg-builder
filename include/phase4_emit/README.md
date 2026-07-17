@@ -17,23 +17,26 @@ stitch, no read-back here). Only buckets that exceed the budget spill to
 See `algorithm.md` §6 for the full description.
 
 ## Input
+
 - the in-RAM cid-range unitig buckets (the `unitig_bucket_writer` carried over
   from stitch), plus any `tmp/unitig_bucket_<k>.bin` that spilled under `-g`.
 - the in-progress `<out>.color_sets` (to finalize) and the running
   `streaming_color_set_dict`.
 
 ## Output
+
 - `<out>.fa` — colored unitigs in FASTA, cid-ascending, headers = cid.
 - `<out>.u2c` — unitig→color-set `bits::bit_vector` (run-end markers;
-  popcount = `num_color_classes`).
+  popcount = `num_color_sets`).
 - `<out>.color_sets` — finalized: header + hybrid-encoded color sets + EF offsets.
 
 These three `<out>.*` files are the tool's deliverables (consumed downstream by
 Fulgor). All `tmp/*` scratch is removed after this phase.
 
 ## Files
-| file | role |
-|---|---|
+
+| file       | role                                                                                                      |
+|------------|-----------------------------------------------------------------------------------------------------------|
 | `emit.hpp` | `emit_fasta` (FASTA + u2c) and `emit_colors` (finalize `.color_sets`), called by the builder orchestrator |
 
 > The top-level `builder.hpp` orchestrator drives all four phases and lives at

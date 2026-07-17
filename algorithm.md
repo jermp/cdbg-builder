@@ -3,7 +3,6 @@
 This document describes how `cdbg-builder` constructs a **colored compacted
 de Bruijn graph (ccdBG)** and how it builds and compresses the color sets.
 
-
 ## 1. What the tool produces
 
 Given `N` input files (FASTA / FASTQ, optionally gzipped), each treated as
@@ -15,7 +14,7 @@ a user-supplied basename:
   k-mer has the same color set). Headers are the integer color-set id.
 - **`<out>.u2c`** — a `bits::bit_vector` of length `num_unitigs` where
   bit *i* is set iff unitig *i* (in `.fa` emission order) is the last
-  unitig of a color-set run. Popcount = `num_color_classes`. Downstream
+  unitig of a color-set run. Popcount = `num_color_sets`. Downstream
   consumers (e.g., [Fulgor](https://github.com/jermp/fulgor))
   recover the per-unitig color-set id via
   `rank1(unitig_id)` after building a rank index over this bit_vector.
@@ -34,8 +33,6 @@ Correctness is **exact unitig-set equality** against an independently
 built naive ccdBG, checked by `test_data/verify.py` (coverage,
 monochromaticity, topology, *and* maximality). On `salmonella_10` the
 correct colored compacted dBG has **86,630 unitigs**.
-
-
 
 ## 2. Pipeline overview
 
@@ -90,14 +87,14 @@ artifact contract, the rest of the pipeline is unaffected.
 
 - *Reads:* the `B` `tmp/bucket_<b>.bin` files (one bucket per worker).
 - *Produces two artifacts:*
-  - `tmp/frag_unitigs.bin` — a single stream of **open-ended fragments**
-    `{ACGT seq, open_flags (which ends are still extendable), color-run
-    sequence}`. The color runs reference **global** cids (the per-bucket
-    local→global merge, §4.7, runs before each fragment is written). Phase 3
-    seeds its join by streaming this spill once.
-  - `<out>.color_sets` — the distinct **global color classes**, interned
-    and streamed to disk incrementally during the phase (the only artifact
-    written progressively rather than at phase end; finalized by phase 4).
+    - `tmp/frag_unitigs.bin` — a single stream of **open-ended fragments**
+      `{ACGT seq, open_flags (which ends are still extendable), color-run
+      sequence}`. The color runs reference **global** cids (the per-bucket
+      local→global merge, §4.7, runs before each fragment is written). Phase 3
+      seeds its join by streaming this spill once.
+    - `<out>.color_sets` — the distinct **global color sets**, interned
+      and streamed to disk incrementally during the phase (the only artifact
+      written progressively rather than at phase end; finalized by phase 4).
 - *Why it's the natural handoff:* fragments are maximal colorless
   (topological) pieces whose open ends each carry their boundary k-mer, so
   phase 3 only has to match boundary k-mers — and global cids decouple the
@@ -144,7 +141,6 @@ RAM        : per-thread super-k-mer buffers (keys/recs)   sized B*(alpha*T*flush
              held to ~0.5*g; peak ~34.6 GiB @ 661k/-g64
 out (disk) : B x bucket_<b>.bin                        - LZ4-framed, compacted super-k-mer records
 ```
-
 
 ### 3.1 Goal
 
@@ -385,6 +381,7 @@ historical `B = 1024`.
 ### 3.8 Output
 
 Per bucket: a single LZ4-framed file. Frame format:
+
 ```
 repeat:
   [u32 uncompressed_size]   little-endian; 0 = end-of-stream
@@ -409,9 +406,8 @@ RAM        : per-bucket walk set (kmer_info + visited + frags + local_dict)  buc
              per-thread local->global merge buffers
              admission gate holds the phase to ~0.82*g; peak ~34.6 GiB @ 661k/-g64
 out (disk) : frag_unitigs.bin   - fragments {seq, open_flags, color runs (global cids)}
-             <out>.color_sets   - distinct color classes, STREAMED out during the phase (finalized in phase 4)
+             <out>.color_sets   - distinct color sets, STREAMED out during the phase (finalized in phase 4)
 ```
-
 
 ### 4.1 Goal
 
@@ -452,16 +448,16 @@ Three structures per in-flight bucket:
 
 1. Intern colors into `record_sets` → get rsid.
 2. Roll the canonical k-mer through the record's bases. For each k-mer:
-   - **Boundary flags**: the first k-mer gets a boundary bit if the
-     record's `IS_ACGT_BEGIN` is clear (it is the begin-ignored overlap
-     copy of the previous super); the last gets one if `IS_ACGT_END` is
-     clear. The bit is oriented to the k-mer's canonical frame. Flags are
-     OR-accumulated over all occurrences. (GGCAT `hashmap.rs:382-398`.)
-   - **Ownership / color**: color the k-mer (and mark `primary`) unless
-     this bucket does not own it. An interior k-mer is always owned; the
-     first / last k-mer is owned iff the record's `OWNS_FIRST` /
-     `OWNS_LAST` flag is set (§3.2). So each k-mer is colored in exactly
-     one bucket, accumulating the full color union there.
+    - **Boundary flags**: the first k-mer gets a boundary bit if the
+      record's `IS_ACGT_BEGIN` is clear (it is the begin-ignored overlap
+      copy of the previous super); the last gets one if `IS_ACGT_END` is
+      clear. The bit is oriented to the k-mer's canonical frame. Flags are
+      OR-accumulated over all occurrences. (GGCAT `hashmap.rs:382-398`.)
+    - **Ownership / color**: color the k-mer (and mark `primary`) unless
+      this bucket does not own it. An interior k-mer is always owned; the
+      first / last k-mer is owned iff the record's `OWNS_FIRST` /
+      `OWNS_LAST` flag is set (§3.2). So each k-mer is colored in exactly
+      one bucket, accumulating the full color union there.
 
 ### 4.4 Contig-break flags (no phantom edges)
 
@@ -480,6 +476,7 @@ check sees all the arms.
 ### 4.5 Computing per-k-mer cids and the walk
 
 After load, build `cid_of[k-mer]` for every **primary** (owned) k-mer:
+
 - *Single-rsid* (common): `local_dict.intern(record_sets.at(rsid))`,
   with an `rsid_to_cid` cache for O(1) repeats.
 - *Multi-rsid*: sort+unique the rsids; one distinct rsid → cached path;
@@ -655,7 +652,6 @@ out (disk) : K x unitig_bucket_<k>.bin    - finished monochromatic unitigs, cid-
                                             (written through during the rounds)
 ```
 
-
 External-memory, GGCAT-faithful hash-bucketed iterative-doubling join
 (`extend_unitigs.rs`). The **production default** is the **base-carrying**
 form (`stitch_extmem.hpp`): each round carries every still-open tig's
@@ -824,12 +820,11 @@ out (disk) : <out>.fa           - cid-ascending FASTA (headers = color-set id)
              <out>.color_sets   - finalized: hybrid bits + Elias-Fano offsets + header
 ```
 
-
 ### 6.1 Cid-range unitig spill (already done by stitch)
 
 `unitig_bucket_writer` (the stitch sink) partitions finished merged
 unitigs into K cid-range buckets: bucket `b` holds every unitig with
-`cid ∈ [b * S, (b+1) * S)` where `S = ceil(num_color_classes / K)`.
+`cid ∈ [b * S, (b+1) * S)` where `S = ceil(num_color_sets / K)`.
 K auto-scales with `-g` (target: per-bucket peak ~10 % of
 budget). Per-bucket file format:
 `[u32 cid][u32 seq_len][seq bytes]` repeated.
@@ -859,7 +854,7 @@ RAM as an `n_unitigs / 8`-byte bitmap — one more non-spillable floor removed.
 `u2c` invariants:
 
 - `num_bits == num_unitigs` (one bit per unitig in `.fa` order).
-- `popcount == num_color_classes`.
+- `popcount == num_color_sets`.
 - The last bit is always set.
 - Downstream consumer recovers each unitig's color-set id via
   `rank1(unitig_id)` after building a rank index.
@@ -962,7 +957,7 @@ Standard FASTA. Each record:
 ```
 
 Records are emitted in **strictly cid-ascending** order. Multiple
-records can share a `cid` (multiple unitigs in one color class) and
+records can share a `cid` (multiple unitigs in one color set) and
 appear consecutively.
 
 ### 8.2 `<out>.u2c`
@@ -976,6 +971,7 @@ semantics.
 ### 8.3 `<out>.color_sets`
 
 See §6.4 for the byte layout. Decoding one color set:
+
 1. Read the fixed header (40 bytes).
 2. mmap or `fread` the bit_vector words.
 3. `essentials::load` the elias_fano from the file tail.
@@ -1063,16 +1059,16 @@ the dataset)?** A data-sized structure is safe only if it has a fallback —
 *spill* to disk, *stream* through RAM, or *scale* a fan-out knob so its share
 shrinks. The non-spillable structures and their fallbacks, per phase:
 
-| Phase | Non-spillable structure | Sized by | Fallback | Bounded at fixed `-g`/`-t`, any dataset? |
-|---|---|---|---|---|
-| bucket-write | per-thread `keys`/`recs` buffers | `B·(α·T·flush+β·spill)` — **U-independent** | abort if floor > `0.5·g` | **Yes** (independent of dataset size) |
-| bucket-write | compactor hashmaps | live data | RSS watcher spills (§3.6) | Yes |
-| **bucket-process** | **per-bucket walk set** (`kmer_info`+visited+frags+`local_dict`) | **bucket size = data / B** | **none** | **No** — see below |
-| **bucket-process** | **color-sets-dedup-map** (`colorset_dedup_index`) | **# distinct color sets** | **none** | **No** — see below |
-| stitch (default) | on-disk round store working set | `num_threads` × bucket; bucket count from `-g` | on disk already; bound **statistical** (§5.3) | **Mostly** — statistical, not hard |
-| stitch (default) | unitig writer | — | **write-through to disk** under `-g` (§5.4) | **Yes** (hard, 0 RAM) |
-| emit | one cid-range bucket | data / K | **external merge-sort** if over cap (§6.2) | Yes |
-| emit | u2c | data | **streamed** (§6.2) | Yes |
+| Phase              | Non-spillable structure                                          | Sized by                                       | Fallback                                      | Bounded at fixed `-g`/`-t`, any dataset? |
+|--------------------|------------------------------------------------------------------|------------------------------------------------|-----------------------------------------------|------------------------------------------|
+| bucket-write       | per-thread `keys`/`recs` buffers                                 | `B·(α·T·flush+β·spill)` — **U-independent**    | abort if floor > `0.5·g`                      | **Yes** (independent of dataset size)    |
+| bucket-write       | compactor hashmaps                                               | live data                                      | RSS watcher spills (§3.6)                     | Yes                                      |
+| **bucket-process** | **per-bucket walk set** (`kmer_info`+visited+frags+`local_dict`) | **bucket size = data / B**                     | **none**                                      | **No** — see below                       |
+| **bucket-process** | **color-sets-dedup-map** (`colorset_dedup_index`)                | **# distinct color sets**                      | **none**                                      | **No** — see below                       |
+| stitch (default)   | on-disk round store working set                                  | `num_threads` × bucket; bucket count from `-g` | on disk already; bound **statistical** (§5.3) | **Mostly** — statistical, not hard       |
+| stitch (default)   | unitig writer                                                    | —                                              | **write-through to disk** under `-g` (§5.4)   | **Yes** (hard, 0 RAM)                    |
+| emit               | one cid-range bucket                                             | data / K                                       | **external merge-sort** if over cap (§6.2)    | Yes                                      |
+| emit               | u2c                                                              | data                                           | **streamed** (§6.2)                           | Yes                                      |
 
 Everything **outside bucket-process** has a spill, stream, or scale fallback
 that holds it to a `-g` share — **except** the stitch's on-disk round store,
@@ -1133,12 +1129,12 @@ are independent:
 
 ## 10. Concurrency model
 
-| phase | parallelism | sync |
-|---|---|---|
-| bucket-write | T worker threads, one input file each at a time; per-thread per-bucket buffers; per-bucket mutex guards `bucket_compactor` | per-bucket mutex + RSS watcher's `try_spill` sweep |
-| bucket-process | T worker threads pop next bucket from atomic counter; each owns one bucket end-to-end | per-bucket: thread-local; `global_mu` only during local→global merge; `mem_mu`/cv admission gate (§4.9) bounds resident buckets |
-| stitch | seed: 1 reader (block reads) + `T` parse/route workers via a bounded queue (§5.1); base-carrying doubling rounds `T`-way over independent per-round buckets via a **persistent worker pool** (§5.2), each holding one decoded round-store bucket; monochromatic split drained to the write-through sink | per-bucket waiting-map thread-local; round barrier between rounds (generation-counted, pool reused); sink drained under `sink_mu` / a seed `sink_mu` |
-| emit | single-threaded | n/a |
+| phase          | parallelism                                                                                                                                                                                                                                                                                             | sync                                                                                                                                                 |
+|----------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------|
+| bucket-write   | T worker threads, one input file each at a time; per-thread per-bucket buffers; per-bucket mutex guards `bucket_compactor`                                                                                                                                                                              | per-bucket mutex + RSS watcher's `try_spill` sweep                                                                                                   |
+| bucket-process | T worker threads pop next bucket from atomic counter; each owns one bucket end-to-end                                                                                                                                                                                                                   | per-bucket: thread-local; `global_mu` only during local→global merge; `mem_mu`/cv admission gate (§4.9) bounds resident buckets                      |
+| stitch         | seed: 1 reader (block reads) + `T` parse/route workers via a bounded queue (§5.1); base-carrying doubling rounds `T`-way over independent per-round buckets via a **persistent worker pool** (§5.2), each holding one decoded round-store bucket; monochromatic split drained to the write-through sink | per-bucket waiting-map thread-local; round barrier between rounds (generation-counted, pool reused); sink drained under `sink_mu` / a seed `sink_mu` |
+| emit           | single-threaded                                                                                                                                                                                                                                                                                         | n/a                                                                                                                                                  |
 
 Inter-phase: each phase finishes before the next begins. There is no
 overlap between phases (e.g., no GGCAT-style background compactor
@@ -1152,26 +1148,26 @@ running concurrently with bucketing).
 own `README.md`); the orchestrator and the cross-phase primitives sit at the
 root. Other shared files live in the phase that primarily owns them.
 
-| file | role |
-|---|---|
-| `src/main.cpp`                                       | CLI entry point |
-| `include/builder.hpp`                                | top-level `build()` orchestrator + auto-tune (drives all 4 phases) |
-| `include/kmer.hpp`                                   | 2-bit canonical k-mer encoding (foundational; used by all phases) |
-| `include/util.hpp`                                   | timers, `seconds_timer`, RSS, profiling counters, `build_config` (used by all phases) |
-| **Phase 1 — `include/phase1_bucket_write/`** | |
-| `bucket_ingester.hpp`                                | parse + minimizer + bucketing per input file |
-| `bucket_io.hpp`                                      | per-bucket compactor, LZ4 framing, RSS watcher |
-| `minimizer.hpp`                                      | canonical ntHash + sliding-window minimum |
-| `seq_reader.hpp`                                     | mmap + libdeflate FASTA/FASTQ iterator (kseq over mem_stream) |
-| `super_kmer.hpp`                                     | super-k-mer record format (varint + 2-bit) |
-| **Phase 2 — `include/phase2_bucket_process/`** | |
-| `bucket_walker.hpp`                                  | per-bucket dBG load + walk; multi-thread driver + admission gate |
-| `compact_color_set_dict.hpp`                         | per-bucket color-set dict (hybrid in-memory) |
-| `streaming_color_set_dict.hpp`                       | global color-set dict; writes `.color_sets` |
-| `hybrid_color_sets.hpp`                              | static `encode_one` (sparse/dense/complementary) |
-| `unitig_spill.hpp`                                   | disk-backed frag/unitig sinks (batched write) + streaming + block-buffered raw frag readers |
-| **Phase 3 — `include/phase3_stitch/`** | |
-| `stitch_extmem.hpp`                                  | **production stitch**: base-carrying iterative-doubling join (`stitch_unitigs_extmem_file_streaming`); on-disk round store + write-through unitig writer. The random-access `stitch_unitigs_extmem` / `_file` variants are kept as `test_stitch`'s cross-check oracle |
-| `stitch.hpp`                                         | shared stitch helpers (side tags, junction, frag source) |
-| **Phase 4 — `include/phase4_emit/`** | |
-| `emit.hpp`                                           | `emit_fasta` (FASTA + u2c) + `emit_colors` (finalize `.color_sets`) |
+| file                                           | role                                                                                                                                                                                                                                                                  |
+|------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `src/main.cpp`                                 | CLI entry point                                                                                                                                                                                                                                                       |
+| `include/builder.hpp`                          | top-level `build()` orchestrator + auto-tune (drives all 4 phases)                                                                                                                                                                                                    |
+| `include/kmer.hpp`                             | 2-bit canonical k-mer encoding (foundational; used by all phases)                                                                                                                                                                                                     |
+| `include/util.hpp`                             | timers, `seconds_timer`, RSS, profiling counters, `build_config` (used by all phases)                                                                                                                                                                                 |
+| **Phase 1 — `include/phase1_bucket_write/`**   |                                                                                                                                                                                                                                                                       |
+| `bucket_ingester.hpp`                          | parse + minimizer + bucketing per input file                                                                                                                                                                                                                          |
+| `bucket_io.hpp`                                | per-bucket compactor, LZ4 framing, RSS watcher                                                                                                                                                                                                                        |
+| `minimizer.hpp`                                | canonical ntHash + sliding-window minimum                                                                                                                                                                                                                             |
+| `seq_reader.hpp`                               | mmap + libdeflate FASTA/FASTQ iterator (kseq over mem_stream)                                                                                                                                                                                                         |
+| `super_kmer.hpp`                               | super-k-mer record format (varint + 2-bit)                                                                                                                                                                                                                            |
+| **Phase 2 — `include/phase2_bucket_process/`** |                                                                                                                                                                                                                                                                       |
+| `bucket_walker.hpp`                            | per-bucket dBG load + walk; multi-thread driver + admission gate                                                                                                                                                                                                      |
+| `compact_color_set_dict.hpp`                   | per-bucket color-set dict (hybrid in-memory)                                                                                                                                                                                                                          |
+| `streaming_color_set_dict.hpp`                 | global color-set dict; writes `.color_sets`                                                                                                                                                                                                                           |
+| `hybrid_color_sets.hpp`                        | static `encode_one` (sparse/dense/complementary)                                                                                                                                                                                                                      |
+| `unitig_spill.hpp`                             | disk-backed frag/unitig sinks (batched write) + streaming + block-buffered raw frag readers                                                                                                                                                                           |
+| **Phase 3 — `include/phase3_stitch/`**         |                                                                                                                                                                                                                                                                       |
+| `stitch_extmem.hpp`                            | **production stitch**: base-carrying iterative-doubling join (`stitch_unitigs_extmem_file_streaming`); on-disk round store + write-through unitig writer. The random-access `stitch_unitigs_extmem` / `_file` variants are kept as `test_stitch`'s cross-check oracle |
+| `stitch.hpp`                                   | shared stitch helpers (side tags, junction, frag source)                                                                                                                                                                                                              |
+| **Phase 4 — `include/phase4_emit/`**           |                                                                                                                                                                                                                                                                       |
+| `emit.hpp`                                     | `emit_fasta` (FASTA + u2c) + `emit_colors` (finalize `.color_sets`)                                                                                                                                                                                                   |

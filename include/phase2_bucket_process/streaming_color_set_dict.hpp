@@ -138,7 +138,7 @@ struct streaming_color_set_dict {
     //
     // THREAD-SAFE. The dedup index is sharded into NUM_SHARDS independent
     // maps, each under its own mutex (selected by the secondary hash), so
-    // the common case -- a duplicate color class, just a probe + return --
+    // the common case -- a duplicate color set, just a probe + return --
     // distributes across shards instead of serialising on one lock. For a
     // genuinely new class the expensive hybrid-encode runs into a thread-
     // local builder *under the shard lock* (so distinct shards encode in
@@ -213,8 +213,7 @@ struct streaming_color_set_dict {
     // reported at phase boundaries to attribute budget.
     uint64_t resident_bytes() const {
         if (m_released) return 0;
-        return colorset_dedup_index::resident_bytes(
-            m_class_count.load(std::memory_order_relaxed));
+        return colorset_dedup_index::resident_bytes(m_class_count.load(std::memory_order_relaxed));
     }
 
     // Finalize the on-disk file: flush trailing partial word, build &

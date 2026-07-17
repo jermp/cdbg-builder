@@ -86,7 +86,7 @@ private:
 // hand-rolled 1 MiB buffer + std::to_chars (far faster than std::ofstream on
 // millions of small records). In the same pass build the u2c bit_vector: bit i
 // is set iff unitig i (in .fa emission order) is the last unitig of a color-set
-// run -- length = num_unitigs, popcount = num_color_classes -- which Fulgor
+// run -- length = num_unitigs, popcount = num_color_sets -- which Fulgor
 // reads via rank1(unitig_id). The per-bucket cid-sort is RAM-capped
 // (read_bucket_sorted external merge-sorts a bucket that exceeds the cap), so
 // emit peak is bounded regardless of cid skew.

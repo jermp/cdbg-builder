@@ -19,13 +19,13 @@
 //   // After build():
 //   //   b.num_colors()         -- one per input file
 //   //   b.num_unitigs()        -- count of stitched unitigs in <basename>.fa
-//   //   b.num_color_classes()  -- count of distinct color sets in <basename>.color_sets
+//   //   b.num_color_sets()  -- count of distinct color sets in <basename>.color_sets
 //
 // build() throws std::runtime_error on configuration errors or I/O
 // failures. On success, three artifacts are written:
 //   <basename>.fa          colored unitigs in FASTA, headers = cid
 //   <basename>.u2c         unitig-to-color-set bit_vector (run-end
-//                          marker, popcount = num_color_classes)
+//                          marker, popcount = num_color_sets)
 //   <basename>.color_sets  hybrid-encoded color sets + EF offsets
 // The scratch directory (cfg.tmp_dir or an mkdtemp'd one) is removed.
 
@@ -269,7 +269,7 @@ struct builder {
                                 /*delete_consumed_buckets=*/!m_cfg.keep_tmp);
                 prog.stop();
                 std::cout << "  bucket fragments: " << frag_sink.count() << "\n";
-                std::cout << "  distinct color classes: " << global_dict.size() << "\n";
+                std::cout << "  distinct color sets: " << global_dict.size() << "\n";
                 // color-sets-dedup-map occupancy vs its -g budget. Peak == final,
                 // since the index only grows until release_index(). MEASURE-ONLY:
                 // shows whether/by how much the externalization's overflow path
@@ -293,7 +293,7 @@ struct builder {
             rss.stop();
         }
         process_prof().print(m_cfg.num_threads);
-        m_num_color_classes = global_dict.size();
+        m_num_color_sets = global_dict.size();
 
         // Interning is done. Free the dict's dedup index + per-class hash
         // vector NOW (finalize only needs the class count + the on-disk
@@ -328,7 +328,7 @@ struct builder {
                 const uint64_t n_frags = frag_sink.count();
 
                 const uint64_t unitig_bucket_count = pick_unitig_bucket_count_(
-                    m_num_color_classes, total_frag_seq_bytes, m_cfg.max_ram_gb);
+                    m_num_color_sets, total_frag_seq_bytes, m_cfg.max_ram_gb);
 
                 // The write-through unitig_bucket_writer only needs to know
                 // "finite (=> write-through, under -g)" vs "SIZE_MAX (=> keep in
@@ -340,7 +340,7 @@ struct builder {
                     unitig_ram_budget =
                         (size_t)(m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0 * STITCH_BUDGET_FRAC);
                 uwriter_ptr = std::make_unique<unitig_bucket_writer>(
-                    tmp_dir, m_num_color_classes, unitig_bucket_count, unitig_ram_budget);
+                    tmp_dir, m_num_color_sets, unitig_bucket_count, unitig_ram_budget);
                 // Govern the unitig writer for the stitch's duration: under -g
                 // pressure the governor spills its largest in-RAM cid-buckets to
                 // disk. Unregistered when this block exits (before emit, which
@@ -455,7 +455,7 @@ struct builder {
     // Stats populated by build(); zero before build() runs.
     uint64_t num_colors() const { return m_num_colors; }
     uint64_t num_unitigs() const { return m_num_unitigs; }
-    uint64_t num_color_classes() const { return m_num_color_classes; }
+    uint64_t num_color_sets() const { return m_num_color_sets; }
     uint64_t peak_rss_bytes() const { return m_peak_rss_bytes; }
     build_config const& config() const { return m_cfg; }
 
@@ -737,10 +737,10 @@ private:
 #endif
     }
 
-    static uint64_t pick_unitig_bucket_count_(uint64_t num_color_classes,
+    static uint64_t pick_unitig_bucket_count_(uint64_t num_color_sets,
                                               uint64_t total_seq_bytes_estimate,
                                               double max_ram_gb) {
-        if (num_color_classes == 0) return 1;
+        if (num_color_sets == 0) return 1;
         constexpr uint64_t MIN_K = 16;
         constexpr uint64_t MAX_K = 1024;
         constexpr uint64_t DEFAULT_K = 64;
@@ -748,15 +748,15 @@ private:
         constexpr double SHARE = 0.10;
 
         if (max_ram_gb <= 0 or total_seq_bytes_estimate == 0) {
-            return std::min<uint64_t>(num_color_classes, DEFAULT_K);
+            return std::min<uint64_t>(num_color_sets, DEFAULT_K);
         }
         const uint64_t budget_bytes = max_ram_gb * 1024.0 * 1024.0 * 1024.0 * SHARE;
-        if (budget_bytes == 0) { return std::min<uint64_t>(num_color_classes, DEFAULT_K); }
+        if (budget_bytes == 0) { return std::min<uint64_t>(num_color_sets, DEFAULT_K); }
         const uint64_t needed = total_seq_bytes_estimate * OVERHEAD;
         uint64_t k = (needed + budget_bytes - 1) / budget_bytes;
         if (k < MIN_K) k = MIN_K;
         if (k > MAX_K) k = MAX_K;
-        if (k > num_color_classes) k = num_color_classes;
+        if (k > num_color_sets) k = num_color_sets;
         return k;
     }
 
@@ -818,7 +818,7 @@ private:
     // serialized as a u32 only at the .color_sets header boundary (the dicts).
     uint64_t m_num_colors = 0;
     uint64_t m_num_unitigs = 0;
-    uint64_t m_num_color_classes = 0;
+    uint64_t m_num_color_sets = 0;
     uint64_t m_peak_rss_bytes = 0;
     // bucket-write batching payload, fixed at good defaults in
     // validate_and_resolve_config(); the bucket COUNT is sized against these.
