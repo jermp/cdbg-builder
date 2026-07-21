@@ -539,16 +539,25 @@ inline void process_bucket_sorting(std::string const& path, uint32_t k, uint32_t
                                    compact_color_set_dict& out_local_dict) {
     auto& prof = process_prof();
 
-    struct raw_rec {
-        std::vector<uint8_t> bases;    // 0..3, stored (read) frame
-        std::vector<uint32_t> colors;  // sorted-deduped color list
-        uint32_t min_pos = 0;
-        uint8_t flags = 0;
-        uint64_t min_canon = 0;  // canonical 2-bit value of the minimizer m-mer
-        bool rc = false;         // align by reverse-complementing to read min forward
-        bool normalizable = false;
+    // Per-record metadata; bases live 2-bit-packed in a single flat per-bucket
+    // buffer (byte-aligned per record) and colors are interned ONCE into a
+    // shared per-bucket dict -- no per-record heap vectors, no per-group color
+    // re-interning. This holds the bucket's super-k-mers at ~the on-disk packed
+    // size (vs the hashmap path's Theta(#distinct k-mers) map), which is the
+    // §3.8 memory win.
+    struct rec_meta {
+        uint32_t base_off;   // BYTE offset into packed all_bases
+        uint32_t base_len;   // number of bases
+        uint32_t min_pos;    // minimizer offset, stored (read) frame
+        uint32_t rsid;       // color-set id in the shared record_sets
+        uint64_t min_canon;  // canonical 2-bit value of the minimizer m-mer
+        uint8_t flags;       // SK_FLAG_*
+        bool rc;             // align by reverse-complementing to read min forward
+        bool normalizable;
     };
-    std::vector<raw_rec> recs;
+    std::vector<uint8_t> all_bases;  // flat, 2-bit packed, byte-aligned per record
+    std::vector<rec_meta> recs;
+    compact_color_set_dict record_sets(num_colors);  // shared across the bucket
     {
         auto t_load = bucket_process_prof::clock::now();
         bucket_reader reader(path);
@@ -561,15 +570,18 @@ inline void process_bucket_sorting(std::string const& path, uint32_t k, uint32_t
             ++loaded_records;
             if (bases.size() < k) continue;
             loaded_kmers += bases.size() - (k - 1);
-            raw_rec r;
-            r.bases = bases;
-            r.colors = colors;
+            const size_t L = bases.size();
+            rec_meta r;
+            r.base_off = (uint32_t)all_bases.size();
+            r.base_len = (uint32_t)L;
             r.min_pos = min_pos;
             r.flags = flags;
-            const size_t L = r.bases.size();
+            r.min_canon = 0;
+            r.rc = false;
+            r.normalizable = false;
             if ((size_t)min_pos + m <= L) {
                 uint64_t mv = 0;
-                for (uint32_t i = 0; i < m; ++i) mv = (mv << 2) | r.bases[min_pos + i];
+                for (uint32_t i = 0; i < m; ++i) mv = (mv << 2) | bases[min_pos + i];
                 uint64_t rcv = reverse_complement<uint64_t>(mv, m);
                 uint64_t canon = mv <= rcv ? mv : rcv;
                 r.min_canon = canon;
@@ -579,14 +591,16 @@ inline void process_bucket_sorting(std::string const& path, uint32_t k, uint32_t
                 uint32_t occ = 0;
                 for (size_t p = 0; p + m <= L; ++p) {
                     uint64_t w = 0;
-                    for (uint32_t i = 0; i < m; ++i) w = (w << 2) | r.bases[p + i];
+                    for (uint32_t i = 0; i < m; ++i) w = (w << 2) | bases[p + i];
                     uint64_t wr = reverse_complement<uint64_t>(w, m);
                     uint64_t wc = w <= wr ? w : wr;
                     if (wc == canon && ++occ > 1) break;
                 }
                 r.normalizable = (k % 2 == 1) && !palindrome && (occ == 1);
             }
-            recs.push_back(std::move(r));
+            r.rsid = record_sets.intern(std::move(colors));  // intern once (bucket-wide)
+            pack_2bit(bases.data(), L, all_bases);           // append packed, byte-aligned
+            recs.push_back(r);
         }
         prof.n_records.fetch_add(loaded_records, std::memory_order_relaxed);
         prof.n_kmers.fetch_add(loaded_kmers, std::memory_order_relaxed);
@@ -601,8 +615,10 @@ inline void process_bucket_sorting(std::string const& path, uint32_t k, uint32_t
 
     group_sorting_extender extender;
     std::vector<se_read> group_reads;
-    std::vector<uint8_t> gbases;
+    std::vector<uint8_t> gbases;          // aligned per-group base buffer (reused)
+    std::vector<uint8_t> unpack_scratch;  // reused per-record unpack buffer
     uint64_t n_sort = 0, n_fallback = 0;
+    uint64_t ext_ns = 0;  // sorting extend + fallback map-build (walk-equivalent)
 
     size_t gi = 0;
     while (gi < order.size()) {
@@ -615,21 +631,20 @@ inline void process_bucket_sorting(std::string const& path, uint32_t k, uint32_t
         }
 
         if (all_norm) {
-            compact_color_set_dict record_sets(num_colors);
+            auto t0 = bucket_process_prof::clock::now();
             group_reads.clear();
             gbases.clear();
             for (size_t t = gi; t < gj; ++t) {
-                raw_rec& r = recs[order[t]];
-                std::vector<uint32_t> col_copy = r.colors;
-                uint32_t rsid = record_sets.intern(std::move(col_copy));
+                rec_meta& r = recs[order[t]];
+                unpack_2bit(all_bases.data() + r.base_off, r.base_len, unpack_scratch);
                 const uint32_t off = (uint32_t)gbases.size();
-                const uint32_t L = (uint32_t)r.bases.size();
+                const uint32_t L = r.base_len;
                 se_read sr;
                 sr.base_off = off;
                 sr.base_len = L;
-                sr.rsid = rsid;
+                sr.rsid = r.rsid;
                 if (!r.rc) {
-                    for (uint32_t x = 0; x < L; ++x) gbases.push_back(r.bases[x]);
+                    gbases.insert(gbases.end(), unpack_scratch.begin(), unpack_scratch.end());
                     sr.min_pos = r.min_pos;
                     sr.flags = (uint8_t)(((r.flags & SK_FLAG_IS_ACGT_BEGIN) ? SE_INCL_BEGIN : 0) |
                                          ((r.flags & SK_FLAG_IS_ACGT_END) ? SE_INCL_END : 0) |
@@ -637,7 +652,7 @@ inline void process_bucket_sorting(std::string const& path, uint32_t k, uint32_t
                                          ((r.flags & SK_FLAG_OWNS_LAST) ? SE_OWNS_LAST : 0));
                 } else {
                     for (uint32_t x = 0; x < L; ++x)
-                        gbases.push_back((uint8_t)(3 - r.bases[L - 1 - x]));
+                        gbases.push_back((uint8_t)(3 - unpack_scratch[L - 1 - x]));
                     sr.min_pos = L - r.min_pos - m;
                     // Reverse-complement swaps the begin/end and first/last frames.
                     sr.flags = (uint8_t)(((r.flags & SK_FLAG_IS_ACGT_END) ? SE_INCL_BEGIN : 0) |
@@ -648,24 +663,27 @@ inline void process_bucket_sorting(std::string const& path, uint32_t k, uint32_t
                 group_reads.push_back(sr);
             }
             extender.process_group(group_reads, gbases, k, record_sets, out_local_dict, out_local);
+            ext_ns += bucket_process_prof::since(t0);
             n_sort += (gj - gi);
         } else {
+            auto t0 = bucket_process_prof::clock::now();
             bucket_kmer_map kmer_info;
-            {
-                compact_color_set_dict record_sets(num_colors);
-                for (size_t t = gi; t < gj; ++t) {
-                    raw_rec& r = recs[order[t]];
-                    std::vector<uint32_t> col_copy = r.colors;
-                    uint32_t rsid = record_sets.intern(std::move(col_copy));
-                    add_record_to_map(kmer_info, rsid, r.flags, r.bases.data(), r.bases.size(), k);
-                }
-                resolve_bucket(kmer_info, record_sets, out_local_dict);
+            for (size_t t = gi; t < gj; ++t) {
+                rec_meta& r = recs[order[t]];
+                unpack_2bit(all_bases.data() + r.base_off, r.base_len, unpack_scratch);
+                add_record_to_map(kmer_info, r.rsid, r.flags, unpack_scratch.data(), r.base_len, k);
             }
+            ext_ns += bucket_process_prof::since(t0);
+            // Shared record_sets holds every bucket record's colors; resolve only
+            // touches the rsids that appear in this group's kmer_info. These add
+            // to ns_resolve / ns_walk internally, so they are not in ext_ns.
+            resolve_bucket(kmer_info, record_sets, out_local_dict);
             walk_bucket(kmer_info, k, out_local);
             n_fallback += (gj - gi);
         }
         gi = gj;
     }
+    prof.ns_walk.fetch_add(ext_ns, std::memory_order_relaxed);
 
     prof.n_sort_records.fetch_add(n_sort, std::memory_order_relaxed);
     prof.n_fallback_records.fetch_add(n_fallback, std::memory_order_relaxed);
