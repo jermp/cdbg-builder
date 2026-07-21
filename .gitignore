@@ -24,3 +24,6 @@ test_output/
 # Python bytecode cache (e.g. from importing test_data/verify.py)
 __pycache__/
 *.pyc
+
+# Extracted test data (regenerated from se-50.tar.gz)
+/test_data/se-50/
