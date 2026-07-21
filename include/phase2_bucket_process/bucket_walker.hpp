@@ -33,7 +33,9 @@
 #include "phase1_bucket_write/bucket_io.hpp"
 #include "phase2_bucket_process/compact_color_set_dict.hpp"
 #include "kmer.hpp"
+#include "phase2_bucket_process/stitchable_unitig.hpp"
 #include "phase2_bucket_process/streaming_color_set_dict.hpp"
+#include "phase2_bucket_process/sorting_extender.hpp"
 #include "phase1_bucket_write/super_kmer.hpp"
 #include "util.hpp"
 
@@ -76,51 +78,6 @@ struct kmer_entry {
     }
 };
 
-// Open-end marker, in unitig-sequence orientation.
-inline constexpr uint8_t UNITIG_OPEN_LEFT = 1u << 0;
-inline constexpr uint8_t UNITIG_OPEN_RIGHT = 1u << 1;
-
-// A run of consecutive k-mers along a tig that share one color class.
-// num_kmers counts k-mers (a length-L tig of L = seq.size()-k+1 k-mers has
-// runs summing to L). This is the RLE color sequence GGCAT carries on a
-// topological unitig (UnitigColorData); the monochromatic split at emit
-// time cuts a tig at its run boundaries.
-//
-// INVARIANT: sum of num_kmers over a tig's runs == its seq k-mer count. Every
-// k-mer carries exactly one run unit, INCLUDING a foreign boundary k-mer at an
-// open end (whose color is owned by the adjacent bucket): it gets a run with
-// cid == COLOR_RUN_FOREIGN as a placeholder so seq and runs stay aligned. The
-// stitch reconciles that placeholder to the real color when the open end joins
-// its primary-side partner (ext_concat_runs); a fully closed (sunk) tig has had
-// every boundary joined, so it contains no foreign placeholders.
-inline constexpr uint64_t COLOR_RUN_FOREIGN = UINT64_MAX;
-struct color_run {
-    uint64_t cid;        // local during process_bucket, global after remap
-    uint32_t num_kmers;  // number of k-mers covered by this run (>= 1)
-};
-
-struct stitchable_unitig {
-    std::string seq;  // ACGT characters
-    // Colorless/topological tig: extension follows graph topology only
-    // (GGCAT hashmap.rs:230), never breaking on color. The per-k-mer color
-    // classes ride along as an RLE run sequence, joined at each stitch merge
-    // and cut into monochromatic unitigs at emit. `runs` covers exactly the
-    // tig's k-mers in 5'->3' order; while process_bucket emits, the cids are
-    // *local* (into the bucket's local_dict) and process_buckets remaps each
-    // to a global cid. For a monochromatic tig `runs` has a single element.
-    std::vector<color_run> runs;
-    uint8_t open_flags = 0;  // bits from UNITIG_OPEN_*
-
-    // Convenience: a freshly walked or post-split tig is monochromatic.
-    uint64_t mono_cid() const { return runs.empty() ? UINT64_MAX : runs.front().cid; }
-    // Set a single color run covering all of this tig's k-mers (seq must
-    // already be assigned). Used by tests that build monochromatic frags.
-    void set_mono(uint64_t cid, uint32_t k) {
-        uint32_t nk = (seq.size() >= k) ? (uint32_t)(seq.size() - k + 1) : 1;
-        runs.assign(1, color_run{cid, nk});
-    }
-};
-
 namespace detail {
 
 // Per-canonical-k-mer cross-bucket boundary flags (GGCAT hashmap.rs:382-398),
@@ -159,6 +116,55 @@ struct bucket_kmer_info {
 
 using bucket_kmer_map = ankerl::unordered_dense::map<kmer_int_t, bucket_kmer_info, kmer_hasher>;
 
+// Fold one super-k-mer record (already interned to `rsid`) into the bucket's
+// per-canonical-k-mer map. Extracted from load_bucket so the sorting extender's
+// per-group hashmap fallback can reuse the exact same k-mer/flag/ownership
+// accounting on an in-memory record subset. `bases` are 0-3 values.
+inline void add_record_to_map(bucket_kmer_map& out, uint32_t rsid, uint8_t flags,
+                              uint8_t const* bases, size_t bases_size, uint32_t k) {
+    if (bases_size < k) return;
+    const kmer_int_t mask = kmer_mask(k);
+    const uint32_t k_minus_1_x2 = 2 * (k - 1);
+
+    kmer_int_t fwd = 0, rc = 0;
+    for (uint32_t i = 0; i < k - 1; ++i) {
+        uint8_t v = bases[i];
+        fwd = ((fwd << 2) | v) & mask;
+        rc = (rc >> 2) | ((kmer_int_t)(v ^ 3) << k_minus_1_x2);
+    }
+    const bool begin_incl = (flags & SK_FLAG_IS_ACGT_BEGIN) != 0;
+    const bool end_incl = (flags & SK_FLAG_IS_ACGT_END) != 0;
+    const bool owns_first = (flags & SK_FLAG_OWNS_FIRST) != 0;
+    const bool owns_last = (flags & SK_FLAG_OWNS_LAST) != 0;
+    const uint32_t n_kmers = (uint32_t)(bases_size - (k - 1));
+    const uint32_t last_idx = n_kmers - 1;
+
+    uint32_t idx = 0;
+    for (size_t i = k - 1; i < bases_size; ++i, ++idx) {
+        uint8_t v = bases[i];
+        fwd = ((fwd << 2) | v) & mask;
+        rc = (rc >> 2) | ((kmer_int_t)(v ^ 3) << k_minus_1_x2);
+        bool is_fwd = (fwd <= rc);
+        kmer_int_t can = is_fwd ? fwd : rc;
+
+        uint8_t contrib = 0;
+        if (!begin_incl and idx == 0) contrib |= is_fwd ? KMER_BOUND_LEFT : KMER_BOUND_RIGHT;
+        if (!end_incl and idx == last_idx) contrib |= is_fwd ? KMER_BOUND_RIGHT : KMER_BOUND_LEFT;
+
+        bucket_kmer_info& info = out[can];
+        info.flags |= contrib;
+        const bool is_first = (idx == 0);
+        const bool is_last = (idx == last_idx);
+        bool owned = true;
+        if (is_first and !owns_first) owned = false;
+        if (is_last and !owns_last) owned = false;
+        if (owned) {
+            info.colors.add(rsid);
+            info.primary = true;
+        }
+    }
+}
+
 // Build the per-canonical-k-mer info from a bucket's super-k-mer stream.
 // Each record's color list is interned into `record_sets` once; the per
 // k-mer storage is just the rsid (or short list of rsids), not the colors
@@ -185,69 +191,7 @@ inline void load_bucket(std::string const& path, uint32_t k, bucket_kmer_map& ou
         // the next iteration via resize() + assignment, so a moved-from
         // state is safe.
         uint32_t rsid = record_sets.intern(std::move(colors));
-
-        const kmer_int_t mask = kmer_mask(k);
-        const uint32_t k_minus_1_x2 = 2 * (k - 1);
-
-        kmer_int_t fwd = 0, rc = 0;
-        for (uint32_t i = 0; i < k - 1; ++i) {
-            uint8_t v = bases[i];
-            fwd = ((fwd << 2) | v) & mask;
-            rc = (rc >> 2) | ((kmer_int_t)(v ^ 3) << k_minus_1_x2);
-        }
-
-        // GGCAT per-k-mer boundary flags (hashmap.rs:382-398). A k-mer is
-        // begin-ignored if it is the super's FIRST k-mer (idx 0) and the super
-        // does not begin an ACGT run (IS_ACGT_BEGIN clear) -- i.e. it is the
-        // overlap k-mer duplicated from the predecessor super in the adjacent
-        // bucket. Symmetrically end-ignored is the LAST k-mer of a super whose
-        // run does not end here. Each contributes a side bit oriented to the
-        // k-mer's canonical frame: a forward (canonical) k-mer's begin is its
-        // LEFT side and its end is its RIGHT; a reverse-canonical k-mer's are
-        // swapped (GGCAT's `<< (!is_forward)` / `<< is_forward`). Every k-mer --
-        // boundary or not -- is inserted and colored uniformly; the flag, not a
-        // separate node class, marks the cross-bucket boundary, and the same
-        // boundary k-mer is present (and colored) in BOTH adjacent buckets, the
-        // stitch reconciling the two copies on the full-k-mer key.
-        const bool begin_incl = (flags & SK_FLAG_IS_ACGT_BEGIN) != 0;
-        const bool end_incl = (flags & SK_FLAG_IS_ACGT_END) != 0;
-        const bool owns_first = (flags & SK_FLAG_OWNS_FIRST) != 0;
-        const bool owns_last = (flags & SK_FLAG_OWNS_LAST) != 0;
-        const uint32_t n_kmers = (uint32_t)(bases.size() - (k - 1));
-        const uint32_t last_idx = n_kmers - 1;
-
-        uint32_t idx = 0;
-        for (uint32_t i = k - 1; i < bases.size(); ++i, ++idx) {
-            uint8_t v = bases[i];
-            fwd = ((fwd << 2) | v) & mask;
-            rc = (rc >> 2) | ((kmer_int_t)(v ^ 3) << k_minus_1_x2);
-            bool is_fwd = (fwd <= rc);
-            kmer_int_t can = is_fwd ? fwd : rc;
-
-            uint8_t contrib = 0;
-            if (!begin_incl and idx == 0) contrib |= is_fwd ? KMER_BOUND_LEFT : KMER_BOUND_RIGHT;
-            if (!end_incl and idx == last_idx)
-                contrib |= is_fwd ? KMER_BOUND_RIGHT : KMER_BOUND_LEFT;
-
-            bucket_kmer_info& info = out[can];
-            info.flags |= contrib;
-            // Color (mark primary) this occurrence iff THIS bucket owns the
-            // k-mer (BCALM2: the boundary k-mer is colored in bucket(min(lmin,
-            // rmin)) only). Interior k-mers (neither first nor last) are always
-            // owned -- they are not cross-bucket boundaries. The first/last
-            // k-mers are owned per the SK_FLAG_OWNS_* bits set at ingest. This
-            // makes each k-mer primary in EXACTLY one bucket, so its color is the
-            // full union over its occurrences there (no partial-color split).
-            const bool is_first = (idx == 0);
-            const bool is_last = (idx == last_idx);
-            bool owned = true;
-            if (is_first and !owns_first) owned = false;
-            if (is_last and !owns_last) owned = false;
-            if (owned) {
-                info.colors.add(rsid);
-                info.primary = true;
-            }
-        }
+        add_record_to_map(out, rsid, flags, bases.data(), bases.size(), k);
     }
     auto& prof = process_prof();
     prof.n_records.fetch_add(loaded_records, std::memory_order_relaxed);
@@ -335,28 +279,15 @@ inline bool walk_step(kmer_int_t can, bool rc, bool forward, uint32_t k, bucket_
     return true;
 }
 
-inline void process_bucket(std::string const& path, uint32_t k, uint64_t num_colors,
-                           std::vector<stitchable_unitig>& out_local,
+// Resolve each primary k-mer's local cid, interning the color union into
+// out_local_dict and stashing the cid back into kmer_info. `record_sets` is
+// only read here; the caller frees it before the walk (it is unused after
+// resolve), preserving the original process_bucket memory profile. The dict is
+// non-movable, so it is passed by reference and scoped by the caller.
+inline void resolve_bucket(bucket_kmer_map& kmer_info, compact_color_set_dict& record_sets,
                            compact_color_set_dict& out_local_dict) {
     auto& prof = process_prof();
-    bucket_kmer_map kmer_info;
     {
-        // record_sets and the per-k-mer rsid storage are only needed while we
-        // resolve each k-mer's cid. We then stash the cid back INTO kmer_info
-        // (reusing kmer_entry.first_rsid, dead after resolve) and free the rest
-        // vectors, so the walk needs no separate kmer->cid map -- it reads the
-        // cid straight from the kmer_info entry it already looks up.
-        //
-        // record_sets is the compact (hybrid-encoded) variant -- on
-        // dense pangenome inputs the live-vector dict grew to hundreds
-        // of MB per bucket; with N threads in flight that became the
-        // dominant peak contributor. compact stores each color list
-        // hybrid-encoded and decodes on access into a scratch buffer.
-        compact_color_set_dict record_sets(num_colors);
-        auto t_load = bucket_process_prof::clock::now();
-        load_bucket(path, k, kmer_info, record_sets);
-        prof.ns_load.fetch_add(bucket_process_prof::since(t_load), std::memory_order_relaxed);
-
         auto t_resolve = bucket_process_prof::clock::now();
 
         // Common case: a k-mer is contributed by a single record, so its
@@ -427,7 +358,13 @@ inline void process_bucket(std::string const& path, uint32_t k, uint64_t num_col
         }
         prof.ns_resolve.fetch_add(bucket_process_prof::since(t_resolve), std::memory_order_relaxed);
     }
+}
 
+// Walk the resolved bucket's de Bruijn graph into stitchable fragments appended
+// to out_local. Splits out of resolve so the caller can free record_sets first.
+inline void walk_bucket(bucket_kmer_map& kmer_info, uint32_t k,
+                        std::vector<stitchable_unitig>& out_local) {
+    auto& prof = process_prof();
     auto t_walk = bucket_process_prof::clock::now();
     ankerl::unordered_dense::map<kmer_int_t, uint8_t, kmer_hasher> visited;
     visited.reserve(kmer_info.size());
@@ -565,6 +502,173 @@ inline void process_bucket(std::string const& path, uint32_t k, uint64_t num_col
         emit_from_seed(kv.first);
     }
     prof.ns_walk.fetch_add(bucket_process_prof::since(t_walk), std::memory_order_relaxed);
+    // NOTE: n_unitigs / n_local_classes are accumulated by the top-level driver
+    // (process_bucket / process_bucket_sorting), not here, so per-group fallback
+    // calls do not double-count the cumulative out_local size.
+}
+
+// Per-k-mer hashmap walk of one bucket: load its records into kmer_info, then
+// resolve + walk. This is the legacy phase-2 path and the fallback the sorting
+// extender routes non-normalizable / even-k buckets to.
+inline void process_bucket(std::string const& path, uint32_t k, uint64_t num_colors,
+                           std::vector<stitchable_unitig>& out_local,
+                           compact_color_set_dict& out_local_dict) {
+    auto& prof = process_prof();
+    bucket_kmer_map kmer_info;
+    {
+        compact_color_set_dict record_sets(num_colors);
+        auto t_load = bucket_process_prof::clock::now();
+        load_bucket(path, k, kmer_info, record_sets);
+        prof.ns_load.fetch_add(bucket_process_prof::since(t_load), std::memory_order_relaxed);
+        resolve_bucket(kmer_info, record_sets, out_local_dict);
+    }  // record_sets freed before the walk
+    walk_bucket(kmer_info, k, out_local);
+    prof.n_unitigs.fetch_add((uint64_t)out_local.size(), std::memory_order_relaxed);
+    prof.n_local_classes.fetch_add((uint64_t)out_local_dict.size(), std::memory_order_relaxed);
+}
+
+// Sorting-based extender driver (§3.8): read a bucket, group its records by the
+// canonical (k-1)-minimizer m-mer, align each group on that m-mer, and route the
+// group either to the sorting extender (all records normalizable + odd k) or to
+// the hashmap-walk fallback (resolve_and_walk on that group's records). Groups
+// are independent: any k-mer shared across groups is a boundary emitted as an
+// open end and rejoined by phase-3 stitch, exactly as a cross-bucket boundary.
+inline void process_bucket_sorting(std::string const& path, uint32_t k, uint32_t m,
+                                   uint64_t num_colors,
+                                   std::vector<stitchable_unitig>& out_local,
+                                   compact_color_set_dict& out_local_dict) {
+    auto& prof = process_prof();
+
+    struct raw_rec {
+        std::vector<uint8_t> bases;    // 0..3, stored (read) frame
+        std::vector<uint32_t> colors;  // sorted-deduped color list
+        uint32_t min_pos = 0;
+        uint8_t flags = 0;
+        uint64_t min_canon = 0;  // canonical 2-bit value of the minimizer m-mer
+        bool rc = false;         // align by reverse-complementing to read min forward
+        bool normalizable = false;
+    };
+    std::vector<raw_rec> recs;
+    {
+        auto t_load = bucket_process_prof::clock::now();
+        bucket_reader reader(path);
+        uint8_t flags = 0;
+        std::vector<uint32_t> colors;
+        std::vector<uint8_t> bases;
+        uint32_t min_pos = 0;
+        uint64_t loaded_records = 0, loaded_kmers = 0;
+        while (reader.next(flags, colors, bases, min_pos)) {
+            ++loaded_records;
+            if (bases.size() < k) continue;
+            loaded_kmers += bases.size() - (k - 1);
+            raw_rec r;
+            r.bases = bases;
+            r.colors = colors;
+            r.min_pos = min_pos;
+            r.flags = flags;
+            const size_t L = r.bases.size();
+            if ((size_t)min_pos + m <= L) {
+                uint64_t mv = 0;
+                for (uint32_t i = 0; i < m; ++i) mv = (mv << 2) | r.bases[min_pos + i];
+                uint64_t rcv = reverse_complement<uint64_t>(mv, m);
+                uint64_t canon = mv <= rcv ? mv : rcv;
+                r.min_canon = canon;
+                r.rc = (mv != canon);
+                const bool palindrome = (mv == rcv);
+                // Uniqueness: the canonical minimizer m-mer occurs once in the super.
+                uint32_t occ = 0;
+                for (size_t p = 0; p + m <= L; ++p) {
+                    uint64_t w = 0;
+                    for (uint32_t i = 0; i < m; ++i) w = (w << 2) | r.bases[p + i];
+                    uint64_t wr = reverse_complement<uint64_t>(w, m);
+                    uint64_t wc = w <= wr ? w : wr;
+                    if (wc == canon && ++occ > 1) break;
+                }
+                r.normalizable = (k % 2 == 1) && !palindrome && (occ == 1);
+            }
+            recs.push_back(std::move(r));
+        }
+        prof.n_records.fetch_add(loaded_records, std::memory_order_relaxed);
+        prof.n_kmers.fetch_add(loaded_kmers, std::memory_order_relaxed);
+        prof.ns_load.fetch_add(bucket_process_prof::since(t_load), std::memory_order_relaxed);
+    }
+
+    // Group by canonical minimizer value.
+    std::vector<uint32_t> order(recs.size());
+    for (uint32_t i = 0; i < recs.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.end(),
+              [&](uint32_t a, uint32_t b) { return recs[a].min_canon < recs[b].min_canon; });
+
+    group_sorting_extender extender;
+    std::vector<se_read> group_reads;
+    std::vector<uint8_t> gbases;
+    uint64_t n_sort = 0, n_fallback = 0;
+
+    size_t gi = 0;
+    while (gi < order.size()) {
+        size_t gj = gi;
+        const uint64_t key = recs[order[gi]].min_canon;
+        bool all_norm = true;
+        while (gj < order.size() && recs[order[gj]].min_canon == key) {
+            if (!recs[order[gj]].normalizable) all_norm = false;
+            ++gj;
+        }
+
+        if (all_norm) {
+            compact_color_set_dict record_sets(num_colors);
+            group_reads.clear();
+            gbases.clear();
+            for (size_t t = gi; t < gj; ++t) {
+                raw_rec& r = recs[order[t]];
+                std::vector<uint32_t> col_copy = r.colors;
+                uint32_t rsid = record_sets.intern(std::move(col_copy));
+                const uint32_t off = (uint32_t)gbases.size();
+                const uint32_t L = (uint32_t)r.bases.size();
+                se_read sr;
+                sr.base_off = off;
+                sr.base_len = L;
+                sr.rsid = rsid;
+                if (!r.rc) {
+                    for (uint32_t x = 0; x < L; ++x) gbases.push_back(r.bases[x]);
+                    sr.min_pos = r.min_pos;
+                    sr.flags = (uint8_t)(((r.flags & SK_FLAG_IS_ACGT_BEGIN) ? SE_INCL_BEGIN : 0) |
+                                         ((r.flags & SK_FLAG_IS_ACGT_END) ? SE_INCL_END : 0) |
+                                         ((r.flags & SK_FLAG_OWNS_FIRST) ? SE_OWNS_FIRST : 0) |
+                                         ((r.flags & SK_FLAG_OWNS_LAST) ? SE_OWNS_LAST : 0));
+                } else {
+                    for (uint32_t x = 0; x < L; ++x)
+                        gbases.push_back((uint8_t)(3 - r.bases[L - 1 - x]));
+                    sr.min_pos = L - r.min_pos - m;
+                    // Reverse-complement swaps the begin/end and first/last frames.
+                    sr.flags = (uint8_t)(((r.flags & SK_FLAG_IS_ACGT_END) ? SE_INCL_BEGIN : 0) |
+                                         ((r.flags & SK_FLAG_IS_ACGT_BEGIN) ? SE_INCL_END : 0) |
+                                         ((r.flags & SK_FLAG_OWNS_LAST) ? SE_OWNS_FIRST : 0) |
+                                         ((r.flags & SK_FLAG_OWNS_FIRST) ? SE_OWNS_LAST : 0));
+                }
+                group_reads.push_back(sr);
+            }
+            extender.process_group(group_reads, gbases, k, record_sets, out_local_dict, out_local);
+            n_sort += (gj - gi);
+        } else {
+            bucket_kmer_map kmer_info;
+            {
+                compact_color_set_dict record_sets(num_colors);
+                for (size_t t = gi; t < gj; ++t) {
+                    raw_rec& r = recs[order[t]];
+                    std::vector<uint32_t> col_copy = r.colors;
+                    uint32_t rsid = record_sets.intern(std::move(col_copy));
+                    add_record_to_map(kmer_info, rsid, r.flags, r.bases.data(), r.bases.size(), k);
+                }
+                resolve_bucket(kmer_info, record_sets, out_local_dict);
+            }
+            walk_bucket(kmer_info, k, out_local);
+            n_fallback += (gj - gi);
+        }
+        gi = gj;
+    }
+
+    prof.n_sort_records.fetch_add(n_sort, std::memory_order_relaxed);
+    prof.n_fallback_records.fetch_add(n_fallback, std::memory_order_relaxed);
     prof.n_unitigs.fetch_add((uint64_t)out_local.size(), std::memory_order_relaxed);
     prof.n_local_classes.fetch_add((uint64_t)out_local_dict.size(), std::memory_order_relaxed);
 }
@@ -605,11 +709,12 @@ inline void process_bucket(std::string const& path, uint32_t k, uint64_t num_col
 // thread count. One bucket is always allowed even if it alone exceeds the
 // budget (forward progress).
 template <typename Sink>
-inline void process_buckets(bucket_writer const& writer, uint32_t k, uint64_t num_colors,
-                            uint32_t num_threads, Sink&& sink,
+inline void process_buckets(bucket_writer const& writer, uint32_t k, uint32_t m,
+                            uint64_t num_colors, uint32_t num_threads, Sink&& sink,
                             streaming_color_set_dict& global_dict, std::mutex& global_mu,
                             std::atomic<uint64_t>* done = nullptr, uint64_t mem_budget_bytes = 0,
-                            bool delete_consumed_buckets = false) {
+                            bool delete_consumed_buckets = false,
+                            bool use_sorting_extender = false) {
     if (num_threads == 0) num_threads = 1;
     // global_dict is now internally sharded/thread-safe, so the caller's
     // global_mu is no longer used to guard the merge. Kept in the signature
@@ -676,8 +781,13 @@ inline void process_buckets(bucket_writer const& writer, uint32_t k, uint64_t nu
             // pangenome inputs.
             compact_color_set_dict local_dict(num_colors);
             try {
-                detail::process_bucket(writer.bucket_path(b), k, num_colors, bucket_unitigs,
-                                       local_dict);
+                if (use_sorting_extender) {
+                    detail::process_bucket_sorting(writer.bucket_path(b), k, m, num_colors,
+                                                   bucket_unitigs, local_dict);
+                } else {
+                    detail::process_bucket(writer.bucket_path(b), k, num_colors, bucket_unitigs,
+                                           local_dict);
+                }
             } catch (std::exception& e) {
                 std::cerr << "error processing bucket " << b << ": " << e.what() << '\n';
             }

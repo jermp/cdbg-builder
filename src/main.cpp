@@ -53,6 +53,10 @@ bool parse_args(int argc, char** argv, cdbg::build_config& cfg) {
     parser.add("verbose", "Verbose output.", "--verbose", false, true);
     parser.add("keep_tmp", "Do not delete -d <tmp_dir> on success (keeps scratch for debugging).",
                "--keep-tmp", false, true);
+    parser.add("sorting_extender",
+               "Phase 2: use the sorting-based unitig extender (GGCAT v2 §3.8) on normalizable "
+               "buckets, falling back to the hashmap walk otherwise.",
+               "--sorting-extender", false, true);
 
     if (!parser.parse()) return false;
 
@@ -70,6 +74,8 @@ bool parse_args(int argc, char** argv, cdbg::build_config& cfg) {
     if (parser.parsed("spill_bytes")) cfg.spill_bytes = parser.get<uint64_t>("spill_bytes");
     if (parser.parsed("verbose")) cfg.verbose = parser.get<bool>("verbose");
     if (parser.parsed("keep_tmp")) cfg.keep_tmp = parser.get<bool>("keep_tmp");
+    if (parser.parsed("sorting_extender"))
+        cfg.sorting_extender = parser.get<bool>("sorting_extender");
     return true;
 }
 

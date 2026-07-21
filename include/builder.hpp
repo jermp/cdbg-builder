@@ -264,9 +264,9 @@ struct builder {
                     dedup_budget = COLORSET_DEDUP_BUDGET_FRAC * total;
                 }
                 global_dict.set_dedup_budget(dedup_budget);
-                process_buckets(*writer, m_cfg.k, m_num_colors, m_cfg.num_threads, frag_sink,
-                                global_dict, global_mu, &done, bp_budget,
-                                /*delete_consumed_buckets=*/!m_cfg.keep_tmp);
+                process_buckets(*writer, m_cfg.k, m_cfg.m, m_num_colors, m_cfg.num_threads,
+                                frag_sink, global_dict, global_mu, &done, bp_budget,
+                                /*delete_consumed_buckets=*/!m_cfg.keep_tmp, m_cfg.sorting_extender);
                 prog.stop();
                 std::cout << "  bucket fragments: " << frag_sink.count() << "\n";
                 std::cout << "  distinct color classes: " << global_dict.size() << "\n";

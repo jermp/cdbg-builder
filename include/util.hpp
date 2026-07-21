@@ -63,6 +63,10 @@ struct build_config {
     bool verbose = false;
     // Do not remove tmp_dir on success (keeps the scratch dir for debugging).
     bool keep_tmp = false;
+    // Phase 2: use the sorting-based unitig extender (§3.8) for buckets whose
+    // records are all normalizable, instead of the per-k-mer hashmap walk. The
+    // hashmap walk remains the fallback for non-normalizable / even-k buckets.
+    bool sorting_extender = false;
 
     std::string u2c_filename() const { return cdbg::u2c_filename(out_basename); }
     std::string fa_filename() const { return cdbg::fa_filename(out_basename); }
@@ -546,6 +550,9 @@ struct bucket_process_prof {
     std::atomic<uint64_t> n_kmers{0};          // total k-mers rolled (sum of bases.size()-k+1)
     std::atomic<uint64_t> n_local_classes{0};  // sum of local_dict.size() across buckets
     std::atomic<uint64_t> n_unitigs{0};        // total bucket_unitigs emitted
+    // §3.8 sorting-extender routing split (only nonzero with --sorting-extender):
+    std::atomic<uint64_t> n_sort_records{0};      // records processed by the sorting extender
+    std::atomic<uint64_t> n_fallback_records{0};  // records routed to the hashmap fallback
 
     static inline uint64_t since(clock::time_point t0) {
         return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - t0)
@@ -568,11 +575,14 @@ struct bucket_process_prof {
             "  pre_hash    %7.2fs   (wyhash + fnv1a on decoded class, lock-free)\n"
             "  merge_wait  %7.2fs   (waiting on global_mu)\n"
             "  merge       %7.2fs   (global_dict.intern_with_hashes under global_mu)\n"
-            "  counts: buckets=%llu records=%llu kmers=%llu local_classes=%llu unitigs=%llu\n",
+            "  counts: buckets=%llu records=%llu kmers=%llu local_classes=%llu unitigs=%llu\n"
+            "  sorting-extender: sort_records=%llu fallback_records=%llu\n",
             s(ns_load), s(ns_resolve), s(ns_walk), s(ns_pre_decode), s(ns_pre_hash),
             s(ns_merge_lock_wait), s(ns_merge), (unsigned long long)load_a(n_buckets),
             (unsigned long long)load_a(n_records), (unsigned long long)load_a(n_kmers),
-            (unsigned long long)load_a(n_local_classes), (unsigned long long)load_a(n_unitigs));
+            (unsigned long long)load_a(n_local_classes), (unsigned long long)load_a(n_unitigs),
+            (unsigned long long)load_a(n_sort_records),
+            (unsigned long long)load_a(n_fallback_records));
     }
 };
 
