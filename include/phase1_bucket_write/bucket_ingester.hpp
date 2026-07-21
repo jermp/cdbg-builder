@@ -76,9 +76,15 @@ inline void emit_super_kmers(uint8_t const* bases, uint32_t L, uint32_t k, uint3
     bool cur_owns_first = true;        // first super's idx0 is the ACGT-begin (not a boundary)
     uint64_t cur_min = mq.min_hash();  // minimizer of (k-1)-mer 0
     uint32_t cur_bucket = bucket_of(cur_min);
+    // Base offset (in `bases`) of the m-mer achieving the running minimizer. The
+    // whole run shares one minimizer value, so this position is constant across
+    // the run; captured whenever the running minimizer changes. Recorded per
+    // super-k-mer as the §3.8 normalization anchor (relative to the super start).
+    int32_t cur_min_mmer_pos = mq.cur_min_pos;
 
     auto emit_super = [&](uint32_t first_kmer, uint32_t last_kmer, uint32_t bucket,
-                          bool is_run_begin, bool is_run_end, bool owns_first, bool owns_last) {
+                          bool is_run_begin, bool is_run_end, bool owns_first, bool owns_last,
+                          int32_t min_mmer_pos) {
         uint32_t base_start = first_kmer;
         uint32_t base_len = (last_kmer - first_kmer) + k;
         uint8_t flags = 0;
@@ -86,7 +92,12 @@ inline void emit_super_kmers(uint8_t const* bases, uint32_t L, uint32_t k, uint3
         if (is_run_end) flags |= SK_FLAG_IS_ACGT_END;
         if (owns_first) flags |= SK_FLAG_OWNS_FIRST;
         if (owns_last) flags |= SK_FLAG_OWNS_LAST;
-        sink.append(bucket, flags, color, bases + base_start, base_len);
+        // Minimizer position relative to this super-k-mer's first base. The
+        // minimizer m-mer lies within the run's (k-1)-mer windows, so it is
+        // always inside [base_start, base_start + base_len - m].
+        int32_t min_pos = min_mmer_pos - (int32_t)base_start;
+        if (min_pos < 0) min_pos = 0;  // defensive; should not happen
+        sink.append(bucket, flags, color, bases + base_start, base_len, (uint32_t)min_pos);
     };
 
     // Walk the (k-1)-mers j = 1..K. A maximal run [run_a..b] of equal-minimizer
@@ -110,11 +121,12 @@ inline void emit_super_kmers(uint8_t const* bases, uint32_t L, uint32_t k, uint3
             uint32_t first_kmer = (run_a == 0) ? 0 : run_a - 1;
             bool owns_last = (cur_min < new_min);
             emit_super(first_kmer, j - 1, cur_bucket, is_first_super, /*is_run_end=*/false,
-                       cur_owns_first, owns_last);
+                       cur_owns_first, owns_last, cur_min_mmer_pos);
             is_first_super = false;
             cur_owns_first = (new_min < cur_min);  // B owns its first X iff mB < mA
             cur_min = new_min;
             cur_bucket = bucket_of(new_min);
+            cur_min_mmer_pos = mq.cur_min_pos;  // minimizer m-mer position of the new run
             run_a = j;
         }
     }
@@ -123,7 +135,7 @@ inline void emit_super_kmers(uint8_t const* bases, uint32_t L, uint32_t k, uint3
     // boundary), so it always owns it; its first k-mer ownership was decided at
     // the preceding split (cur_owns_first).
     emit_super(first_kmer, K - 1, cur_bucket, is_first_super, /*is_run_end=*/true, cur_owns_first,
-               /*owns_last=*/true);
+               /*owns_last=*/true, cur_min_mmer_pos);
 }
 
 inline void ingest_file_bucketed(std::string const& path, uint32_t k, uint32_t m,

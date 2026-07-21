@@ -121,6 +121,7 @@ struct bucket_compactor  //
         uint32_t color;
         uint32_t key_off;
         uint32_t key_len;
+        uint32_t minimizer_pos;  // base offset of the minimizer m-mer in the bases
         uint8_t flags;
     };
 
@@ -149,6 +150,9 @@ struct bucket_compactor  //
                 // entry sees only one set of flags; subsequent merges
                 // across batches/colors AND-shrink the begin/end bits.
                 e.flags = r.flags;
+                // minimizer_pos is intrinsic to the (identical) base key, so all
+                // deduped occurrences agree; keep the first-seen value.
+                e.minimizer_pos = r.minimizer_pos;
                 e.colors.push_back(r.color);
                 m_bytes += key.size() + sizeof(uint32_t);
                 m_dedup.emplace(std::string(key), std::move(e));
@@ -214,6 +218,7 @@ struct bucket_compactor  //
 private:
     struct entry {
         std::vector<uint32_t> colors;  // ascending, deduped
+        uint32_t minimizer_pos = 0;
         uint8_t flags = 0;
     };
 
@@ -241,7 +246,7 @@ private:
             uint64_t base_len = varint_read((uint8_t const*)key.data(), key.size(), p);
             write_super_kmer_packed(e.flags, e.colors.data(), num_colors,
                                     (uint8_t const*)key.data() + p, (uint32_t)base_len,
-                                    m_batch_buf);
+                                    e.minimizer_pos, m_batch_buf);
         }
         if (m_batch_buf.empty()) {
             m_dedup.clear();
@@ -615,7 +620,8 @@ struct per_thread_bucket_buffers {
     // the base count. We build the dedup key here -- [varint len][2-bit packed
     // bases] -- so the bases live 4x smaller in RAM all the way to the spill.
     void append(uint32_t b,  // bucket_index
-                uint8_t flags, uint32_t color, uint8_t const* sk_bases, uint32_t len) {
+                uint8_t flags, uint32_t color, uint8_t const* sk_bases, uint32_t len,
+                uint32_t minimizer_pos) {
         auto& kbuf = keys[b];
         uint32_t off = (uint32_t)kbuf.size();
         varint_write(len, kbuf);         // length prefix (disambiguates packings)
@@ -625,7 +631,7 @@ struct per_thread_bucket_buffers {
         // on its dedup-map find() instead of re-hashing the (typically cold)
         // bytes from the writer's key_storage.
         uint64_t h = bucket_compactor::hash_bases(kbuf.data() + off, key_len);
-        recs[b].push_back({h, color, off, key_len, (uint8_t)(flags & 0xfu)});
+        recs[b].push_back({h, color, off, key_len, minimizer_pos, (uint8_t)(flags & 0xfu)});
         // Flush by UNPACKED base count, not kbuf.size(): the keys are 2-bit
         // packed, so a fixed packed-byte threshold would buffer ~4x more
         // super-k-mers (hence ~4x more pending_records, 24 B each) than the RAM
@@ -705,13 +711,22 @@ struct bucket_reader  //
     }
 
     // Iterate records in order. Returns false when no more records remain.
-    bool next(uint8_t& flags, std::vector<uint32_t>& colors, std::vector<uint8_t>& bases) {
+    // `min_pos` receives the record's minimizer m-mer base offset (§3.8).
+    bool next(uint8_t& flags, std::vector<uint32_t>& colors, std::vector<uint8_t>& bases,
+              uint32_t& min_pos) {
         if (m_pos >= m_buf.size()) return false;
-        size_t consumed =
-            read_super_kmer(m_buf.data() + m_pos, m_buf.size() - m_pos, flags, colors, bases);
+        size_t consumed = read_super_kmer(m_buf.data() + m_pos, m_buf.size() - m_pos, flags, colors,
+                                          bases, min_pos);
         if (consumed == 0) return false;
         m_pos += consumed;
         return true;
+    }
+
+    // Convenience overload for callers that don't need the minimizer position
+    // (the legacy hashmap walk re-canonicalizes every k-mer independently).
+    bool next(uint8_t& flags, std::vector<uint32_t>& colors, std::vector<uint8_t>& bases) {
+        uint32_t ignored = 0;
+        return next(flags, colors, bases, ignored);
     }
 
 private:

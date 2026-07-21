@@ -5,6 +5,7 @@
 //   [color_count : varint]
 //   [color_delta_0 : varint] ... [color_delta_{n-1} : varint]
 //   [length_with_flags : varint]
+//   [minimizer_pos : varint]
 //   [2-bit packed bases]
 //
 // Records are *compacted*: a super-k-mer that occurs in multiple input files
@@ -102,8 +103,14 @@ inline constexpr uint8_t SK_FLAG_OWNS_LAST = 1u << 3;
 // re-packing. `colors` must be sorted ascending and contain no duplicates;
 // the 4 low bits of length_with_flags carry flags (BEGIN, END, OWNS_FIRST,
 // OWNS_LAST) and len is shifted up by 4.
+//
+// `minimizer_pos` is the 0-based base offset of the super-k-mer's minimizer
+// m-mer within the record's stored bases (§3.8 normalization anchor). It is
+// intrinsic to the base sequence, so all deduped occurrences of a super-k-mer
+// agree on it. The sorting-based extender uses it to align a minimizer group;
+// the legacy hashmap walk ignores it (it re-canonicalizes every k-mer).
 inline void write_super_kmer_packed(uint8_t flags, uint32_t const* colors, uint32_t num_colors,
-                                    uint8_t const* packed, uint32_t base_len,
+                                    uint8_t const* packed, uint32_t base_len, uint32_t minimizer_pos,
                                     std::vector<uint8_t>& out) {
     varint_write(num_colors, out);
     uint32_t prev = 0;
@@ -113,13 +120,15 @@ inline void write_super_kmer_packed(uint8_t flags, uint32_t const* colors, uint3
         prev = c;
     }
     varint_write(((uint64_t)base_len << 4) | (flags & 0xfu), out);
+    varint_write((uint64_t)minimizer_pos, out);
     out.insert(out.end(), packed, packed + (base_len + 3) / 4);
 }
 
-// Returns the byte length consumed; sets out_flags, out_colors and copies
-// bases into out_bases. Returns 0 on malformed/EOF.
+// Returns the byte length consumed; sets out_flags, out_colors, out_min_pos and
+// copies bases into out_bases. Returns 0 on malformed/EOF.
 inline size_t read_super_kmer(uint8_t const* buf, size_t buf_len, uint8_t& out_flags,
-                              std::vector<uint32_t>& out_colors, std::vector<uint8_t>& out_bases) {
+                              std::vector<uint32_t>& out_colors, std::vector<uint8_t>& out_bases,
+                              uint32_t& out_min_pos) {
     if (buf_len < 1) return 0;
     size_t p = 0;
     uint64_t num_colors = varint_read(buf, buf_len, p);
@@ -136,6 +145,8 @@ inline size_t read_super_kmer(uint8_t const* buf, size_t buf_len, uint8_t& out_f
     uint64_t lenflags = varint_read(buf, buf_len, p);
     uint64_t len = lenflags >> 4;
     out_flags = (uint8_t)(lenflags & 0xfu);
+    if (p > buf_len) return 0;
+    out_min_pos = (uint32_t)varint_read(buf, buf_len, p);
     size_t base_bytes = (size_t)((len + 3) / 4);
     if (p + base_bytes > buf_len) return 0;
     unpack_2bit(buf + p, (size_t)len, out_bases);
