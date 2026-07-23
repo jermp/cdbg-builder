@@ -56,6 +56,8 @@
 #include <sys/stat.h>
 #include <vector>
 #include <lz4.h>
+#include <lz4hc.h>
+#include <libdeflate.h>
 
 #include <unordered_dense/unordered_dense.h>
 
@@ -69,6 +71,12 @@ namespace cdbg {
 // Default per-bucket hashmap memory budget (estimated). With 1024 buckets
 // at this budget the global ingest peak from the compactors is ~256 MiB.
 inline constexpr size_t DEFAULT_COMPACTOR_SPILL_BYTES = 256 * 1024;
+
+// Bucket-file codec ids (stored as the first byte of every bucket file so
+// the reader is self-describing -- no config plumbing to bucket_reader).
+// lz4hc and lz4 produce interchangeable blocks: both decode with
+// LZ4_decompress_safe, so codec 0 and 1 share the reader's LZ4 path.
+enum : uint8_t { BUCKET_CODEC_LZ4 = 0, BUCKET_CODEC_LZ4HC = 1, BUCKET_CODEC_DEFLATE = 2 };
 
 struct bucket_compactor  //
 {
@@ -85,18 +93,37 @@ struct bucket_compactor  //
     // (m_batch_buf, m_out_buf) grow up to one spill's worth of bytes
     // and are reused across spills. They're already counted as part
     // of the compactor's structural cost in the auto-tune model.
-    bucket_compactor(std::string path, size_t spill_bytes)
+    bucket_compactor(std::string path, size_t spill_bytes, uint8_t codec = BUCKET_CODEC_LZ4,
+                     int codec_level = 0)
         : m_path(std::move(path))
-        , m_spill_bytes(spill_bytes)  //
+        , m_spill_bytes(spill_bytes)
+        , m_codec(codec)  //
     {
         m_file = std::fopen(m_path.c_str(), "wb");
         if (!m_file) {
             throw std::runtime_error("cannot open bucket file: " + m_path + ": " +
                                      std::strerror(errno));
         }
+        // First byte of the file records the codec so bucket_reader is
+        // self-describing (no config plumbing across the phase boundary).
+        if (std::fwrite(&m_codec, 1, 1, m_file) != 1) {
+            throw std::runtime_error("short write of codec header to " + m_path);
+        }
+        if (m_codec == BUCKET_CODEC_DEFLATE) {
+            // libdeflate levels are 1-12; 0 means "codec default" -> 6.
+            int lvl = codec_level > 0 ? codec_level : 6;
+            m_deflate = libdeflate_alloc_compressor(lvl);
+            if (!m_deflate) throw std::runtime_error("libdeflate_alloc_compressor failed");
+        } else if (m_codec == BUCKET_CODEC_LZ4HC) {
+            // LZ4HC levels are 1-12; 0 means "codec default" -> LZ4HC_CLEVEL_DEFAULT (9).
+            m_lz4hc_level = codec_level > 0 ? codec_level : LZ4HC_CLEVEL_DEFAULT;
+        }
     }
 
-    ~bucket_compactor() { close(); }
+    ~bucket_compactor() {
+        close();
+        if (m_deflate) libdeflate_free_compressor(m_deflate);
+    }
 
     bucket_compactor(bucket_compactor const&) = delete;
     bucket_compactor& operator=(bucket_compactor const&) = delete;
@@ -248,21 +275,39 @@ private:
             m_bytes = 0;
             return;
         }
-        // LZ4 block API: stateless, fast mode (acceleration=1). The
-        // function expects int parameters, so we cap each frame at
-        // ~1 GiB; in practice spills are kilobytes to a few MiB so
-        // this never trips.
+        // The LZ4 path uses int-sized lengths, so cap each frame at
+        // ~1 GiB; in practice spills are kilobytes to a few MiB so this
+        // never trips. (deflate uses size_t and is bounded well below.)
         if (m_batch_buf.size() > (size_t)LZ4_MAX_INPUT_SIZE) {
             throw std::runtime_error("spill batch exceeds LZ4_MAX_INPUT_SIZE on " + m_path);
         }
-        int src_size = (int)m_batch_buf.size();
-        int bound = LZ4_compressBound(src_size);
-        if (bound <= 0) throw std::runtime_error("LZ4_compressBound failed on " + m_path);
-        if (m_out_buf.size() < (size_t)bound) m_out_buf.resize((size_t)bound);
-        int compressed =
-            LZ4_compress_default((char const*)m_batch_buf.data(), (char*)m_out_buf.data(), src_size,
-                                 (int)m_out_buf.size());
-        if (compressed <= 0) throw std::runtime_error("LZ4_compress_default failed on " + m_path);
+        size_t src_size = m_batch_buf.size();
+        size_t compressed = 0;
+        if (m_codec == BUCKET_CODEC_DEFLATE) {
+            size_t bound = libdeflate_deflate_compress_bound(m_deflate, src_size);
+            if (m_out_buf.size() < bound) m_out_buf.resize(bound);
+            compressed = libdeflate_deflate_compress(m_deflate, m_batch_buf.data(), src_size,
+                                                     m_out_buf.data(), m_out_buf.size());
+            // Returns 0 if it couldn't fit in bound (should never happen).
+            if (compressed == 0) throw std::runtime_error("libdeflate_deflate_compress failed on " +
+                                                          m_path);
+        } else {
+            int bound = LZ4_compressBound((int)src_size);
+            if (bound <= 0) throw std::runtime_error("LZ4_compressBound failed on " + m_path);
+            if (m_out_buf.size() < (size_t)bound) m_out_buf.resize((size_t)bound);
+            int lz;
+            if (m_codec == BUCKET_CODEC_LZ4HC) {
+                lz = LZ4_compress_HC((char const*)m_batch_buf.data(), (char*)m_out_buf.data(),
+                                     (int)src_size, (int)m_out_buf.size(), m_lz4hc_level);
+            } else {
+                // acceleration=1 fast mode (current default behavior).
+                lz = LZ4_compress_default((char const*)m_batch_buf.data(),
+                                          (char*)m_out_buf.data(), (int)src_size,
+                                          (int)m_out_buf.size());
+            }
+            if (lz <= 0) throw std::runtime_error("LZ4 compress failed on " + m_path);
+            compressed = (size_t)lz;
+        }
         // Write per-spill frame: [u32 uncompressed][u32 compressed][bytes].
         uint32_t u = (uint32_t)src_size;
         uint32_t c = (uint32_t)compressed;
@@ -324,6 +369,9 @@ private:
 
     std::string m_path;
     size_t m_spill_bytes;
+    uint8_t m_codec = BUCKET_CODEC_LZ4;
+    int m_lz4hc_level = 0;                            // only used when m_codec==lz4hc
+    struct libdeflate_compressor* m_deflate = nullptr;  // only allocated when m_codec==deflate
     std::mutex m_mu;
     std::FILE* m_file = nullptr;
     // m_batch_buf accumulates the serialized super-k-mer records of one
@@ -344,7 +392,8 @@ private:
 struct bucket_writer  //
 {
     bucket_writer(std::string const& dir, uint32_t num_buckets, size_t flush_bases = 64 * 1024,
-                  size_t spill_bytes = DEFAULT_COMPACTOR_SPILL_BYTES)
+                  size_t spill_bytes = DEFAULT_COMPACTOR_SPILL_BYTES,
+                  uint8_t codec = BUCKET_CODEC_LZ4, int codec_level = 0)
         : m_dir(dir)
         , m_num_buckets(num_buckets)
         , m_flush_bases(flush_bases)  //
@@ -353,7 +402,7 @@ struct bucket_writer  //
         m_compactors.reserve(num_buckets);
         for (uint32_t b = 0; b < num_buckets; ++b) {
             m_compactors.emplace_back(
-                std::make_unique<bucket_compactor>(bucket_path(b), spill_bytes));
+                std::make_unique<bucket_compactor>(bucket_path(b), spill_bytes, codec, codec_level));
         }
     }
 
@@ -654,17 +703,40 @@ struct bucket_reader  //
     // bucket_walker can iterate records via a simple byte cursor.
     //
     // File format (matches bucket_compactor on the write side):
+    //   [u8 codec]                   0=lz4, 1=lz4hc, 2=deflate
     //   repeat:
     //     [u32 uncompressed_size]   little-endian; 0 marks end-of-stream
     //     [u32 compressed_size]
     //     [compressed bytes]
     //
     // Each frame is one spill. We read uncompressed_size + compressed_size,
-    // realloc m_buf if needed, and call LZ4_decompress_safe directly into
-    // m_buf at the current write offset. Output buffer grows geometrically.
+    // realloc m_buf if needed, and decompress directly into m_buf at the
+    // current write offset. Output buffer grows geometrically. lz4 and
+    // lz4hc are both decoded by LZ4_decompress_safe (interchangeable
+    // blocks); deflate is decoded by libdeflate.
     explicit bucket_reader(std::string const& path) {
         std::FILE* f = std::fopen(path.c_str(), "rb");
         if (!f) throw std::runtime_error("cannot open " + path + ": " + std::strerror(errno));
+
+        uint8_t codec = BUCKET_CODEC_LZ4;
+        if (std::fread(&codec, 1, 1, f) != 1) {
+            // Empty file (no records, no codec byte) is a legitimate
+            // no-op bucket: leave m_buf empty and return.
+            if (std::feof(f)) {
+                std::fclose(f);
+                return;
+            }
+            std::fclose(f);
+            throw std::runtime_error("short read of codec header on " + path);
+        }
+        struct libdeflate_decompressor* dec = nullptr;
+        if (codec == BUCKET_CODEC_DEFLATE) {
+            dec = libdeflate_alloc_decompressor();
+            if (!dec) {
+                std::fclose(f);
+                throw std::runtime_error("libdeflate_alloc_decompressor failed");
+            }
+        }
 
         std::vector<uint8_t> comp_buf;
         size_t out_off = 0;
@@ -677,30 +749,45 @@ struct bucket_reader  //
                 // happen with our writer, but handle it anyway): EOF
                 // here is fine as long as the stream ends cleanly.
                 if (std::feof(f)) break;
+                if (dec) libdeflate_free_decompressor(dec);
                 std::fclose(f);
                 throw std::runtime_error("short read of frame header on " + path);
             }
             if (u == 0) break;  // explicit end-of-stream marker
             uint32_t c = 0;
             if (std::fread(&c, sizeof(c), 1, f) != 1) {
+                if (dec) libdeflate_free_decompressor(dec);
                 std::fclose(f);
                 throw std::runtime_error("short read of compressed_size on " + path);
             }
             if (comp_buf.size() < c) comp_buf.resize(c);
             if (std::fread(comp_buf.data(), 1, c, f) != c) {
+                if (dec) libdeflate_free_decompressor(dec);
                 std::fclose(f);
                 throw std::runtime_error("short read of compressed payload on " + path);
             }
             if (m_buf.size() < out_off + u) m_buf.resize(out_off + u);
-            int decoded = LZ4_decompress_safe((char const*)comp_buf.data(),
-                                              (char*)m_buf.data() + out_off, (int)c, (int)u);
-            if (decoded < 0 or (uint32_t) decoded != u) {
-                std::fclose(f);
-                throw std::runtime_error("LZ4_decompress_safe failed on " + path);
+            if (codec == BUCKET_CODEC_DEFLATE) {
+                size_t actual = 0;
+                enum libdeflate_result r = libdeflate_deflate_decompress(
+                    dec, comp_buf.data(), c, m_buf.data() + out_off, u, &actual);
+                if (r != LIBDEFLATE_SUCCESS or actual != u) {
+                    libdeflate_free_decompressor(dec);
+                    std::fclose(f);
+                    throw std::runtime_error("libdeflate_deflate_decompress failed on " + path);
+                }
+            } else {
+                int decoded = LZ4_decompress_safe((char const*)comp_buf.data(),
+                                                  (char*)m_buf.data() + out_off, (int)c, (int)u);
+                if (decoded < 0 or (uint32_t) decoded != u) {
+                    std::fclose(f);
+                    throw std::runtime_error("LZ4_decompress_safe failed on " + path);
+                }
             }
             out_off += u;
         }
         m_buf.resize(out_off);
+        if (dec) libdeflate_free_decompressor(dec);
         std::fclose(f);
     }
 

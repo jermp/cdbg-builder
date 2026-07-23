@@ -52,6 +52,15 @@ struct build_config {
     // before a disk frame. Smaller -> larger derived bucket count B.
     uint64_t flush_bases = 0;
     uint64_t spill_bytes = 0;
+    // Intermediate bucket-file codec. The pipeline is I/O-bound at scale
+    // (bucket-write out + bucket-process read-back both saturate disk),
+    // while CPU sits idle -- so a higher-ratio codec trades spare cycles
+    // for fewer bytes on disk. 0 = lz4 (fast, default), 1 = lz4hc (better
+    // ratio, SAME lz4 decode path), 2 = deflate (libdeflate, ~2x ratio).
+    // bucket_codec_level: codec compression level (0 = codec default;
+    // lz4hc 1-12, deflate 1-12). Ignored for lz4.
+    uint8_t bucket_codec = 0;
+    int bucket_codec_level = 0;
     // Soft RAM budget in GiB. 0 = no budget. When set, the builder
     // auto-picks bucket_log2 (more buckets -> smaller per-bucket data
     // structures) and streams the encoded color bit_vector to a

@@ -114,9 +114,14 @@ struct builder {
         std::cout << "k = " << m_cfg.k << ", m = " << m_cfg.m << ", num_colors = " << m_num_colors
                   << ", num_threads = " << m_cfg.num_threads << ", num_buckets = " << num_buckets
                   << "\n";
+        char const* codec_name = m_cfg.bucket_codec == BUCKET_CODEC_DEFLATE  ? "deflate"
+                                 : m_cfg.bucket_codec == BUCKET_CODEC_LZ4HC ? "lz4hc"
+                                                                            : "lz4";
         std::cout << "  bucket-write model: flush_bases=" << format_bytes(m_flush_bases)
-                  << ", spill_bytes=" << format_bytes(m_spill_bytes) << ", alpha=" << m_cfg.alpha
-                  << ", beta=" << m_cfg.beta;
+                  << ", spill_bytes=" << format_bytes(m_spill_bytes) << ", codec=" << codec_name;
+        if (m_cfg.bucket_codec != BUCKET_CODEC_LZ4 && m_cfg.bucket_codec_level > 0)
+            std::cout << "@" << m_cfg.bucket_codec_level;
+        std::cout << ", alpha=" << m_cfg.alpha << ", beta=" << m_cfg.beta;
         if (m_cfg.max_ram_gb > 0 and PLATFORM_RAM_OVERHEAD > 1.0) {
             std::cout << " (platform RAM overhead " << PLATFORM_RAM_OVERHEAD << "x)";
         }
@@ -128,8 +133,9 @@ struct builder {
         std::string const tmp_dir = resolve_tmp_dir();
         std::cout << "  tmp_dir = " << tmp_dir << "\n";
 
-        auto writer =
-            std::make_unique<bucket_writer>(tmp_dir, num_buckets, m_flush_bases, m_spill_bytes);
+        auto writer = std::make_unique<bucket_writer>(tmp_dir, num_buckets, m_flush_bases,
+                                                      m_spill_bytes, m_cfg.bucket_codec,
+                                                      m_cfg.bucket_codec_level);
 
         // When -g is set, arm a background RSS watcher with
         // hysteresis. Bucket-write must leave room for what comes

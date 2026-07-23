@@ -72,25 +72,29 @@ include_directories(${CMD_LINE_PARSER_INCLUDE_DIR})
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/external)
 include_directories(${LZ4_DIR})
 
-# LZ4 (used for intermediate bucket file compression). We only need the
-# block API (LZ4_compress_default / LZ4_decompress_safe), so the static
-# library is just lz4.c -- no frame, no HC, no xxhash. Custom per-spill
-# framing is handled in bucket_io.hpp.
+# LZ4 (used for intermediate bucket file compression). We use the block
+# API: LZ4_compress_default / LZ4_decompress_safe (codec 0), plus
+# LZ4_compress_HC (codec 1, --bucket-codec 1) for a better ratio when the
+# pipeline is I/O-bound. lz4hc.c provides the HC compressor and decodes
+# via the same LZ4_decompress_safe. Custom per-spill framing lives in
+# bucket_io.hpp -- no frame API, no xxhash.
 add_library(lz4_static STATIC
         ${LZ4_DIR}/lz4.c
+        ${LZ4_DIR}/lz4hc.c
 )
 set_target_properties(lz4_static PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(lz4_static PUBLIC ${LZ4_DIR})
 
-# libdeflate (decompress-only). Vendored as a submodule and built via
-# its own CMakeLists.txt with compression / zlib / shared lib / cli
-# disabled. We only call libdeflate_alloc_decompressor +
-# libdeflate_gzip_decompress_ex from seq_reader.hpp -- no compressor
-# state, no zlib wrapper. ~2-3x faster than zlib for decompression on
-# bacterial genome FASTA inputs.
+# libdeflate. Vendored as a submodule and built via its own CMakeLists.txt
+# with zlib / shared lib / cli disabled. seq_reader.hpp uses the gzip
+# decompressor for FASTA/FASTQ input; the intermediate bucket codec
+# (--bucket-codec 2) uses the raw-DEFLATE compressor/decompressor, so
+# both COMPRESSION_SUPPORT and DECOMPRESSION_SUPPORT are enabled. ~2x
+# better ratio than lz4 on the bucket streams, trading spare CPU for less
+# disk I/O when the pipeline is I/O-bound.
 set(LIBDEFLATE_BUILD_STATIC_LIB ON CACHE BOOL "" FORCE)
 set(LIBDEFLATE_BUILD_SHARED_LIB OFF CACHE BOOL "" FORCE)
-set(LIBDEFLATE_COMPRESSION_SUPPORT OFF CACHE BOOL "" FORCE)
+set(LIBDEFLATE_COMPRESSION_SUPPORT ON CACHE BOOL "" FORCE)
 set(LIBDEFLATE_DECOMPRESSION_SUPPORT ON CACHE BOOL "" FORCE)
 set(LIBDEFLATE_GZIP_SUPPORT ON CACHE BOOL "" FORCE)
 set(LIBDEFLATE_ZLIB_SUPPORT OFF CACHE BOOL "" FORCE)

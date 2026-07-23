@@ -50,6 +50,13 @@ bool parse_args(int argc, char** argv, cdbg::build_config& cfg) {
                "Compactor dedup window in bytes before a disk frame (default 65536)."
                " Smaller -> larger B but weaker dedup / bigger bucket files.",
                "--spill", false);
+    parser.add("bucket_codec",
+               "Intermediate bucket-file codec: 0=lz4 (default), 1=lz4hc, 2=deflate."
+               " Higher-ratio codecs trade spare CPU for less disk I/O (faster when I/O-bound).",
+               "--bucket-codec", false);
+    parser.add("bucket_level",
+               "Compression level for --bucket-codec (0=codec default; lz4hc/deflate 1-12).",
+               "--bucket-level", false);
     parser.add("verbose", "Verbose output.", "--verbose", false, true);
     parser.add("keep_tmp", "Do not delete -d <tmp_dir> on success (keeps scratch for debugging).",
                "--keep-tmp", false, true);
@@ -68,6 +75,9 @@ bool parse_args(int argc, char** argv, cdbg::build_config& cfg) {
     if (parser.parsed("beta")) cfg.beta = parser.get<double>("beta");
     if (parser.parsed("flush_bases")) cfg.flush_bases = parser.get<uint64_t>("flush_bases");
     if (parser.parsed("spill_bytes")) cfg.spill_bytes = parser.get<uint64_t>("spill_bytes");
+    if (parser.parsed("bucket_codec"))
+        cfg.bucket_codec = (uint8_t)parser.get<uint32_t>("bucket_codec");
+    if (parser.parsed("bucket_level")) cfg.bucket_codec_level = parser.get<int>("bucket_level");
     if (parser.parsed("verbose")) cfg.verbose = parser.get<bool>("verbose");
     if (parser.parsed("keep_tmp")) cfg.keep_tmp = parser.get<bool>("keep_tmp");
     return true;
