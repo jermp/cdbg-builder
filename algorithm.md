@@ -880,7 +880,6 @@ RAM as an `n_unitigs / 8`-byte bitmap — one more non-spillable floor removed.
 [u32 num_colors]
 [u32 sparse_threshold]              = floor(0.25 * num_colors)
 [u32 dense_threshold]               = floor(0.75 * num_colors)
-[u64 num_color_sets]
 [u64 bit_vector_num_bits]
 [u64 bit_vector_num_words]          = ceil(bit_vector_num_bits / 64)
 [bit_vector_num_words × u64]        color-set bit_vector words

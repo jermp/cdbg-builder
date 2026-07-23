@@ -281,7 +281,6 @@ struct streaming_color_set_dict {
         write_pod_(m_num_colors);
         write_pod_(m_sparse_threshold);
         write_pod_(m_dense_threshold);
-        write_pod_((uint64_t)size());
         write_pod_(total_bit_count);
         write_pod_(total_word_count);
 
@@ -296,7 +295,7 @@ struct streaming_color_set_dict {
     }
 
 private:
-    static constexpr size_t HEADER_BYTES = 4 + 4 + 4 + 8 + 8 + 8;
+    static constexpr size_t HEADER_BYTES = 4 + 4 + 4 + 8 + 8;
 
     // Forward-input iterator over a sequence of u64s on disk. Used at
     // finalize to feed bits::elias_fano::encode without ever
