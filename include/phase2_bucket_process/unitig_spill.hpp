@@ -119,6 +119,11 @@ public:
         const uint64_t cid = u.mono_cid();  // post-split: monochromatic
         const uint32_t b = bucket_for_cid(cid);
         ++m_total_unitigs;
+        // Sum unitig sequence lengths (bases) here, before u.seq is moved/
+        // swapped away below. The distinct k-mer count is derivable from this:
+        // sum(len) - num_unitigs*(k-1), since each length-L unitig holds
+        // L-(k-1) k-mers and stitching preserves the total.
+        m_total_seq_bytes += u.seq.size();
         // Write-through mode (a -g budget is in force): NEVER retain unitig bytes
         // in RAM -- stream every record straight to its bucket's disk file, exactly
         // like the proven README path (661k stitch peak 41 GiB). The RAM-first
@@ -166,6 +171,8 @@ public:
     }
 
     uint64_t total_unitigs() const { return m_total_unitigs; }
+    // Sum of all final unitig sequence lengths (bases). See operator().
+    uint64_t total_seq_bytes() const { return m_total_seq_bytes; }
     uint32_t num_buckets() const { return m_num_buckets; }
     uint64_t num_color_sets() const { return m_num_color_sets; }
 
@@ -398,6 +405,7 @@ private:
     uint32_t m_num_buckets;
     std::vector<std::FILE*> m_files;  // null until the bucket spills
     uint64_t m_total_unitigs = 0;
+    uint64_t m_total_seq_bytes = 0;
 
     // In-RAM unitig buffer (skips the temp round-trip when it fits the budget).
     std::vector<std::vector<record>> m_ram;  // RAM-resident records, per bucket

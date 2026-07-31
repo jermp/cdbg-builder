@@ -397,6 +397,11 @@ struct builder {
         // debugging).
         if (!m_cfg.keep_tmp) frag_sink.unlink();
         m_num_unitigs = uwriter_ptr->total_unitigs();
+        // Distinct k-mers = sum over final unitigs of (len - (k-1)). Each
+        // length-L unitig covers L-(k-1) k-mers and the unitig set partitions
+        // the distinct k-mer set, so this is exact (stitching preserves it).
+        m_num_kmers =
+            uwriter_ptr->total_seq_bytes() - m_num_unitigs * (uint64_t)(m_cfg.k - 1);
 
         // Stitch allocates large transient buffers that are freed when it
         // returns, but glibc keeps the freed pages in its per-thread arenas
@@ -417,6 +422,10 @@ struct builder {
             emit_colors(global_dict);
             rss.stop();
         }
+
+        // Plain-text summary of the construction. Written last, once every
+        // statistic is final. num_kmers is the distinct k-mer count.
+        write_metadata_();
 
         // Remove the scratch dir and everything under it (unless --keep-tmp,
         // which preserves the scratch dir for debugging).
@@ -447,7 +456,7 @@ struct builder {
         }
 
         std::cout << "done. wrote " << m_cfg.fa_filename() << ", " << m_cfg.u2c_filename()
-                  << ", and " << m_cfg.cs_filename() << "\n";
+                  << ", " << m_cfg.cs_filename() << ", and " << m_cfg.metadata_filename() << "\n";
         build_timer.stop();
         std::cout << "[total construction time] " << build_timer.elapsed() << " s\n";
     }
@@ -456,6 +465,7 @@ struct builder {
     uint64_t num_colors() const { return m_num_colors; }
     uint64_t num_unitigs() const { return m_num_unitigs; }
     uint64_t num_color_sets() const { return m_num_color_sets; }
+    uint64_t num_kmers() const { return m_num_kmers; }
     uint64_t peak_rss_bytes() const { return m_peak_rss_bytes; }
     build_config const& config() const { return m_cfg; }
 
@@ -737,6 +747,20 @@ private:
 #endif
     }
 
+    // Write <basename>.metadata.txt: a plain-text summary of the construction,
+    // one "key=value" per line. Called after every statistic is final.
+    void write_metadata_() const {
+        std::string const path = m_cfg.metadata_filename();
+        std::ofstream out(path);
+        if (!out) throw std::runtime_error("cannot open metadata file for writing: " + path);
+        out << "k=" << m_cfg.k << "\n"
+            << "num_kmers=" << m_num_kmers << "\n"
+            << "num_colors=" << m_num_colors << "\n"
+            << "num_unitigs=" << m_num_unitigs << "\n"
+            << "num_color_sets=" << m_num_color_sets << "\n";
+        if (!out) throw std::runtime_error("failed writing metadata file: " + path);
+    }
+
     static uint64_t pick_unitig_bucket_count_(uint64_t num_color_sets,
                                               uint64_t total_seq_bytes_estimate,
                                               double max_ram_gb) {
@@ -819,6 +843,7 @@ private:
     uint64_t m_num_colors = 0;
     uint64_t m_num_unitigs = 0;
     uint64_t m_num_color_sets = 0;
+    uint64_t m_num_kmers = 0;
     uint64_t m_peak_rss_bytes = 0;
     // bucket-write batching payload, fixed at good defaults in
     // validate_and_resolve_config(); the bucket COUNT is sized against these.

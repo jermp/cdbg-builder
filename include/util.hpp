@@ -25,6 +25,9 @@ namespace cdbg {
 inline std::string u2c_filename(std::string const& filename) { return filename + ".u2c"; }
 inline std::string fa_filename(std::string const& filename) { return filename + ".fa"; }
 inline std::string cs_filename(std::string const& filename) { return filename + ".color_sets"; }
+inline std::string metadata_filename(std::string const& filename) {
+    return filename + ".metadata.txt";
+}
 
 // ---- build configuration ----------------------------------------------------
 
@@ -67,6 +70,7 @@ struct build_config {
     std::string u2c_filename() const { return cdbg::u2c_filename(out_basename); }
     std::string fa_filename() const { return cdbg::fa_filename(out_basename); }
     std::string cs_filename() const { return cdbg::cs_filename(out_basename); }
+    std::string metadata_filename() const { return cdbg::metadata_filename(out_basename); }
 };
 
 // ---- timer ------------------------------------------------------------------
