@@ -585,4 +585,52 @@ inline bucket_process_prof& process_prof() {
     return p;
 }
 
+struct metadata {
+    explicit metadata(std::string const& path) {
+        std::ifstream in(path);
+        if (!in) { throw std::runtime_error("cannot open metadata file for reading: " + path); }
+
+        std::unordered_map<std::string, std::string> kv;
+        std::string line;
+
+        // Parse key=value line by line
+        while (std::getline(in, line)) {
+            // Skip empty lines
+            if (line.empty()) continue;
+
+            auto pos = line.find('=');
+            if (pos != std::string::npos) {
+                std::string key = line.substr(0, pos);
+                std::string val = line.substr(pos + 1);
+                kv[key] = val;
+            }
+        }
+
+        // Helper to safely extract and convert values
+        auto get_val = [&kv, &path](std::string const& key) -> uint64_t {
+            const auto it = kv.find(key);
+            if (it == kv.end()) {
+                throw std::runtime_error("missing required metadata key '" + key + "' in: " + path);
+            }
+            try {
+                return std::stoull(it->second);
+            } catch (std::exception const&) {
+                throw std::runtime_error("invalid value for key '" + key + "' in: " + path);
+            }
+        };
+
+        k = static_cast<uint32_t>(get_val("k"));
+        num_kmers = get_val("num_kmers");
+        num_colors = get_val("num_colors");
+        num_unitigs = get_val("num_unitigs");
+        num_color_sets = get_val("num_color_sets");
+    }
+
+    uint32_t k = 0;
+    uint64_t num_kmers = 0;
+    uint64_t num_colors = 0;
+    uint64_t num_unitigs = 0;
+    uint64_t num_color_sets = 0;
+};
+
 }  // namespace cdbg

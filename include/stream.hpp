@@ -113,10 +113,11 @@ struct unitigs_color_set {
 class unitigs_color_set_stream {
     streaming_bit_vector m_u2c_reader;
     streaming_bit_vector m_color_reader;
+    const metadata m_metadata;
+
     uint32_t num_colors{};
     uint32_t sparse_threshold{};
     uint32_t very_dense_threshold{};
-    uint64_t num_color_sets{};
     uint64_t m_safe_margin_bits{};
 
     uint64_t m_start_unitig = 0;
@@ -133,7 +134,7 @@ class unitigs_color_set_stream {
     std::thread worker_thread_;
 
     void producer_loop() {
-        while (!stop_requested_.load() && m_parsed_sets < num_color_sets) {
+        while (!stop_requested_.load() && m_parsed_sets < m_metadata.num_color_sets) {
             auto ucs = parse_next();
             std::unique_lock lock(mutex_);
 
@@ -170,14 +171,15 @@ public:
                                       const size_t chunk_size_bytes = 64 * 1024 * 1024)
         : m_u2c_reader(std::ifstream(u2c_filename(base_filename), std::ios::binary), 0,
                        chunk_size_bytes)
-        , m_color_reader(std::ifstream(cs_filename(base_filename), std::ios::binary), 20,
+        , m_color_reader(std::ifstream(cs_filename(base_filename), std::ios::binary), 12,
                          chunk_size_bytes)
+        , m_metadata(metadata_filename(base_filename))
         , max_queue_size_(max_queue_size) {
         auto cs_file = std::ifstream(cs_filename(base_filename), std::ios::binary);
         cs_file.read(reinterpret_cast<char*>(&num_colors), sizeof(num_colors));
         cs_file.read(reinterpret_cast<char*>(&sparse_threshold), sizeof(sparse_threshold));
         cs_file.read(reinterpret_cast<char*>(&very_dense_threshold), sizeof(very_dense_threshold));
-        cs_file.read(reinterpret_cast<char*>(&num_color_sets), sizeof(num_color_sets));
+        assert(num_colors == m_metadata.num_colors);
 
         // Each color_set should take at most num_colors bit. Times 2 to be sure.
         m_safe_margin_bits = num_colors * 2;
@@ -193,10 +195,12 @@ public:
         std::unique_lock lock(mutex_);
 
         cv_not_empty_.wait(lock, [this] {
-            return !queue_.empty() || m_parsed_sets == num_color_sets || stop_requested_.load();
+            return !queue_.empty() || m_parsed_sets == m_metadata.num_color_sets ||
+                   stop_requested_.load();
         });
 
-        if (stop_requested_.load() || (queue_.empty() && m_parsed_sets == num_color_sets)) {
+        if (stop_requested_.load() ||
+            (queue_.empty() && m_parsed_sets == m_metadata.num_color_sets)) {
             return std::nullopt;
         }
         auto ucs = std::move(queue_.front());
