@@ -4,6 +4,7 @@
 #include <vector>
 #include <algorithm>
 #include "bit_vector.hpp"
+#include "elias_fano.hpp"
 #include "integer_codes.hpp"
 #include "util.hpp"
 
@@ -74,8 +75,17 @@ public:
     uint64_t position() const { return m_it.position(); }
     void skip_to(const uint64_t pos) { m_it.skip_to(pos); }
 
-    // Exposes a reference to the native iterator if external querying is needed
     bits::bit_vector::iterator& iterator() { return m_it; }
+    void span(bits::bit_vector& bv, uint64_t len) {
+        bits::bit_vector::builder builder;
+        while (len >= 64) {
+            builder.append_bits(take(64), 64);
+            len -= 64;
+        }
+        builder.append_bits(take(len), len);
+
+        builder.build(bv);
+    }
 
     bool eof() const { return m_stream.eof() && (m_it.position() >= m_bv.num_bits()); }
 
@@ -83,7 +93,7 @@ private:
     void init() {
         bits::bit_vector::builder builder;
         builder.data().resize(m_chunk_size_words);
-        m_stream.seekg(16, std::ios::cur);
+        m_stream.seekg(16, std::ios::cur);  // skip bv metadata (num_bits, num_words)
 
         // Highly optimized word-aligned block read from file
         m_stream.read(reinterpret_cast<char*>(builder.data().data()),
@@ -118,52 +128,11 @@ class unitigs_color_set_stream {
     uint32_t num_colors{};
     uint32_t sparse_threshold{};
     uint32_t very_dense_threshold{};
-    uint64_t m_safe_margin_bits{};
 
-    uint64_t m_start_unitig = 0;
-    uint64_t m_parsed_sets = 0;
+    std::atomic<uint64_t> m_parsed_sets = 0;
 
-    uint64_t max_queue_size_;
-    std::queue<unitigs_color_set> queue_;
-
-    std::mutex mutex_;
-    std::condition_variable cv_not_full_;
-    std::condition_variable cv_not_empty_;
-
-    std::atomic<bool> stop_requested_{false};
-    std::thread worker_thread_;
-
-    void producer_loop() {
-        while (!stop_requested_.load() && m_parsed_sets < m_metadata.num_color_sets) {
-            auto ucs = parse_next();
-            std::unique_lock lock(mutex_);
-
-            cv_not_full_.wait(
-                lock, [this] { return queue_.size() < max_queue_size_ || stop_requested_.load(); });
-
-            queue_.push(std::move(ucs));
-            cv_not_empty_.notify_one();
-        }
-
-        cv_not_empty_.notify_all();
-    }
-
-    unitigs_color_set parse_next() {
-        const uint64_t begin = m_u2c_reader.position();
-        const uint64_t num_unitigs = m_u2c_reader.skip_zeros() + 1;
-        assert(m_u2c_reader.position() - begin == num_unitigs);
-
-        unitigs_color_set rec;
-        rec.unitig_start = begin;
-        rec.num_unitigs = num_unitigs;
-        rec.color_set_id = m_parsed_sets;
-        m_start_unitig = rec.unitig_start;
-
-        rec.color_set = decode_next_color_set();
-        ++m_parsed_sets;
-
-        return rec;
-    }
+    bits::elias_fano<false, false> m_offsets;
+    std::mutex m_mutex;
 
 public:
     explicit unitigs_color_set_stream(const std::string& base_filename,
@@ -173,83 +142,78 @@ public:
                        chunk_size_bytes)
         , m_color_reader(std::ifstream(cs_filename(base_filename), std::ios::binary), 12,
                          chunk_size_bytes)
-        , m_metadata(metadata_filename(base_filename))
-        , max_queue_size_(max_queue_size) {
+        , m_metadata(metadata_filename(base_filename)) {
         auto cs_file = std::ifstream(cs_filename(base_filename), std::ios::binary);
         cs_file.read(reinterpret_cast<char*>(&num_colors), sizeof(num_colors));
         cs_file.read(reinterpret_cast<char*>(&sparse_threshold), sizeof(sparse_threshold));
         cs_file.read(reinterpret_cast<char*>(&very_dense_threshold), sizeof(very_dense_threshold));
         assert(num_colors == m_metadata.num_colors);
+        uint64_t bit_vector_num_bits;
+        uint64_t bit_vector_num_words;
+        cs_file.read(reinterpret_cast<char*>(&bit_vector_num_bits), sizeof(bit_vector_num_bits));
+        cs_file.read(reinterpret_cast<char*>(&bit_vector_num_words), sizeof(bit_vector_num_words));
 
-        // Each color_set should take at most num_colors bit. Times 2 to be sure.
-        m_safe_margin_bits = num_colors * 2;
-    }
-
-    void start() {
-        m_start_unitig = 0;
-        m_parsed_sets = 0;
-        worker_thread_ = std::thread([this] { producer_loop(); });
+        cs_file.seekg(28 + bit_vector_num_words * 8, std::ios::beg);
+        essentials::generic_loader loader(cs_file);
+        loader.visit(m_offsets);
     }
 
     std::optional<unitigs_color_set> get() {
-        std::unique_lock lock(mutex_);
+        bits::bit_vector encoded_cs;
+        uint64_t cs_id = 0;
+        uint64_t u2c_begin = 0;
+        uint64_t u2c_num_unitigs = 0;
+        {
+            std::lock_guard guard(m_mutex);
+            if (m_parsed_sets + 1 >= m_metadata.num_color_sets) { return std::nullopt; }
 
-        cv_not_empty_.wait(lock, [this] {
-            return !queue_.empty() || m_parsed_sets == m_metadata.num_color_sets ||
-                   stop_requested_.load();
-        });
+            cs_id = m_parsed_sets++;
+            u2c_begin = m_u2c_reader.position();
+            u2c_num_unitigs = m_u2c_reader.skip_zeros() + 1;
+            assert(m_u2c_reader.position() - u2c_begin == u2c_num_unitigs);
 
-        if (stop_requested_.load() ||
-            (queue_.empty() && m_parsed_sets == m_metadata.num_color_sets)) {
-            return std::nullopt;
+            const uint64_t num_bits = m_offsets.access(cs_id + 1) - m_offsets.access(cs_id);
+            m_color_reader.ensure_bits_available(num_bits);
+            m_color_reader.span(encoded_cs, num_bits);
         }
-        auto ucs = std::move(queue_.front());
-        queue_.pop();
-        cv_not_full_.notify_one();
 
-        return ucs;
+        unitigs_color_set rec;
+        rec.unitig_start = u2c_begin;
+        rec.num_unitigs = u2c_num_unitigs;
+        rec.color_set_id = cs_id;
+
+        rec.color_set = decode_color_set(std::move(encoded_cs));
+
+        return rec;
     }
-
-    void request_stop_and_join() {
-        stop_requested_.store(true);
-
-        cv_not_full_.notify_all();
-        cv_not_empty_.notify_all();
-
-        if (worker_thread_.joinable()) { worker_thread_.join(); }
-    }
-
-    ~unitigs_color_set_stream() { request_stop_and_join(); }
 
 private:
-    std::vector<uint32_t> decode_next_color_set() {
-        m_color_reader.ensure_bits_available(m_safe_margin_bits);
-
+    std::vector<uint32_t> decode_color_set(bits::bit_vector&& encoded_bv) const {
         std::vector<uint32_t> color_set;
-        const uint64_t cs_size = m_color_reader.read_delta();
+        auto it = encoded_bv.begin();
+
+        const uint64_t cs_size = bits::util::read_delta(it);
         color_set.reserve(cs_size);
 
         if (cs_size < sparse_threshold) {
-            uint32_t prev_val = m_color_reader.read_delta();
+            uint32_t prev_val = bits::util::read_delta(it);
             color_set.push_back(static_cast<uint32_t>(prev_val));
 
             for (uint64_t i = 1; i < cs_size; ++i) {
-                auto val = static_cast<uint32_t>(m_color_reader.read_delta() + prev_val + 1);
+                auto val = static_cast<uint32_t>(bits::util::read_delta(it) + prev_val + 1);
                 color_set.push_back(val);
                 prev_val = val;
             }
         } else if (cs_size < very_dense_threshold) {
-            const uint32_t init_pos = m_color_reader.position();
-            for (uint32_t i = 0; i < cs_size; ++i) {
-                color_set.push_back(m_color_reader.next() - init_pos);
-            }
-            m_color_reader.skip_to(init_pos + num_colors);
+            const uint32_t init_pos = it.position();
+            for (uint32_t i = 0; i < cs_size; ++i) { color_set.push_back(it.next() - init_pos); }
+            it.skip_to(init_pos + num_colors);
         } else {
             const uint64_t size = num_colors - cs_size;
             uint32_t curr = 0;
             uint32_t next = 0;
             for (uint64_t i = 0; i < size; ++i) {
-                next += m_color_reader.read_delta();
+                next += bits::util::read_delta(it);
                 while (curr < next) {
                     color_set.push_back(curr);
                     curr++;
