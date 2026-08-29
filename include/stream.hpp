@@ -165,7 +165,7 @@ public:
         uint64_t u2c_num_unitigs = 0;
         {
             std::lock_guard guard(m_mutex);
-            if (m_parsed_sets + 1 >= m_metadata.num_color_sets) { return std::nullopt; }
+            if (m_parsed_sets >= m_metadata.num_color_sets) { return std::nullopt; }
 
             cs_id = m_parsed_sets++;
             u2c_begin = m_u2c_reader.position();
