@@ -434,9 +434,8 @@ struct bucket_write_prof {
     using clock = std::chrono::steady_clock;
 
     // ---- ingest-loop stages (covers the ingest_file_bucketed body) ----
-    // seq_reader::next: kseq parsing (libdeflate gzip decompression
-    // happens upfront in seq_reader's ctor and is amortised across the
-    // file's records, not counted here).
+    // seq_reader::next: streaming zlib gzip decompression + kseq parsing
+    // (decompression is interleaved with parsing, so both land here).
     std::atomic<uint64_t> ns_seq_read{0};
     // Whole loop body (ACGT scan, 2-bit conversion, emit_super_kmers,
     // including its calls into the per-thread buffer and any flushes).
@@ -482,7 +481,7 @@ struct bucket_write_prof {
         std::fprintf(
             stderr,
             "[bucket-write profile] (per-thread time, ns/threads -> wall-equiv):\n"
-            "  seq_read     %6.2fs   (libdeflate gzip + kseq parsing)\n"
+            "  seq_read     %6.2fs   (zlib gzip streaming + kseq parsing)\n"
             "  compute      %6.2fs   (ACGT scan + 2-bit + ntHash + minimizer + per-thread append)\n"
             "    scan2bit   %6.2fs   (ACGT-run scan + 2-bit only; helicase's domain)\n"
             "  flush        %6.2fs   (writer.flush total = lock + hashmap + spill)\n"

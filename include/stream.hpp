@@ -136,7 +136,6 @@ class unitigs_color_set_stream {
 
 public:
     explicit unitigs_color_set_stream(const std::string& base_filename,
-                                      const uint64_t max_queue_size,
                                       const size_t chunk_size_bytes = 64 * 1024 * 1024)
         : m_u2c_reader(std::ifstream(u2c_filename(base_filename), std::ios::binary), 0,
                        chunk_size_bytes)
