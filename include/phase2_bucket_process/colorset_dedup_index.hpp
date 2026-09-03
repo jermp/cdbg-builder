@@ -6,9 +6,9 @@
 // to its dense cid. This is the "color-sets-dedup-map" of algorithm.md §9.1 --
 // the dominant, fastest-growing, non-spillable structure in bucket-process
 // (~0.5 GiB @ 20k genomes -> ~14 GiB @ 661k). It is encapsulated here as the
-// clean seam for the planned RAM-first / spill-overflow externalization
-// (colorset-dedup-externalization.md): today it is purely in-RAM and exact;
-// the overflow path will plug in behind this interface.
+// clean seam for a planned RAM-first / spill-overflow externalization:
+// today it is purely in-RAM and exact; the overflow path would plug in
+// behind this interface.
 //
 // Sharded NUM_SHARDS ways (selected by the secondary hash) so the bucket-process
 // local->global merge dedups across shards in parallel instead of serialising on

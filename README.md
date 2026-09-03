@@ -18,20 +18,26 @@ Given `N` input files (each treated as one *color*), the tool produces:
 - `<out>.color_sets` — the color sets, written incrementally during
   bucket-process so the compressed bit_vector never sits whole in RAM.
   Layout: a small fixed header (`num_colors`, sparse / dense thresholds,
-  `num_color_sets`, `bit_vector_num_bits`, `bit_vector_num_words`) followed
-  by the `num_color_sets` distinct sets encoded with the same hybrid
+  `bit_vector_num_bits`, `bit_vector_num_words`) followed by the
+  distinct sets encoded with the same hybrid
   sparse / dense / complementary-dense rules as Fulgor's hybrid codec,
   followed by an `elias_fano` of per-class bit-offsets appended at the
   end. (Different on-disk layout from Fulgor's existing `hybrid`
-  serialization; the consumer must be updated to match.)
+  serialization; the consumer must be updated to match. The number of
+  color sets is not stored here — read it from `<out>.metadata.txt`.)
+- `<out>.metadata.txt` — a plain-text summary of the construction, one
+  `key=value` per line: `k`, `num_kmers` (distinct), `num_colors`,
+  `num_unitigs`, and `num_color_sets`.
 
 Inputs may be FASTA, FASTQ, or gzipped variants of either; the file at line
 *i* of the filenames list is assigned color *i*.
 
 ## Build
 
-Requirements: a C++17 compiler and CMake ≥ 3.13. All other dependencies
-(libdeflate, lz4, bits, cmd_line_parser, unordered_dense, kseq) are
+Requirements: a C++17 compiler, CMake ≥ 3.13, and zlib (used for
+streaming gzip decompression of the inputs, so per-reader memory stays
+bounded regardless of file size). All other dependencies
+(lz4, bits, cmd_line_parser, unordered_dense, kseq) are
 vendored as git submodules.
 
 ```bash
@@ -67,7 +73,7 @@ Options:
 |--------------|-------------------------------------------------------------------|---------|
 | `-i PATH`    | Text file with one input path per line (one color each)           | —       |
 | `-k INT`     | k-mer length (≤ 31 by default; build with `-DCDBG_LARGE_K=ON` for ≤ 63) | —  |
-| `-o NAME`    | Output basename; writes `NAME.fa`, `NAME.u2c`, and `NAME.color_sets` | —    |
+| `-o NAME`    | Output basename; writes `NAME.fa`, `NAME.u2c`, `NAME.color_sets`, and `NAME.metadata.txt` | —    |
 | `-t INT`     | Number of worker threads                                          | 1       |
 | `-m INT`     | Minimizer length used for bucketing                               | auto    |
 | `-b INT`     | log2 of the bucket count (`2^N` bucket files on disk)             | auto (derived from `-g` if set, else 10) |
@@ -91,7 +97,8 @@ artifacts:
 3. **stitch** — join fragments across buckets by matching their shared
    **full boundary k-mer** (base-carrying hash-bucketed doubling: the
    unitig sequences grow in place through the rounds).
-4. **emit** — write `.fa` + `.u2c` and finalize `.color_sets`.
+4. **emit** — write `.fa` + `.u2c`, finalize `.color_sets`, and write the
+   `.metadata.txt` summary.
 
 When `-g` is set, every phase sizes itself against that budget (and the
 phases that can, spill to disk), so peak RAM stays within the budget
@@ -140,8 +147,11 @@ This produces:
   bit_vector
 - `~/Salmonella_enterica/salmonella_4546.color_sets` — Fulgor-compatible hybrid
   color sets
+- `~/Salmonella_enterica/salmonella_4546.metadata.txt` — plain-text
+  construction statistics (`k`, `num_kmers`, `num_colors`, `num_unitigs`,
+  `num_color_sets`)
 
-The three files can then be consumed by downstream tools that accept Fulgor's
+The files can then be consumed by downstream tools that accept Fulgor's
 hybrid color-set format.
 
 ## Experiment on Blackwell 661k

@@ -6,7 +6,7 @@ de Bruijn graph (ccdBG)** and how it builds and compresses the color sets.
 ## 1. What the tool produces
 
 Given `N` input files (FASTA / FASTQ, optionally gzipped), each treated as
-one **color** (file `i` = color `i`), the tool writes three artifacts under
+one **color** (file `i` = color `i`), the tool writes four artifacts under
 a user-supplied basename:
 
 - **`<out>.fa`** — colored unitigs in FASTA. Each record is a maximal
@@ -21,6 +21,10 @@ a user-supplied basename:
 - **`<out>.color_sets`** — header + hybrid-encoded distinct color sets +
   Elias–Fano of per-class bit-offsets. See §6 for the on-disk layout
   and §5 for the encoding scheme.
+- **`<out>.metadata.txt`** — plain-text construction statistics, one
+  `key=value` per line: `k`, `num_kmers` (distinct), `num_colors`,
+  `num_unitigs`, `num_color_sets`. This is where consumers read
+  `num_color_sets` from (it is not stored in the `.color_sets` header).
 
 A k-mer is **canonical** (the lexicographic min of itself and its
 reverse complement). Two adjacent canonical k-mers that share a (k−1)
@@ -60,7 +64,8 @@ frag_unitigs.bin (cid + flags + seq)                      ← bucket-process
 K cid-range unitig_bucket files                           ← stitch
     │   sort by cid, write FASTA, build u2c
     ▼
-out.fa + out.u2c + finalize out.color_sets                ← emit
+out.fa + out.u2c + finalize out.color_sets
+    + out.metadata.txt                                    ← emit
 ```
 
 ### 2.1 Phase I/O contracts
@@ -121,8 +126,9 @@ artifact contract, the rest of the pipeline is unaffected.
 - *Reads:* `tmp/unitig_bucket_<k>.bin` (cid order) **and** `<out>.color_sets`
   (to finalize it).
 - *Produces:* `<out>.fa` (cid-ascending FASTA), `<out>.u2c`
-  (unitig→color-set bit_vector), and the finalized `<out>.color_sets`
-  (bits + Elias–Fano offsets + header). These three are the tool's outputs
+  (unitig→color-set bit_vector), the finalized `<out>.color_sets`
+  (bits + Elias–Fano offsets + header), and `<out>.metadata.txt`
+  (plain-text construction statistics). These are the tool's outputs
   (consumed downstream by Fulgor, §1).
 
 All `tmp/*` artifacts live under the scratch dir and are removed at the
@@ -135,7 +141,7 @@ end of `build()`; only the three `<out>.*` files persist.
 **Data flow & memory map:**
 
 ```
-in  (disk) : N gzip FASTA files                        - one color per file (mmap'd -> page cache)
+in  (disk) : N gzip FASTA files                        - one color per file (streamed via zlib, bounded RAM)
 RAM        : per-thread super-k-mer buffers (keys/recs)   sized B*(alpha*T*flush + beta*spill)
              per-bucket compactor hashmaps (online dedup) spilled by the RSS watcher (3.6)
              held to ~0.5*g; peak ~34.6 GiB @ 661k/-g64
@@ -144,7 +150,7 @@ out (disk) : B x bucket_<b>.bin                        - LZ4-framed, compacted s
 
 ### 3.1 Goal
 
-Read every input file (libdeflate-decompressed if `.gz`), decompose
+Read every input file (streaming zlib decompression if `.gz`), decompose
 each ACGT-only run into super-k-mers, compute each super-k-mer's
 **canonical minimizer**, and append it to the bucket file selected by
 that minimizer. After this phase:
@@ -1102,9 +1108,8 @@ are independent:
   `colorset_dedup_index`, and bucket-process prints a *measure-only* occupancy
   line (`color-sets-dedup-map: ~X / Y budget`). The actual overflow path (freeze
   the in-RAM index past the budget, spill new classes to hash-partitioned files,
-  reconcile + remap during the stitch frag-read) is stages 3–6, **not yet built**
-  — see `colorset-dedup-externalization.md`. Until then the index is still fully
-  in RAM and unbounded.
+  reconcile + remap during the stitch frag-read) is **not yet built**.
+  Until then the index is still fully in RAM and unbounded.
 
 - **per-bucket walk set → adaptive minimizer re-split (DEFERRED).** When a
   bucket's estimated working set (`~24·bucket_unc_bytes`) exceeds a `-g` share,
@@ -1157,7 +1162,7 @@ root. Other shared files live in the phase that primarily owns them.
 | `bucket_ingester.hpp`                          | parse + minimizer + bucketing per input file                                                                                                                                                                                                                          |
 | `bucket_io.hpp`                                | per-bucket compactor, LZ4 framing, RSS watcher                                                                                                                                                                                                                        |
 | `minimizer.hpp`                                | canonical ntHash + sliding-window minimum                                                                                                                                                                                                                             |
-| `seq_reader.hpp`                               | mmap + libdeflate FASTA/FASTQ iterator (kseq over mem_stream)                                                                                                                                                                                                         |
+| `seq_reader.hpp`                               | streaming zlib FASTA/FASTQ iterator (kseq over gzFile; bounded memory per reader)                                                                                                                                                                                     |
 | `super_kmer.hpp`                               | super-k-mer record format (varint + 2-bit)                                                                                                                                                                                                                            |
 | **Phase 2 — `include/phase2_bucket_process/`** |                                                                                                                                                                                                                                                                       |
 | `bucket_walker.hpp`                            | per-bucket dBG load + walk; multi-thread driver + admission gate                                                                                                                                                                                                      |

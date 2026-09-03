@@ -20,13 +20,15 @@
 //   //   b.num_colors()         -- one per input file
 //   //   b.num_unitigs()        -- count of stitched unitigs in <basename>.fa
 //   //   b.num_color_sets()  -- count of distinct color sets in <basename>.color_sets
+//   //   b.num_kmers()       -- count of distinct k-mers in the graph
 //
 // build() throws std::runtime_error on configuration errors or I/O
-// failures. On success, three artifacts are written:
-//   <basename>.fa          colored unitigs in FASTA, headers = cid
-//   <basename>.u2c         unitig-to-color-set bit_vector (run-end
-//                          marker, popcount = num_color_sets)
-//   <basename>.color_sets  hybrid-encoded color sets + EF offsets
+// failures. On success, four artifacts are written:
+//   <basename>.fa            colored unitigs in FASTA, headers = cid
+//   <basename>.u2c           unitig-to-color-set bit_vector (run-end
+//                            marker, popcount = num_color_sets)
+//   <basename>.color_sets    hybrid-encoded color sets + EF offsets
+//   <basename>.metadata.txt  plain-text construction statistics
 // The scratch directory (cfg.tmp_dir or an mkdtemp'd one) is removed.
 
 #include <atomic>
@@ -259,8 +261,8 @@ struct builder {
                     const uint64_t total = m_cfg.max_ram_gb * 1024.0 * 1024.0 * 1024.0;
                     bp_budget = BUCKET_PROCESS_BUDGET_FRAC * total;
                     // Share of -g the color-sets-dedup-map may use before its
-                    // overflow path engages. MEASURE-ONLY today (reported below,
-                    // not yet enforced) -- see colorset-dedup-externalization.md.
+                    // (planned) overflow path engages. MEASURE-ONLY today
+                    // (reported below, not yet enforced).
                     dedup_budget = COLORSET_DEDUP_BUDGET_FRAC * total;
                 }
                 global_dict.set_dedup_budget(dedup_budget);
@@ -532,8 +534,8 @@ private:
     // in bucket-process) may use before its overflow path engages. It coexists
     // with the per-bucket walk sets under BUCKET_PROCESS_BUDGET_FRAC, so it gets
     // a sub-share. MEASURE-ONLY today (reported, not enforced) -- a starting
-    // point to validate against real 100k/661k numbers before the overflow
-    // machinery lands. See colorset-dedup-externalization.md.
+    // point to validate against real 100k/661k numbers before any overflow
+    // machinery lands.
     static constexpr double COLORSET_DEDUP_BUDGET_FRAC = 0.50;
 
     // Stitch's whole working-RAM share of -g (unitig writer + RAM-first stores +

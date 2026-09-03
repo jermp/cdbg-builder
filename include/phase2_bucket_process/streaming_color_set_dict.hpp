@@ -31,7 +31,6 @@
 //   [u32 num_colors]
 //   [u32 sparse_threshold]
 //   [u32 dense_threshold]
-//   [u64 num_color_sets]
 //   [u64 bit_vector_num_bits]
 //   [u64 bit_vector_num_words]   == ceil(bit_vector_num_bits / 64)
 //   [bit_vector_num_words * u64] color-set bit_vector words (LE host order)
@@ -188,7 +187,7 @@ struct streaming_color_set_dict {
     uint64_t total_bits() const { return m_flushed_words * 64 + m_bvb.num_bits(); }
 
     // RAM budget the color-sets-dedup-map (m_index) is allowed before its
-    // overflow path must engage (colorset-dedup-externalization.md). 0 = no -g.
+    // (planned, not yet built) overflow path must engage. 0 = no -g.
     // MEASURE-ONLY today: set + reported, but not yet enforced (no spill).
     void set_dedup_budget(uint64_t bytes) { m_dedup_budget = bytes; }
     uint64_t dedup_budget() const { return m_dedup_budget; }
