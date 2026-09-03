@@ -25,6 +25,9 @@ namespace cdbg {
 inline std::string u2c_filename(std::string const& filename) { return filename + ".u2c"; }
 inline std::string fa_filename(std::string const& filename) { return filename + ".fa"; }
 inline std::string cs_filename(std::string const& filename) { return filename + ".color_sets"; }
+inline std::string metadata_filename(std::string const& filename) {
+    return filename + ".metadata.txt";
+}
 
 // ---- build configuration ----------------------------------------------------
 
@@ -67,6 +70,7 @@ struct build_config {
     std::string u2c_filename() const { return cdbg::u2c_filename(out_basename); }
     std::string fa_filename() const { return cdbg::fa_filename(out_basename); }
     std::string cs_filename() const { return cdbg::cs_filename(out_basename); }
+    std::string metadata_filename() const { return cdbg::metadata_filename(out_basename); }
 };
 
 // ---- timer ------------------------------------------------------------------
@@ -430,9 +434,8 @@ struct bucket_write_prof {
     using clock = std::chrono::steady_clock;
 
     // ---- ingest-loop stages (covers the ingest_file_bucketed body) ----
-    // seq_reader::next: kseq parsing (libdeflate gzip decompression
-    // happens upfront in seq_reader's ctor and is amortised across the
-    // file's records, not counted here).
+    // seq_reader::next: streaming zlib gzip decompression + kseq parsing
+    // (decompression is interleaved with parsing, so both land here).
     std::atomic<uint64_t> ns_seq_read{0};
     // Whole loop body (ACGT scan, 2-bit conversion, emit_super_kmers,
     // including its calls into the per-thread buffer and any flushes).
@@ -478,7 +481,7 @@ struct bucket_write_prof {
         std::fprintf(
             stderr,
             "[bucket-write profile] (per-thread time, ns/threads -> wall-equiv):\n"
-            "  seq_read     %6.2fs   (libdeflate gzip + kseq parsing)\n"
+            "  seq_read     %6.2fs   (zlib gzip streaming + kseq parsing)\n"
             "  compute      %6.2fs   (ACGT scan + 2-bit + ntHash + minimizer + per-thread append)\n"
             "    scan2bit   %6.2fs   (ACGT-run scan + 2-bit only; helicase's domain)\n"
             "  flush        %6.2fs   (writer.flush total = lock + hashmap + spill)\n"
@@ -580,5 +583,53 @@ inline bucket_process_prof& process_prof() {
     static bucket_process_prof p;
     return p;
 }
+
+struct metadata {
+    explicit metadata(std::string const& path) {
+        std::ifstream in(path);
+        if (!in) { throw std::runtime_error("cannot open metadata file for reading: " + path); }
+
+        std::unordered_map<std::string, std::string> kv;
+        std::string line;
+
+        // Parse key=value line by line
+        while (std::getline(in, line)) {
+            // Skip empty lines
+            if (line.empty()) continue;
+
+            auto pos = line.find('=');
+            if (pos != std::string::npos) {
+                std::string key = line.substr(0, pos);
+                std::string val = line.substr(pos + 1);
+                kv[key] = val;
+            }
+        }
+
+        // Helper to safely extract and convert values
+        auto get_val = [&kv, &path](std::string const& key) -> uint64_t {
+            const auto it = kv.find(key);
+            if (it == kv.end()) {
+                throw std::runtime_error("missing required metadata key '" + key + "' in: " + path);
+            }
+            try {
+                return std::stoull(it->second);
+            } catch (std::exception const&) {
+                throw std::runtime_error("invalid value for key '" + key + "' in: " + path);
+            }
+        };
+
+        k = static_cast<uint32_t>(get_val("k"));
+        num_kmers = get_val("num_kmers");
+        num_colors = get_val("num_colors");
+        num_unitigs = get_val("num_unitigs");
+        num_color_sets = get_val("num_color_sets");
+    }
+
+    uint32_t k = 0;
+    uint64_t num_kmers = 0;
+    uint64_t num_colors = 0;
+    uint64_t num_unitigs = 0;
+    uint64_t num_color_sets = 0;
+};
 
 }  // namespace cdbg

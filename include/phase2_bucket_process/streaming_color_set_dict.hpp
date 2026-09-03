@@ -138,7 +138,7 @@ struct streaming_color_set_dict {
     //
     // THREAD-SAFE. The dedup index is sharded into NUM_SHARDS independent
     // maps, each under its own mutex (selected by the secondary hash), so
-    // the common case -- a duplicate color class, just a probe + return --
+    // the common case -- a duplicate color set, just a probe + return --
     // distributes across shards instead of serialising on one lock. For a
     // genuinely new class the expensive hybrid-encode runs into a thread-
     // local builder *under the shard lock* (so distinct shards encode in
@@ -213,8 +213,7 @@ struct streaming_color_set_dict {
     // reported at phase boundaries to attribute budget.
     uint64_t resident_bytes() const {
         if (m_released) return 0;
-        return colorset_dedup_index::resident_bytes(
-            m_class_count.load(std::memory_order_relaxed));
+        return colorset_dedup_index::resident_bytes(m_class_count.load(std::memory_order_relaxed));
     }
 
     // Finalize the on-disk file: flush trailing partial word, build &
@@ -282,7 +281,6 @@ struct streaming_color_set_dict {
         write_pod_(m_num_colors);
         write_pod_(m_sparse_threshold);
         write_pod_(m_dense_threshold);
-        write_pod_((uint64_t)size());
         write_pod_(total_bit_count);
         write_pod_(total_word_count);
 
@@ -297,7 +295,7 @@ struct streaming_color_set_dict {
     }
 
 private:
-    static constexpr size_t HEADER_BYTES = 4 + 4 + 4 + 8 + 8 + 8;
+    static constexpr size_t HEADER_BYTES = 4 + 4 + 4 + 8 + 8;
 
     // Forward-input iterator over a sequence of u64s on disk. Used at
     // finalize to feed bits::elias_fano::encode without ever

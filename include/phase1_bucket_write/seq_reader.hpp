@@ -1,126 +1,61 @@
 #pragma once
 
-// FASTA / FASTQ reader with libdeflate-based gzip decompression.
+// FASTA / FASTQ reader with STREAMING zlib-based gzip decompression.
 //
-// Replaces the previous zlib (gzopen/gzread) backend. libdeflate's
-// decompressor is ~2-3x faster than zlib's on bacterial-genome inputs;
-// since seq_read was 33% of bucket-write wall time on the 50K workload,
-// this directly cuts ~half of that.
+// Replaces the previous mmap + libdeflate whole-buffer backend. That
+// design decompressed the ENTIRE file into one RAM buffer (libdeflate
+// has no streaming API) and kept the whole compressed file mmap'd, so
+// per-reader memory scaled with file size: fine on bacterial genomes
+// (~5-10 MiB), catastrophic on human-scale pangenome inputs -- on
+// HPRC-like collections (~0.8 GiB gzipped / ~3 GiB raw per genome,
+// growth-doubling on top) it cost 4-7 GiB PER THREAD, i.e. hundreds of
+// GiB of RSS across a 32-48 thread ingest. The mmap'd compressed pages
+// additionally inflated RSS and misled the RSS-watcher / RAM governor.
 //
-// libdeflate has no streaming API by design (whole-buffer in, whole-
-// buffer out), so we do:
-//   1. mmap the file (zero-copy, no RAM cost for the compressed bytes).
-//   2. If gzip-magic, libdeflate_gzip_decompress_ex into a per-reader
-//      output buffer; loop for multi-member streams.
-//   3. Feed kseq from a memory_stream that just memcpys out of the
-//      decompressed buffer (or directly out of the mmap if the input
-//      wasn't gzipped).
+// This backend streams instead: zlib's gzread inflates a bounded window
+// at a time (it also transparently passes through plain uncompressed
+// files), and kseq parses records incrementally from that stream.
+// Per-reader memory is now O(zlib state + gz buffer + largest single
+// record), independent of file size. The largest-record term is
+// unavoidable with this API (next() hands out one whole sequence);
+// for a human chromosome that's ~250 MiB, vs multiple GiB before.
 //
-// Memory: ~5-10 MiB per concurrent reader for a typical bacterial
-// genome. With 32 ingest threads that's ~250 MiB extra, comfortably
-// within the bucket-write budget (which is dominated by per-bucket
-// hashmaps). The mmap costs nothing -- it's page-cache-backed.
+// Cost: zlib inflate is ~2-3x slower than libdeflate. Ingest threads
+// each decompress their own file in parallel and the pipeline is
+// disk-bound at scale, so the wall-time impact stays small; bounded
+// memory at pangenome scale is worth far more than that.
 
-#include <cerrno>
-#include <cstdint>
-#include <cstdlib>
-#include <cstring>
-#include <fcntl.h>
 #include <stdexcept>
 #include <string>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#include <vector>
 
-#include <libdeflate.h>
-
-namespace cdbg {
-
-// Memory stream type used by kseq's KSEQ_INIT below: a pointer + size +
-// position. mem_read copies up to `len` bytes into the caller's buffer
-// and advances pos. Same shape as POSIX read(2) so kseq can plug into
-// it via KSEQ_INIT.
-struct mem_stream {
-    uint8_t const* data = nullptr;
-    size_t size = 0;
-    size_t pos = 0;
-};
-
-inline ssize_t mem_stream_read(mem_stream* s, void* buf, size_t len) {
-    if (!s) return -1;
-    if (s->pos >= s->size) return 0;
-    size_t avail = s->size - s->pos;
-    size_t n = (len < avail) ? len : avail;
-    std::memcpy(buf, s->data + s->pos, n);
-    s->pos += n;
-    return (ssize_t)n;
-}
-
-}  // namespace cdbg
+#include <zlib.h>
 
 extern "C" {
 #include "external/kseq.h"
 }
 
-// Instantiate kseq for our memory stream. kseq's __KS_GETC fast path
-// inlines mem_stream_read calls; for repeated 4096-byte buffer fills
-// this collapses to memcpy + pos bookkeeping, which the optimizer
-// reduces to a tight loop over the decompressed buffer.
-KSEQ_INIT(cdbg::mem_stream*, cdbg::mem_stream_read)
+// Instantiate kseq directly over zlib's streaming gzFile. gzread
+// returns raw bytes for non-gzip inputs, so plain FASTA works through
+// the same path with no sniffing here.
+KSEQ_INIT(gzFile, gzread)
 
 namespace cdbg {
 
 struct seq_reader {
     explicit seq_reader(std::string const& path) {
-        // mmap the input so we don't pay a read() copy for the
-        // compressed bytes. Also lets the kernel keep the file in the
-        // page cache across runs.
-        int fd = ::open(path.c_str(), O_RDONLY);
-        if (fd < 0) {
-            throw std::runtime_error("could not open input file: " + path + ": " +
-                                     std::strerror(errno));
+        m_file = gzopen(path.c_str(), "rb");
+        if (!m_file) {
+            throw std::runtime_error("could not open input file: " + path);
         }
-        struct stat st;
-        if (::fstat(fd, &st) != 0) {
-            int e = errno;
-            ::close(fd);
-            throw std::runtime_error("fstat failed on " + path + ": " + std::strerror(e));
-        }
-        m_in_size = (size_t)st.st_size;
-        if (m_in_size > 0) {
-            void* p = ::mmap(nullptr, m_in_size, PROT_READ, MAP_PRIVATE, fd, 0);
-            if (p == MAP_FAILED) {
-                int e = errno;
-                ::close(fd);
-                throw std::runtime_error("mmap failed on " + path + ": " + std::strerror(e));
-            }
-            m_in = (uint8_t const*)p;
-            // Hint sequential access -- input is read once front-to-back.
-            ::madvise((void*)m_in, m_in_size, MADV_SEQUENTIAL);
-        }
-        ::close(fd);
-
-        // gzip magic 1f 8b? Empty files fall through as "not gzipped";
-        // kseq will then immediately hit EOF.
-        bool is_gz = m_in_size >= 2 and m_in[0] == 0x1f and m_in[1] == 0x8b;
-
-        if (is_gz) {
-            decompress_gzip_(path);
-            m_stream.data = m_decompressed.data();
-            m_stream.size = m_decompressed.size();
-        } else {
-            // Plain text / FASTA -- feed kseq directly from the mmap.
-            m_stream.data = m_in;
-            m_stream.size = m_in_size;
-        }
-        m_stream.pos = 0;
-        m_kseq = kseq_init(&m_stream);
+        // Default gz buffer is 8 KiB; a larger window cuts the number of
+        // inflate calls and read syscalls on multi-GiB inputs.
+        gzbuffer(m_file, 128 * 1024);
+        m_kseq = kseq_init(m_file);
     }
 
     ~seq_reader() {
         if (m_kseq) kseq_destroy(m_kseq);
-        if (m_in and m_in_size > 0) ::munmap((void*)m_in, m_in_size);
+        if (m_file) gzclose(m_file);
     }
 
     seq_reader(seq_reader const&) = delete;
@@ -137,57 +72,7 @@ struct seq_reader {
     }
 
 private:
-    // Decompress a gzip-wrapped buffer into m_decompressed using
-    // libdeflate. Handles multi-member gzip via the _ex variant: each
-    // call decompresses one member and reports input bytes consumed;
-    // we loop until all input is consumed. Output buffer grows
-    // geometrically on LIBDEFLATE_INSUFFICIENT_SPACE (libdeflate has
-    // no streaming, so the whole decompressed result must fit).
-    //
-    // Initial guess: 4x compressed size. Bacterial-genome FASTA gzip
-    // ratios are typically 3.0-3.5x, so 4x lands in one shot most of
-    // the time.
-    void decompress_gzip_(std::string const& path) {
-        struct libdeflate_decompressor* dec = libdeflate_alloc_decompressor();
-        if (!dec) throw std::runtime_error("libdeflate_alloc_decompressor failed");
-
-        size_t out_cap = m_in_size * 4 + 16;
-        m_decompressed.resize(out_cap);
-        size_t out_off = 0;
-        size_t in_off = 0;
-
-        while (in_off < m_in_size) {
-            size_t in_consumed = 0;
-            size_t out_produced = 0;
-            for (;;) {
-                if (m_decompressed.size() - out_off < 4096) {
-                    m_decompressed.resize(m_decompressed.size() * 2 + 4096);
-                }
-                enum libdeflate_result r = libdeflate_gzip_decompress_ex(
-                    dec, m_in + in_off, m_in_size - in_off, m_decompressed.data() + out_off,
-                    m_decompressed.size() - out_off, &in_consumed, &out_produced);
-                if (r == LIBDEFLATE_SUCCESS) break;
-                if (r == LIBDEFLATE_INSUFFICIENT_SPACE) {
-                    m_decompressed.resize(m_decompressed.size() * 2 + 4096);
-                    continue;
-                }
-                libdeflate_free_decompressor(dec);
-                throw std::runtime_error("libdeflate_gzip_decompress failed on " + path +
-                                         " (result=" + std::to_string((int)r) + ")");
-            }
-            in_off += in_consumed;
-            out_off += out_produced;
-            if (in_consumed == 0) break;  // safety: no progress (shouldn't happen)
-        }
-
-        libdeflate_free_decompressor(dec);
-        m_decompressed.resize(out_off);
-    }
-
-    uint8_t const* m_in = nullptr;
-    size_t m_in_size = 0;
-    std::vector<uint8_t> m_decompressed;
-    mem_stream m_stream;
+    gzFile m_file = nullptr;
     kseq_t* m_kseq = nullptr;
 };
 

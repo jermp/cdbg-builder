@@ -6,7 +6,7 @@
 // the encoded bits stay in memory (one per dict instance) rather than
 // being flushed to a file. Used inside process_bucket for both
 // record_sets (per-record interned color lists) and local_dict (the
-// per-bucket final color classes assigned to each k-mer). With 16
+// per-bucket final color sets assigned to each k-mer). With 16
 // threads in flight, holding the source color lists as live
 // std::vector<uint32_t>'s grew to ~10 GB on the 25K-genome workload;
 // hybrid-encoding them here cuts that to ~hundreds of MB.
@@ -67,7 +67,7 @@ struct compact_color_set_dict {
     // intern(decoded(src, src_id)) -- same hash, and encode_one is deterministic
     // so the copied bits match a fresh encode of the same colors -- but skips the
     // decode + re-hash + re-encode, which dominates resolve when most k-mers are
-    // single-record (their color class IS a record_sets entry). `src` MUST share
+    // single-record (their color set IS a record_sets entry). `src` MUST share
     // this dict's encoding params (it does: both built with the same num_colors).
     uint32_t intern_encoded(compact_color_set_dict const& src, uint32_t src_id) {
         assert(src_id < src.m_classes.size());
