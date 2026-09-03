@@ -103,13 +103,12 @@ add_library(cdbg_builder_headers INTERFACE)
 
 # Propagate all required include directories to whoever links against this target
 target_include_directories(cdbg_builder_headers INTERFACE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${BITS_INCLUDE_DIR}
-        ${ESSENTIALS_INCLUDE_DIR}
-        ${CMD_LINE_PARSER_INCLUDE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/external
-        ${LZ4_DIR}
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/external>
+        $<BUILD_INTERFACE:${CMD_LINE_PARSER_INCLUDE_DIR}>
+        $<BUILD_INTERFACE:${LZ4_DIR}>
+        $<BUILD_INTERFACE:${LIBDEFLATE_DIR}>
 )
 
 # Propagate downstream dependencies automatically
