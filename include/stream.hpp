@@ -29,6 +29,7 @@ public:
         const uint64_t total_bits = m_bv.num_bits();
 
         if (total_bits - current_pos < safe_margin_bits && !m_stream.eof()) {
+            m_consumed_bits += current_pos;
             uint64_t remaining_bits = total_bits - current_pos;
             bits::bit_vector::builder builder;
 
@@ -87,13 +88,16 @@ public:
         builder.build(bv);
     }
 
-    bool eof() const { return m_stream.eof() && (m_it.position() >= m_bv.num_bits()); }
+    bool eof() const {
+        return m_consumed_bits + m_it.position() >= m_num_bits;
+    }
 
 private:
     void init() {
         bits::bit_vector::builder builder;
         builder.data().resize(m_chunk_size_words);
-        m_stream.seekg(16, std::ios::cur);  // skip bv metadata (num_bits, num_words)
+        m_stream.read(reinterpret_cast<char*>(&m_num_bits), sizeof(uint64_t));
+        m_stream.seekg(8, std::ios::cur);  // skip bv metadata (num_bits, num_words)
 
         // Highly optimized word-aligned block read from file
         m_stream.read(reinterpret_cast<char*>(builder.data().data()),
@@ -111,6 +115,8 @@ private:
     size_t m_chunk_size_words;
     bits::bit_vector m_bv;
     bits::bit_vector::iterator m_it;
+    uint64_t m_num_bits;
+    uint64_t m_consumed_bits = 0;
 };
 
 struct unitigs_color_set {
